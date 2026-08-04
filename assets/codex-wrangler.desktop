@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Codex Wrangler
+Comment=Survey and activate live Codex terminals
+Exec=codex-wrangler
+Terminal=false
+Categories=Development;
+StartupNotify=false
+X-GNOME-UsesNotifications=false

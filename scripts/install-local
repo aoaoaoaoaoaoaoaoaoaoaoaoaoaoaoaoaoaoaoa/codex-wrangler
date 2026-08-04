@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+cargo build --release --bin codex-wrangler
+target_directory=$(cargo metadata --format-version 1 --no-deps \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+test -n "$target_directory"
+install -Dm755 "$target_directory/release/codex-wrangler" \
+  "$HOME/.local/bin/codex-wrangler"
+install -Dm644 assets/codex-wrangler.desktop \
+  "$HOME/.local/share/applications/codex-wrangler.desktop"

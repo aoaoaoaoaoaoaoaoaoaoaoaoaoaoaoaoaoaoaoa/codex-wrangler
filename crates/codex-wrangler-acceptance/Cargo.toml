@@ -1,0 +1,20 @@
+[package]
+name = "codex-wrangler-acceptance"
+version.workspace = true
+description = "Hermetic native acceptance story for Codex Wrangler."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["egui-test"]
+egui-test = []
+
+[dependencies]
+egui-tester.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
