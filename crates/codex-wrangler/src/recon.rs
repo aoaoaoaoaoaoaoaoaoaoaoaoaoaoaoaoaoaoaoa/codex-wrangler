@@ -7,14 +7,16 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 
 use crate::{
+    contract::{Harness, Work},
     desktop::Desktop,
-    model::{Census, CodexCard, snip},
+    model::{Card, Census, snip},
     rollout::Rollouts,
+    transcript::Transcripts,
 };
 
 const REFRESH: Duration = Duration::from_millis(800);
@@ -51,7 +53,7 @@ fn raid(ctx: &egui::Context, census: &Sender<Census>, strikes: &Receiver<Strike>
         let next = match &mut recon {
             Ok(recon) => recon.census().unwrap_or_else(|error| Census {
                 cards: Vec::new(),
-                fault: Some(format!("Could not inspect Codex: {error:#}")),
+                fault: Some(format!("Could not inspect harnesses: {error:#}")),
             }),
             Err(error) => Census {
                 cards: Vec::new(),
@@ -75,87 +77,177 @@ fn raid(ctx: &egui::Context, census: &Sender<Census>, strikes: &Receiver<Strike>
 }
 
 struct Recon {
-    codex_home: PathBuf,
-    db: Connection,
+    codex: Option<Codex>,
     desktop: Desktop,
-    rollouts: Rollouts,
-    names: NameIndex,
+    transcripts: Transcripts,
 }
 
 impl Recon {
     fn raise() -> Result<Self> {
-        let codex_home = std::env::var_os("CODEX_HOME").map_or_else(
-            || {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .map(|home| home.join(".codex"))
-                    .ok_or_else(|| anyhow!("neither CODEX_HOME nor HOME is set"))
-            },
-            |home| Ok(PathBuf::from(home)),
-        )?;
-        let db = Connection::open_with_flags(
-            codex_home.join("state_5.sqlite"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .context("open Codex thread index")?;
+        let codex = match Codex::raise() {
+            Ok(codex) => codex,
+            Err(error) => {
+                eprintln!("codex-wrangler could not arm its Codex adapter: {error:#}");
+                None
+            }
+        };
         Ok(Self {
-            codex_home,
-            db,
+            codex,
             desktop: Desktop::connect()?,
-            rollouts: Rollouts::default(),
-            names: NameIndex::default(),
+            transcripts: Transcripts::default(),
         })
     }
 
     fn census(&mut self) -> Result<Census> {
-        self.names
-            .refresh(&self.codex_home.join("session_index.jsonl"))?;
+        if let Some(codex) = &mut self.codex {
+            codex.refresh_names()?;
+        }
         let windows = self.desktop.windows_by_pid()?;
         let workspaces = self
             .desktop
             .workspace_numbers(windows.values().copied())
             .unwrap_or_default();
+        let mut processes = manual_harnesses()?;
+        processes.sort_by_key(|process| std::cmp::Reverse(process.pid));
+        let mut locator = SessionLocator::default();
         let mut cards = Vec::new();
         let mut seen = HashSet::new();
-        for process in manual_codexes()? {
+        for process in processes {
             let Some(terminal_pid) = alacritty_ancestor(process.pid)? else {
                 continue;
             };
             let Some(&window) = windows.get(&terminal_pid) else {
                 continue;
             };
-            let Some(thread) = self.current_thread(&process.rollouts)? else {
+            let workspace = workspaces.get(&window).copied();
+            let card = match process.harness {
+                Harness::Codex => match &mut self.codex {
+                    Some(codex) => codex.card(&process, window, workspace)?,
+                    None => None,
+                },
+                Harness::ClaudeCode | Harness::PrimeAgent => Some(foreign_card(
+                    &mut self.transcripts,
+                    &mut locator,
+                    &process,
+                    window,
+                    workspace,
+                )),
+            };
+            let Some(card) = card else {
                 continue;
             };
-            if !seen.insert(thread.id.clone()) {
-                continue;
+            if seen.insert((card.harness, card.thread.clone())) {
+                cards.push(card);
             }
-            let summary = self
-                .rollouts
-                .read(&thread.rollout)
-                .with_context(|| format!("read rollout `{}`", thread.rollout.display()))?;
-            let name = thread
-                .name
-                .or_else(|| self.names.get(&thread.id).map(str::to_owned));
-            cards.push(CodexCard {
-                thread: thread.id,
-                name,
-                cwd: compact_path(&thread.cwd),
-                tile_preview: snip(&summary.preview, 280),
-                work: summary.work,
-                window,
-                workspace: workspaces.get(&window).copied(),
-                updated_at_ms: thread.updated_at_ms,
-            });
         }
         cards.sort();
         Ok(Census { cards, fault: None })
+    }
+}
+
+struct Codex {
+    home: PathBuf,
+    db: Connection,
+    goals: Option<Connection>,
+    names: NameIndex,
+    rollouts: Rollouts,
+}
+
+impl Codex {
+    fn raise() -> Result<Option<Self>> {
+        let Some(home) = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        else {
+            return Ok(None);
+        };
+        let db_path = home.join("state_5.sqlite");
+        if !db_path.is_file() {
+            return Ok(None);
+        }
+        let db = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("open Codex thread index")?;
+        let goals_path = home.join("goals_1.sqlite");
+        let goals = goals_path
+            .is_file()
+            .then(|| {
+                Connection::open_with_flags(
+                    &goals_path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .context("open Codex goal ledger")
+            })
+            .transpose()?;
+        Ok(Some(Self {
+            home,
+            db,
+            goals,
+            names: NameIndex::default(),
+            rollouts: Rollouts::default(),
+        }))
+    }
+
+    fn refresh_names(&mut self) -> Result<()> {
+        self.names.refresh(&self.home.join("session_index.jsonl"))
+    }
+
+    fn card(
+        &mut self,
+        process: &Process,
+        window: u32,
+        workspace: Option<u32>,
+    ) -> Result<Option<Card>> {
+        let Some(thread) = self.current_thread(&process.transcripts)? else {
+            return Ok(None);
+        };
+        let summary = self
+            .rollouts
+            .read(&thread.rollout)
+            .with_context(|| format!("read rollout `{}`", thread.rollout.display()))?;
+        let name = thread
+            .name
+            .or_else(|| self.names.get(&thread.id).map(str::to_owned));
+        let work = classify_work(
+            summary.running,
+            self.goal_active(&thread.id)?,
+            summary.waiting_for_input,
+        );
+        Ok(Some(Card {
+            harness: Harness::Codex,
+            thread: thread.id,
+            name,
+            cwd: compact_path(&thread.cwd, process.home.as_deref()),
+            tile_preview: snip(&summary.preview, 280),
+            work,
+            window,
+            workspace,
+            updated_at_ms: thread.updated_at_ms,
+        }))
+    }
+
+    fn goal_active(&self, thread: &str) -> Result<bool> {
+        let Some(goals) = &self.goals else {
+            return Ok(false);
+        };
+        goals
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM thread_goals
+                   WHERE thread_id = ?1 AND status = 'active'
+                 )",
+                params![thread],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("query current goal state for thread `{thread}`"))
     }
 
     fn current_thread(&self, paths: &[PathBuf]) -> Result<Option<Thread>> {
         let mut freshest = None;
         for rollout in paths {
-            if !rollout.starts_with(self.codex_home.join("sessions")) {
+            if !rollout.starts_with(self.home.join("sessions")) {
                 continue;
             }
             let Some(id) = rollout_id(rollout) else {
@@ -203,6 +295,59 @@ impl Recon {
             }
         }
         Ok(freshest)
+    }
+}
+
+fn foreign_card(
+    transcripts: &mut Transcripts,
+    locator: &mut SessionLocator,
+    process: &Process,
+    window: u32,
+    workspace: Option<u32>,
+) -> Card {
+    let path = locator.locate(process);
+    let summary = path
+        .as_deref()
+        .and_then(|path| transcripts.read(process.harness, path).ok());
+    let thread = path
+        .as_deref()
+        .and_then(Path::file_stem)
+        .and_then(OsStr::to_str)
+        .map_or_else(|| format!("pid-{}", process.pid), str::to_owned);
+    let cwd = summary
+        .as_ref()
+        .and_then(|summary| summary.cwd.as_deref())
+        .unwrap_or(&process.cwd);
+    let work = summary.as_ref().map_or(Work::Done, |summary| summary.work);
+    Card {
+        harness: process.harness,
+        thread,
+        name: process
+            .explicit_name()
+            .or_else(|| summary.as_ref().and_then(|summary| summary.name.clone())),
+        cwd: compact_path(cwd, process.home.as_deref()),
+        tile_preview: summary
+            .as_ref()
+            .map_or_else(String::new, |summary| snip(&summary.preview, 280)),
+        work: if process.goal && work == Work::Turn {
+            Work::Goal
+        } else {
+            work
+        },
+        window,
+        workspace,
+        updated_at_ms: summary
+            .as_ref()
+            .map_or_else(|| i64::from(process.pid), |summary| summary.updated_at_ms),
+    }
+}
+
+const fn classify_work(running: bool, goal_active: bool, waiting_for_input: bool) -> Work {
+    match (running, goal_active, waiting_for_input) {
+        (_, _, true) => Work::Input,
+        (true, true, false) => Work::Goal,
+        (true, false, false) => Work::Turn,
+        (false, _, false) => Work::Done,
     }
 }
 
@@ -270,12 +415,14 @@ struct Thread {
     rollout: PathBuf,
 }
 
-fn compact_path(path: &Path) -> String {
+fn compact_path(path: &Path, home: Option<&Path>) -> String {
     let text = path.to_string_lossy().into_owned();
-    let Some(home) = std::env::var_os("HOME") else {
+    let home = home
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let Some(home) = home else {
         return text;
     };
-    let home = Path::new(&home);
     path.strip_prefix(home).map_or(text, |tail| {
         let suffix = tail.to_string_lossy();
         if suffix.is_empty() {
@@ -288,10 +435,63 @@ fn compact_path(path: &Path) -> String {
 
 struct Process {
     pid: u32,
-    rollouts: Vec<PathBuf>,
+    harness: Harness,
+    argv: Vec<OsString>,
+    transcripts: Vec<PathBuf>,
+    cwd: PathBuf,
+    environment: HashMap<String, OsString>,
+    home: Option<PathBuf>,
+    goal: bool,
 }
 
-fn manual_codexes() -> Result<Vec<Process>> {
+impl Process {
+    fn explicit_name(&self) -> Option<String> {
+        (self.harness == Harness::ClaudeCode)
+            .then(|| option_value(&self.argv, "--name", Some("-n")))
+            .flatten()
+    }
+
+    fn claude_home(&self) -> Option<PathBuf> {
+        self.environment
+            .get("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| self.home.as_ref().map(|home| home.join(".claude")))
+    }
+
+    fn prime_home(&self) -> Option<PathBuf> {
+        self.environment
+            .get("PRIME_AGENT_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .or_else(|| self.home.as_ref().map(|home| home.join(".prime/agent")))
+    }
+
+    fn prime_sessions(&self) -> Option<PathBuf> {
+        option_value(&self.argv, "--session-dir", None)
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.environment
+                    .get("PRIME_AGENT_SESSION_DIR")
+                    .or_else(|| self.environment.get("PRIME_AGENT_CODING_AGENT_SESSION_DIR"))
+                    .map(PathBuf::from)
+            })
+            .or_else(|| self.prime_home().map(|home| home.join("sessions")))
+    }
+
+    fn selector(&self) -> Option<String> {
+        match self.harness {
+            Harness::Codex => None,
+            Harness::ClaudeCode => option_value(&self.argv, "--session-id", None)
+                .or_else(|| option_value(&self.argv, "--resume", Some("-r"))),
+            Harness::PrimeAgent => option_value(&self.argv, "--resume", Some("-r")).or_else(|| {
+                (self.argv.get(1).and_then(|arg| arg.to_str()) == Some("attach"))
+                    .then(|| self.argv.get(2)?.to_str().map(str::to_owned))
+                    .flatten()
+            }),
+        }
+    }
+}
+
+fn manual_harnesses() -> Result<Vec<Process>> {
     let mut processes = Vec::new();
     for entry in fs::read_dir("/proc").context("enumerate processes")? {
         let entry = entry?;
@@ -307,22 +507,130 @@ fn manual_codexes() -> Result<Vec<Process>> {
             .filter(|arg| !arg.is_empty())
             .map(|arg| OsString::from_vec(arg.to_vec()))
             .collect::<Vec<_>>();
-        if !manual_argv(&argv) || !foreground_tty(&root) {
+        let Some(harness) = harness_argv(&argv) else {
+            continue;
+        };
+        if !foreground_tty(&root) {
             continue;
         }
-        let rollouts = open_rollouts(&root);
-        if !rollouts.is_empty() {
-            processes.push(Process { pid, rollouts });
-        }
+        let environment = process_environment(&root);
+        let home = environment
+            .get("HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        let cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| PathBuf::from("."));
+        let goal = harness == Harness::PrimeAgent && has_option(&argv, "--goal");
+        processes.push(Process {
+            pid,
+            harness,
+            argv,
+            transcripts: open_jsonls(&root),
+            cwd,
+            environment,
+            home,
+            goal,
+        });
     }
     Ok(processes)
 }
 
-fn manual_argv(argv: &[OsString]) -> bool {
-    let Some(program) = argv.first().and_then(|arg| Path::new(arg).file_name()) else {
-        return false;
+fn harness_argv(argv: &[OsString]) -> Option<Harness> {
+    let program = argv.first().and_then(|arg| Path::new(arg).file_name())?;
+    if program == OsStr::new("codex") {
+        return (!argv.iter().skip(1).any(|arg| arg == OsStr::new("exec")))
+            .then_some(Harness::Codex);
+    }
+    if program == OsStr::new("claude") || program == OsStr::new("claude-code") {
+        let banished = ["--print", "-p", "--background", "--bg"]
+            .iter()
+            .any(|flag| has_option(argv, flag));
+        let command = argv.get(1).and_then(|arg| arg.to_str());
+        let subcommand = command.is_some_and(|command| {
+            [
+                "agents",
+                "auth",
+                "auto-mode",
+                "doctor",
+                "gateway",
+                "install",
+                "mcp",
+                "plugin",
+                "plugins",
+                "project",
+                "setup-token",
+                "ultrareview",
+                "update",
+                "upgrade",
+            ]
+            .contains(&command)
+        });
+        return (!banished && !subcommand).then_some(Harness::ClaudeCode);
+    }
+    if program == OsStr::new("prime-agent") {
+        let banished = ["--print", "-p"].iter().any(|flag| has_option(argv, flag))
+            || option_value(argv, "--mode", None).is_some_and(|mode| mode != "text");
+        let command = argv.get(1).and_then(|arg| arg.to_str());
+        let subcommand = command.is_some_and(|command| {
+            [
+                "agents", "config", "doctor", "help", "list", "model", "package", "rename",
+                "schedule", "send", "session", "shutdown", "status", "stop", "update",
+            ]
+            .contains(&command)
+        });
+        return (!banished && !subcommand).then_some(Harness::PrimeAgent);
+    }
+    None
+}
+
+fn has_option(argv: &[OsString], option: &str) -> bool {
+    argv.iter().skip(1).any(|arg| {
+        arg == OsStr::new(option)
+            || arg.to_str().is_some_and(|arg| {
+                arg.strip_prefix(option)
+                    .is_some_and(|tail| tail.starts_with('='))
+            })
+    })
+}
+
+fn option_value(argv: &[OsString], long: &str, short: Option<&str>) -> Option<String> {
+    for (index, arg) in argv.iter().enumerate().skip(1) {
+        let text = arg.to_str()?;
+        if text == long || short == Some(text) {
+            return argv
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.starts_with('-'))
+                .map(str::to_owned);
+        }
+        if let Some(value) = text
+            .strip_prefix(long)
+            .and_then(|tail| tail.strip_prefix('='))
+            && !value.is_empty()
+        {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn process_environment(root: &Path) -> HashMap<String, OsString> {
+    let mut environment = HashMap::new();
+    let Ok(bytes) = fs::read(root.join("environ")) else {
+        return environment;
     };
-    program == OsStr::new("codex") && !argv.iter().skip(1).any(|arg| arg == OsStr::new("exec"))
+    for pair in bytes.split(|byte| *byte == 0) {
+        let Some(split) = pair.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(&pair[..split]) else {
+            continue;
+        };
+        let _prior = environment.insert(
+            name.to_owned(),
+            OsString::from_vec(pair[split + 1..].to_vec()),
+        );
+    }
+    environment
 }
 
 fn foreground_tty(root: &Path) -> bool {
@@ -331,22 +639,195 @@ fn foreground_tty(root: &Path) -> bool {
     })
 }
 
-fn open_rollouts(root: &Path) -> Vec<PathBuf> {
+fn open_jsonls(root: &Path) -> Vec<PathBuf> {
     fs::read_dir(root.join("fd"))
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|entry| fs::read_link(entry.path()).ok())
         .filter(|target| {
-            let rollout = target
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .is_some_and(|stem| stem.starts_with("rollout-"));
-            let jsonl = target
+            target
                 .extension()
                 .and_then(OsStr::to_str)
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
-            rollout && jsonl
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct SessionLocator {
+    claimed: HashSet<PathBuf>,
+    prime_workers: HashMap<PathBuf, Vec<PrimeWorker>>,
+}
+
+impl SessionLocator {
+    fn locate(&mut self, process: &Process) -> Option<PathBuf> {
+        match process.harness {
+            Harness::Codex => None,
+            Harness::ClaudeCode => self.claude(process),
+            Harness::PrimeAgent => self.prime(process),
+        }
+    }
+
+    fn claude(&mut self, process: &Process) -> Option<PathBuf> {
+        if let Some(path) = self.claim(
+            process
+                .transcripts
+                .iter()
+                .filter(|path| claude_jsonl(path))
+                .cloned(),
+        ) {
+            return Some(path);
+        }
+        let directory = process
+            .claude_home()?
+            .join("projects")
+            .join(claude_project_key(&process.cwd));
+        if let Some(selector) = process.selector() {
+            let exact = directory.join(format!("{selector}.jsonl"));
+            if exact.is_file() && self.claimed.insert(exact.clone()) {
+                return Some(exact);
+            }
+        }
+        self.claim(direct_jsonls(&directory))
+    }
+
+    fn prime(&mut self, process: &Process) -> Option<PathBuf> {
+        if let Some(path) = self.claim(
+            process
+                .transcripts
+                .iter()
+                .filter(|path| prime_jsonl(path))
+                .cloned(),
+        ) {
+            return Some(path);
+        }
+        let session_dir = process.prime_sessions()?;
+        if let Some(selector) = process.selector() {
+            let selector_path = PathBuf::from(&selector);
+            if selector_path.is_file() && self.claimed.insert(selector_path.clone()) {
+                return Some(selector_path);
+            }
+            if let Some(path) = self.claim(direct_jsonls(&session_dir).into_iter().filter(|path| {
+                path.file_stem()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|stem| stem.starts_with(&selector))
+            })) {
+                return Some(path);
+            }
+        }
+        if let Some(agent_dir) = process.prime_home() {
+            let workers = self
+                .prime_workers
+                .entry(agent_dir.clone())
+                .or_insert_with(|| read_prime_workers(&agent_dir))
+                .clone();
+            if let Some(path) = self.claim(
+                workers
+                    .into_iter()
+                    .filter(|worker| worker.cwd == process.cwd)
+                    .map(|worker| worker.session),
+            ) {
+                return Some(path);
+            }
+        }
+        self.claim(direct_jsonls(&session_dir))
+    }
+
+    fn claim(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+        let selected = paths
+            .into_iter()
+            .filter(|path| !self.claimed.contains(path))
+            .filter_map(|path| {
+                let modified = fs::metadata(&path).ok()?.modified().ok()?;
+                Some((modified, path))
+            })
+            .max_by(Ord::cmp)?
+            .1;
+        let _new = self.claimed.insert(selected.clone());
+        Some(selected)
+    }
+}
+
+#[derive(Clone)]
+struct PrimeWorker {
+    cwd: PathBuf,
+    session: PathBuf,
+}
+
+fn read_prime_workers(agent_dir: &Path) -> Vec<PrimeWorker> {
+    let Ok(hosts) = fs::read_dir(agent_dir.join("daemon-workers")) else {
+        return Vec::new();
+    };
+    hosts
+        .flatten()
+        .flat_map(|host| fs::read_dir(host.path()).into_iter().flatten().flatten())
+        .filter(|entry| entry.path().extension() == Some(OsStr::new("json")))
+        .filter_map(|entry| fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter_map(|record| {
+            let session = record
+                .get("sessionFile")
+                .and_then(serde_json::Value::as_str)?;
+            let cwd = record
+                .pointer("/createCommand/config/cwd")
+                .and_then(serde_json::Value::as_str)?;
+            Some(PrimeWorker {
+                cwd: PathBuf::from(cwd),
+                session: PathBuf::from(session),
+            })
+        })
+        .collect()
+}
+
+fn direct_jsonls(directory: &Path) -> Vec<PathBuf> {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension() == Some(OsStr::new("jsonl")))
+        .collect()
+}
+
+fn claude_jsonl(path: &Path) -> bool {
+    prime_jsonl(path)
+        && path
+            .ancestors()
+            .any(|ancestor| ancestor.file_name() == Some(OsStr::new("projects")))
+        && !path
+            .ancestors()
+            .any(|ancestor| ancestor.file_name() == Some(OsStr::new("subagents")))
+}
+
+fn prime_jsonl(path: &Path) -> bool {
+    path.extension() == Some(OsStr::new("jsonl"))
+        && path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .is_some_and(uuidish)
+        && !path
+            .ancestors()
+            .any(|ancestor| ancestor.file_name() == Some(OsStr::new("session-artifacts")))
+}
+
+fn uuidish(stem: &str) -> bool {
+    stem.len() == 36
+        && stem
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) == (byte == b'-'))
+}
+
+fn claude_project_key(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() {
+                char::from(byte)
+            } else {
+                '-'
+            }
         })
         .collect()
 }
@@ -392,17 +873,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admits_tui_and_resume_but_beheads_exec() {
-        assert!(manual_argv(&[OsString::from("codex")]));
-        assert!(manual_argv(&[
-            OsString::from("/usr/bin/codex"),
-            OsString::from("resume")
-        ]));
-        assert!(!manual_argv(&[
-            OsString::from("codex"),
-            OsString::from("exec"),
-            OsString::from("do it")
-        ]));
+    fn work_state_has_one_lawful_precedence() {
+        assert_eq!(classify_work(true, true, false), Work::Goal);
+        assert_eq!(classify_work(true, false, false), Work::Turn);
+        assert_eq!(classify_work(false, true, false), Work::Done);
+        assert_eq!(classify_work(false, false, false), Work::Done);
+        assert_eq!(classify_work(true, true, true), Work::Input);
+    }
+
+    #[test]
+    fn admits_three_interactive_harnesses_and_beheads_batch_modes() {
+        assert_eq!(
+            harness_argv(&[OsString::from("codex")]),
+            Some(Harness::Codex)
+        );
+        assert_eq!(
+            harness_argv(&[
+                OsString::from("/usr/bin/claude"),
+                OsString::from("--resume"),
+                OsString::from("id")
+            ]),
+            Some(Harness::ClaudeCode)
+        );
+        assert_eq!(
+            harness_argv(&[
+                OsString::from("prime-agent"),
+                OsString::from("--cwd"),
+                OsString::from("/work")
+            ]),
+            Some(Harness::PrimeAgent)
+        );
+        assert_eq!(
+            harness_argv(&[
+                OsString::from("prime-agent"),
+                OsString::from("--mode"),
+                OsString::from("text")
+            ]),
+            Some(Harness::PrimeAgent)
+        );
+        assert_eq!(
+            harness_argv(&[
+                OsString::from("prime-agent"),
+                OsString::from("attach"),
+                OsString::from("session-id")
+            ]),
+            Some(Harness::PrimeAgent)
+        );
+        assert_eq!(
+            harness_argv(&[
+                OsString::from("codex"),
+                OsString::from("exec"),
+                OsString::from("do it")
+            ]),
+            None
+        );
+        assert_eq!(
+            harness_argv(&[
+                OsString::from("claude"),
+                OsString::from("--print"),
+                OsString::from("do it")
+            ]),
+            None
+        );
+        assert_eq!(
+            harness_argv(&[OsString::from("prime-agent"), OsString::from("list")]),
+            None
+        );
+        assert_eq!(
+            harness_argv(&[
+                OsString::from("prime-agent"),
+                OsString::from("--mode"),
+                OsString::from("daemon")
+            ]),
+            None
+        );
     }
 
     #[test]
@@ -412,6 +956,14 @@ mod tests {
         assert_eq!(
             rollout_id(path),
             Some("019fc940-b18f-7ad2-a012-71d86289bd60")
+        );
+    }
+
+    #[test]
+    fn claude_project_directory_uses_its_native_path_cipher() {
+        assert_eq!(
+            claude_project_key(Path::new("/home/main/a.b/work-tree")),
+            "-home-main-a-b-work-tree"
         );
     }
 

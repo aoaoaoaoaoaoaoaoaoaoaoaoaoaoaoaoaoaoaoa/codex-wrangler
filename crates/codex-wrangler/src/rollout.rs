@@ -1,55 +1,56 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
 };
 
-use crate::contract::Work;
 use memchr::memmem;
 use serde_json::Value;
 
 const BLOCK: usize = 1 << 20;
+const INPUT_REQUEST: &[u8] = b"\"name\":\"request_user_input\"";
+const CALL_OUTPUT: &[u8] = b"\"type\":\"function_call_output\"";
+const CALL_ID: &[u8] = b"\"call_id\":\"";
 
 #[derive(Clone, Debug, Default)]
 struct Pulse {
-    goal: bool,
     running: bool,
+    input_call: Option<String>,
     preview: String,
 }
 
 impl Pulse {
-    fn work(&self) -> Work {
-        if self.goal && self.running {
-            Work::Goal
-        } else if self.running {
-            Work::Turn
-        } else {
-            Work::Done
-        }
-    }
-
     fn absorb(&mut self, line: &[u8]) {
+        if memmem::find(line, INPUT_REQUEST).is_some() {
+            self.input_call = call_id(line).map(str::to_owned);
+            return;
+        }
+        if self.input_call.is_some()
+            && memmem::find(line, CALL_OUTPUT).is_some()
+            && call_id(line) == self.input_call.as_deref()
+        {
+            self.input_call = None;
+            return;
+        }
         if !interesting(line) {
             return;
         }
         let Ok(event) = serde_json::from_slice::<Value>(line) else {
             return;
         };
+        let payload = &event["payload"];
         if event.get("type").and_then(Value::as_str) != Some("event_msg") {
             return;
         }
-        let payload = &event["payload"];
         match payload.get("type").and_then(Value::as_str) {
             Some("task_started" | "turn_started") => self.running = true,
             Some("task_complete" | "turn_complete" | "turn_aborted") => {
                 self.running = false;
+                self.input_call = None;
                 if let Some(message) = payload.get("last_agent_message").and_then(Value::as_str) {
                     assign_preview(&mut self.preview, message);
                 }
-            }
-            Some("thread_goal_updated") => {
-                self.goal = payload["goal"]["status"].as_str() == Some("active");
             }
             Some("user_message" | "agent_message") => {
                 if let Some(message) = payload.get("message").and_then(Value::as_str) {
@@ -71,12 +72,18 @@ fn interesting(line: &[u8]) -> bool {
     [
         b"\"type\":\"task_".as_slice(),
         b"\"type\":\"turn_".as_slice(),
-        b"\"type\":\"thread_goal_updated\"".as_slice(),
         b"\"type\":\"user_message\"".as_slice(),
         b"\"type\":\"agent_message\"".as_slice(),
     ]
     .iter()
     .any(|needle| memmem::find(line, needle).is_some())
+}
+
+fn call_id(line: &[u8]) -> Option<&str> {
+    let start = memmem::find(line, CALL_ID)? + CALL_ID.len();
+    let tail = line.get(start..)?;
+    let end = memchr::memchr(b'"', tail)?;
+    std::str::from_utf8(&tail[..end]).ok()
 }
 
 #[derive(Clone, Debug)]
@@ -93,7 +100,8 @@ pub struct Rollouts {
 #[derive(Clone, Debug)]
 pub struct RolloutSummary {
     pub preview: String,
-    pub work: Work,
+    pub running: bool,
+    pub waiting_for_input: bool,
 }
 
 impl Rollouts {
@@ -110,7 +118,8 @@ impl Rollouts {
         };
         let summary = RolloutSummary {
             preview: pulse.preview.clone(),
-            work: pulse.work(),
+            running: pulse.running,
+            waiting_for_input: pulse.input_call.is_some(),
         };
         let _prior = self.memo.insert(path.to_owned(), Memo { length, pulse });
         Ok(summary)
@@ -132,10 +141,11 @@ fn scan_reverse(path: &Path, length: u64) -> std::io::Result<Pulse> {
     let mut suffix = Vec::new();
     let mut newest = Pulse::default();
     let mut found_work = false;
-    let mut found_goal = false;
     let mut found_preview = false;
+    let mut found_input_call = false;
+    let mut resolved_calls = HashSet::new();
 
-    while cursor > 0 && !(found_work && found_goal && found_preview) {
+    while cursor > 0 && !(found_work && found_preview) {
         let start = cursor.saturating_sub(BLOCK as u64);
         let span = usize::try_from(cursor - start).unwrap_or(BLOCK);
         let mut bytes = vec![0; span];
@@ -154,10 +164,11 @@ fn scan_reverse(path: &Path, length: u64) -> std::io::Result<Pulse> {
                 line,
                 &mut newest,
                 &mut found_work,
-                &mut found_goal,
                 &mut found_preview,
+                &mut found_input_call,
+                &mut resolved_calls,
             );
-            if found_work && found_goal && found_preview {
+            if found_work && found_preview {
                 break;
             }
         }
@@ -171,9 +182,25 @@ fn inspect_reverse(
     line: &[u8],
     newest: &mut Pulse,
     found_work: &mut bool,
-    found_goal: &mut bool,
     found_preview: &mut bool,
+    found_input_call: &mut bool,
+    resolved_calls: &mut HashSet<String>,
 ) {
+    if memmem::find(line, CALL_OUTPUT).is_some() {
+        if let Some(call) = call_id(line) {
+            let _new = resolved_calls.insert(call.to_owned());
+        }
+        return;
+    }
+    if !*found_input_call && memmem::find(line, INPUT_REQUEST).is_some() {
+        if let Some(call) = call_id(line)
+            && !resolved_calls.contains(call)
+        {
+            newest.input_call = Some(call.to_owned());
+        }
+        *found_input_call = true;
+        return;
+    }
     if !interesting(line) {
         return;
     }
@@ -199,10 +226,6 @@ fn inspect_reverse(
                 assign_preview(&mut newest.preview, message);
                 *found_preview = true;
             }
-        }
-        Some("thread_goal_updated") if !*found_goal => {
-            newest.goal = payload["goal"]["status"].as_str() == Some("active");
-            *found_goal = true;
         }
         Some("user_message" | "agent_message") if !*found_preview => {
             if let Some(message) = payload.get("message").and_then(Value::as_str)
@@ -231,14 +254,14 @@ mod tests {
     }
 
     #[test]
-    fn active_goal_dominates_an_active_turn() {
+    fn active_turn_is_running() {
         let file = fixture(&[
             r#"{"type":"event_msg","payload":{"type":"user_message","message":"forge it"}}"#,
             r#"{"type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"status":"active"}}}"#,
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
         ]);
         let summary = Rollouts::default().read(file.path()).expect("summarize");
-        assert_eq!(summary.work, Work::Goal);
+        assert!(summary.running);
         assert_eq!(summary.preview, "forge it");
     }
 
@@ -249,46 +272,95 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
         ]);
         let mut rollouts = Rollouts::default();
-        assert_eq!(
-            rollouts.read(file.path()).expect("running").work,
-            Work::Turn
-        );
+        assert!(rollouts.read(file.path()).expect("running").running);
         file.write_all(
             b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"slain\"}}\n",
         )
         .expect("append completion");
         let summary = rollouts.read(file.path()).expect("complete");
-        assert_eq!(summary.work, Work::Done);
+        assert!(!summary.running);
         assert_eq!(summary.preview, "slain");
     }
 
     #[test]
-    fn an_idle_active_goal_is_not_working() {
+    fn an_idle_rollout_is_not_running() {
         let file = fixture(&[
             r#"{"type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"status":"active"}}}"#,
             r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
         ]);
-        assert_eq!(
-            Rollouts::default()
+        assert!(
+            !Rollouts::default()
                 .read(file.path())
                 .expect("summarize")
-                .work,
-            Work::Done
+                .running
         );
     }
 
     #[test]
-    fn a_paused_goal_with_an_ordinary_turn_is_green() {
+    fn goal_events_do_not_own_running_state() {
         let file = fixture(&[
             r#"{"type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"status":"paused"}}}"#,
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
         ]);
-        assert_eq!(
+        assert!(
             Rollouts::default()
                 .read(file.path())
                 .expect("summarize")
-                .work,
-            Work::Turn
+                .running
+        );
+    }
+
+    #[test]
+    fn unanswered_input_request_is_a_distinct_wait() {
+        let file = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"begin"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call_7"}}"#,
+        ]);
+        let summary = Rollouts::default().read(file.path()).expect("summarize");
+        assert!(summary.running);
+        assert!(summary.waiting_for_input);
+    }
+
+    #[test]
+    fn input_response_releases_the_wait_incrementally() {
+        let mut file = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"begin"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call_7"}}"#,
+        ]);
+        let mut rollouts = Rollouts::default();
+        assert!(
+            rollouts
+                .read(file.path())
+                .expect("waiting")
+                .waiting_for_input
+        );
+        file.write_all(
+            b"{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call_7\"}}\n",
+        )
+        .expect("append response");
+        assert!(
+            !rollouts
+                .read(file.path())
+                .expect("released")
+                .waiting_for_input
+        );
+    }
+
+    #[test]
+    fn answered_input_request_is_not_a_wait_on_cold_scan() {
+        let file = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"begin"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call_7"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_7"}}"#,
+        ]);
+        assert!(
+            !Rollouts::default()
+                .read(file.path())
+                .expect("answered")
+                .waiting_for_input
         );
     }
 }

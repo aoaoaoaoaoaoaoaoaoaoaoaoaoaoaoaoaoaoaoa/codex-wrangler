@@ -1,13 +1,13 @@
 [package]
 name = "codex-wrangler"
 version.workspace = true
-description = "Linux/X11/i3 tray switcher for live Codex TUI sessions"
+description = "Linux/X11/i3 tray switcher for live coding-agent TUI sessions"
 edition.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-keywords = ["codex", "i3", "x11", "egui"]
+keywords = ["codex", "claude", "i3", "x11", "egui"]
 categories = ["gui"]
 
 [features]

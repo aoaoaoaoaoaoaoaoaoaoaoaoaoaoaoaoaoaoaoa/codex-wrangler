@@ -1,10 +1,13 @@
 mod app;
 mod contract;
 mod desktop;
+mod i3;
 mod instance;
 mod model;
 mod recon;
 mod rollout;
+mod sigil;
+mod transcript;
 mod tray;
 
 #[cfg(feature = "egui-test")]

@@ -409,7 +409,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dwemer_poolrooms"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "eternalist-apps"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dwemer_poolrooms",

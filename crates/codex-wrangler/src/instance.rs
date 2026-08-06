@@ -18,6 +18,7 @@ pub struct Incumbent {
     pub(crate) screen_number: usize,
     pub(crate) anchor: Window,
     pub(crate) summons: Atom,
+    pub(crate) launch_desktop: Option<u32>,
 }
 
 impl Incumbent {
@@ -42,7 +43,8 @@ impl Incumbent {
         .check()
         .context("create instance anchor")?;
         let summons = intern(&conn, &format!("_CODEX_WRANGLER_INSTANCE_S{screen_number}"))?;
-        let desktop = Desktop::current_desktop()?.unwrap_or(NO_DESKTOP);
+        let launch_desktop = Desktop::current_desktop()?;
+        let desktop = launch_desktop.unwrap_or(NO_DESKTOP);
 
         conn.grab_server()?
             .check()
@@ -76,6 +78,7 @@ impl Incumbent {
                 screen_number,
                 anchor,
                 summons,
+                launch_desktop,
             }))
         } else {
             conn.destroy_window(anchor)?
@@ -84,6 +87,10 @@ impl Incumbent {
             conn.flush().context("seal Codex Wrangler relay")?;
             Ok(None)
         }
+    }
+
+    pub const fn launch_desktop(&self) -> Option<u32> {
+        self.launch_desktop
     }
 }
 

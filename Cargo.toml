@@ -16,12 +16,12 @@ version = "1.0.0"
 [workspace.dependencies]
 anyhow = "1.0.102"
 crossbeam-channel = "0.5.15"
-dwemer_poolrooms = { path = "../dwemer_poolrooms", version = "0.7.0" }
+dwemer_poolrooms = { path = "../dwemer_poolrooms", version = "0.8.0" }
 egui = "=0.34.3"
 egui-tester = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/egui-tester", rev = "ea7308a50cc8029ad807377b71c3aec8f5c95a57", version = "0.6.0" }
 egui-tester-witness = "0.6.0"
 egui-wgpu = "=0.34.3"
-eternalist-apps = { path = "../eternalist_apps", version = "0.1.0" }
+eternalist-apps = { path = "../eternalist_apps", version = "0.2.0" }
 memchr = "2.7.6"
 nix = { version = "0.30.1", default-features = false, features = ["poll"] }
 rusqlite = "0.37.0"

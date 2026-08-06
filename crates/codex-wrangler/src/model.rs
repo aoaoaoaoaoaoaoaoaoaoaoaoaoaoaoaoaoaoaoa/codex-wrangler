@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 
-use crate::contract::Work;
+use crate::contract::{Harness, Work};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CodexCard {
+pub struct Card {
+    pub harness: Harness,
     pub thread: String,
     pub name: Option<String>,
     pub cwd: String,
@@ -34,16 +35,17 @@ pub fn snip(text: &str, limit: usize) -> String {
     }
 }
 
-impl Ord for CodexCard {
+impl Ord for Card {
     fn cmp(&self, other: &Self) -> Ordering {
         rank(self.work)
             .cmp(&rank(other.work))
             .then_with(|| other.updated_at_ms.cmp(&self.updated_at_ms))
+            .then_with(|| self.harness.cmp(&other.harness))
             .then_with(|| self.thread.cmp(&other.thread))
     }
 }
 
-impl PartialOrd for CodexCard {
+impl PartialOrd for Card {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -51,15 +53,16 @@ impl PartialOrd for CodexCard {
 
 const fn rank(work: Work) -> u8 {
     match work {
-        Work::Goal => 0,
-        Work::Turn => 1,
-        Work::Done => 2,
+        Work::Input => 0,
+        Work::Goal => 1,
+        Work::Turn => 2,
+        Work::Done => 3,
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Census {
-    pub cards: Vec<CodexCard>,
+    pub cards: Vec<Card>,
     pub fault: Option<String>,
 }
 

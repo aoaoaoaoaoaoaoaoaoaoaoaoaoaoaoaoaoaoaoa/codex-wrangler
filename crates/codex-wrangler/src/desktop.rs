@@ -6,7 +6,7 @@ use x11rb::{
     connection::Connection,
     protocol::xproto::{
         Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask,
-        InputFocus, PropMode, StackMode, Window,
+        PropMode, StackMode, Window,
     },
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
@@ -73,23 +73,57 @@ impl Desktop {
     }
 
     pub fn activate(&self, window: Window) -> Result<()> {
-        let _mapped = self.conn.map_window(window)?;
-        let _raised = self.conn.configure_window(
-            window,
-            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-        )?;
-        let _focused = self
-            .conn
-            .set_input_focus(InputFocus::PARENT, window, CURRENT_TIME)?;
+        self.drive_window(window, None)?;
+        self.conn.flush().context("activate harness terminal")
+    }
+
+    fn drive_window(&self, window: Window, destination: Option<u32>) -> Result<()> {
+        if let Some(index) = destination {
+            self.conn
+                .change_property32(
+                    PropMode::REPLACE,
+                    window,
+                    self.atoms.desktop,
+                    AtomEnum::CARDINAL,
+                    &[index],
+                )?
+                .check()
+                .context("prime destination workspace")?;
+            let event =
+                ClientMessageEvent::new(32, window, self.atoms.desktop, [index, 2, 0, 0, 0]);
+            self.conn
+                .send_event(
+                    false,
+                    self.root,
+                    EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                    event,
+                )?
+                .check()
+                .context("move window to destination workspace")?;
+        }
+        self.conn
+            .map_window(window)?
+            .check()
+            .context("map destination window")?;
+        self.conn
+            .configure_window(
+                window,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?
+            .check()
+            .context("raise destination window")?;
         let event =
             ClientMessageEvent::new(32, window, self.atoms.active, [2, CURRENT_TIME, 0, 0, 0]);
-        let _sent = self.conn.send_event(
-            false,
-            self.root,
-            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            event,
-        )?;
-        self.conn.flush().context("activate Codex terminal")
+        self.conn
+            .send_event(
+                false,
+                self.root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )?
+            .check()
+            .context("announce active window")?;
+        Ok(())
     }
 
     pub fn workspace_numbers(
@@ -118,38 +152,34 @@ impl Desktop {
         desktop.cardinal(desktop.root, desktop.atoms.current_desktop)
     }
 
-    pub fn summon_process_to(pid: u32, index: u32) -> Result<()> {
+    pub fn process_floating(pid: u32) -> Result<Option<bool>> {
         let desktop = Self::connect()?;
         let Some(window) = desktop.window_by_pid(pid)? else {
-            return Ok(());
+            return Ok(None);
         };
-        desktop
-            .conn
-            .change_property32(
-                PropMode::REPLACE,
-                window,
-                desktop.atoms.desktop,
-                AtomEnum::CARDINAL,
-                &[index],
-            )?
-            .check()
-            .context("prime Wrangler's destination workspace")?;
-        let event = ClientMessageEvent::new(32, window, desktop.atoms.desktop, [index, 2, 0, 0, 0]);
-        let _sent = desktop.conn.send_event(
-            false,
-            desktop.root,
-            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            event,
-        )?;
-        let active =
-            ClientMessageEvent::new(32, window, desktop.atoms.active, [2, CURRENT_TIME, 0, 0, 0]);
-        let _sent = desktop.conn.send_event(
-            false,
-            desktop.root,
-            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            active,
-        )?;
-        desktop.conn.flush().context("summon Wrangler")
+        crate::i3::window_floating(window)
+    }
+
+    pub fn summon_process_to(pid: u32, index: Option<u32>, floating: bool) -> Result<bool> {
+        let desktop = Self::connect()?;
+        let Some(window) = desktop.window_by_pid(pid)? else {
+            return Ok(false);
+        };
+        let destination = floating.then_some(index).flatten();
+        desktop.drive_window(window, destination)?;
+        desktop.conn.flush().context("summon Wrangler")?;
+        let workspace = desktop.cardinal(window, desktop.atoms.desktop)?;
+        let workspace_settled = match destination {
+            Some(index) => desktop.cardinal(window, desktop.atoms.desktop)? == Some(index),
+            None => match workspace {
+                Some(index) => {
+                    desktop.cardinal(desktop.root, desktop.atoms.current_desktop)? == Some(index)
+                }
+                None => true,
+            },
+        };
+        let focus_settled = desktop.window(desktop.root, desktop.atoms.active)? == Some(window);
+        Ok(workspace_settled && focus_settled)
     }
 
     fn window_pid(&self, window: Window) -> Result<Option<u32>> {
@@ -174,6 +204,16 @@ impl Desktop {
             .get_property(false, window, atom, AtomEnum::CARDINAL, 0, 1)?
             .reply()
             .with_context(|| format!("read X11 cardinal {atom} from window {window}"))?
+            .value32()
+            .and_then(|mut values| values.next()))
+    }
+
+    fn window(&self, window: Window, atom: Atom) -> Result<Option<Window>> {
+        Ok(self
+            .conn
+            .get_property(false, window, atom, AtomEnum::WINDOW, 0, 1)?
+            .reply()
+            .with_context(|| format!("read X11 window {atom} from window {window}"))?
             .value32()
             .and_then(|mut values| values.next()))
     }
