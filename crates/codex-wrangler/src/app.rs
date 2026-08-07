@@ -1,15 +1,19 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 #[cfg(feature = "egui-test")]
 use crate::contract::{
-    CardKey, CardObservation, CardTarget, LogoTarget, Observation, UI_FINGERPRINT, WorkspaceTarget,
+    CardKey, CardObservation, CardTarget, Flight, LogoTarget, Observation, UI_FINGERPRINT,
+    WorkspaceTarget,
 };
 use dwemer_poolrooms::{
     chrome,
-    water::{Domain, Floor, Frame as WaterFrame, Surface, Wetness},
+    water::{Domain, Floor, Frame as WaterFrame, Poke, Surface, Wetness},
 };
 use egui::{Color32, RichText, Sense, Stroke, StrokeKind, Vec2};
 use eternalist_apps::{CloseDisposition, LivingWait, NativeApp, WindowSpec};
@@ -17,8 +21,9 @@ use eternalist_apps::{CloseDisposition, LivingWait, NativeApp, WindowSpec};
 use crate::{
     contract::{Harness, Work},
     instance::{Incumbent, NO_DESKTOP},
-    model::{Card, Census},
-    recon::{Nexus, Strike, spawn},
+    model::{Card, Census, Retention},
+    posture::{Ledger, Posture},
+    recon::{Intent, Nexus, Strike, spawn},
     sigil,
     tray::{Signal as TraySignal, Tray},
 };
@@ -30,48 +35,90 @@ const GREEN: Color32 = Color32::from_rgb(91, 218, 146);
 const VIOLET: Color32 = Color32::from_rgb(178, 115, 238);
 const RED: Color32 = Color32::from_rgb(236, 91, 91);
 const WHITE: Color32 = Color32::from_rgb(238, 234, 224);
+const ASH: Color32 = Color32::from_rgb(174, 172, 166);
 const TYPE_LIFT: f32 = 1.0;
 const SUMMON_BARRAGE: u8 = 12;
+const TILE_AREA_PER_IMPULSE: f32 = 2_000.0;
+const TILE_IMPULSE_CEIL: f32 = 1.60;
+const TILE_SWEEP_EPSILON: f32 = 0.05;
 
-pub struct Wrangler {
+type JoltLedger = HashMap<Harness, HashMap<String, Vec2>>;
+
+struct CardPhysics<'a> {
+    jiggling: bool,
+    recoiling: bool,
+    water: &'a mut Surface,
+    jolts: &'a mut JoltLedger,
+}
+
+struct ActivationFlight {
+    strike: Strike,
+    witness: FlightWitness,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FlightWitness {
+    Unpresented,
+    Presented,
+    Reapable,
+}
+
+impl ActivationFlight {
+    const fn launch(strike: Strike) -> Self {
+        Self {
+            strike,
+            witness: FlightWitness::Unpresented,
+        }
+    }
+
+    fn witness(&mut self) {
+        self.witness = match self.witness {
+            FlightWitness::Unpresented => FlightWitness::Presented,
+            FlightWitness::Presented | FlightWitness::Reapable => FlightWitness::Reapable,
+        };
+    }
+}
+
+struct Wrangler<const START_FLOATING: bool> {
     water: Surface,
     living_wait: LivingWait,
     nexus: Nexus,
     census: Option<Census>,
     census_label: String,
     first_frame_presented: bool,
-    void_sighted: bool,
     summon: Arc<AtomicU64>,
     summon_generation: u32,
     summon_attempts: Option<u8>,
     posture: Posture,
+    pending_activation: Option<ActivationFlight>,
     quit: Arc<AtomicBool>,
     hovered: Option<usize>,
+    jiggling: bool,
+    jolts: JoltLedger,
+    concealed: bool,
+    ledger: Ledger,
     tray: Option<Tray>,
 }
 
-#[derive(Clone, Copy)]
-enum Posture {
-    Floating,
-    Tiled,
-}
-
-impl Posture {
-    const fn from_floating(floating: bool) -> Self {
-        if floating {
-            Self::Floating
-        } else {
-            Self::Tiled
+pub fn launch(
+    ctx: &egui::Context,
+    incumbent: Incumbent,
+    ledger: Ledger,
+    posture: Posture,
+) -> anyhow::Result<()> {
+    match posture {
+        Posture::Floating => {
+            eternalist_apps::run(ctx.clone(), Wrangler::<true>::raise(ctx, incumbent, ledger))
         }
-    }
-
-    const fn floating(self) -> bool {
-        matches!(self, Self::Floating)
+        Posture::Tiled => eternalist_apps::run(
+            ctx.clone(),
+            Wrangler::<false>::raise(ctx, incumbent, ledger),
+        ),
     }
 }
 
-impl Wrangler {
-    pub fn raise(ctx: &egui::Context, incumbent: Incumbent) -> Self {
+impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
+    fn raise(ctx: &egui::Context, incumbent: Incumbent, ledger: Ledger) -> Self {
         lift_typography(ctx);
         let nexus = spawn(ctx.clone());
         let summon = Arc::new(AtomicU64::new(pack_summon(1, incumbent.launch_desktop())));
@@ -111,14 +158,65 @@ impl Wrangler {
             census: None,
             census_label: "DISCOVERING MANUAL THREADS".to_owned(),
             first_frame_presented: false,
-            void_sighted: false,
             summon,
             summon_generation: 0,
             summon_attempts: Some(0),
-            posture: Posture::from_floating(Self::WINDOW.floating),
+            posture: Posture::from_floating(START_FLOATING),
+            pending_activation: None,
             quit,
             hovered: None,
+            jiggling: false,
+            jolts: JoltLedger::new(),
+            concealed: false,
+            ledger,
             tray,
+        }
+    }
+
+    fn quench(&mut self) {
+        self.concealed = true;
+        self.jiggling = false;
+        self.jolts.clear();
+        self.water.reset();
+        self.water.set_wetness(Wetness::Dry);
+    }
+
+    fn reap_activation(&mut self, ui: &egui::Ui) {
+        if self
+            .pending_activation
+            .as_ref()
+            .is_some_and(|flight| flight.witness != FlightWitness::Reapable)
+        {
+            return;
+        }
+        let Some(activation) = self.nexus.take_activation() else {
+            return;
+        };
+        if self
+            .pending_activation
+            .as_ref()
+            .is_none_or(|flight| flight.strike != activation.strike)
+        {
+            return;
+        }
+        self.pending_activation = None;
+        if activation.succeeded && activation.conceal {
+            self.sight_posture();
+            if self.posture.floating() {
+                self.quench();
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+    }
+
+    fn kindle_if_summoned(&mut self) {
+        let generation = u32::try_from(self.summon.load(Ordering::Acquire) >> 32)
+            .expect("summon generation occupies 32 bits");
+        if generation != self.summon_generation {
+            self.concealed = false;
+            self.water.reset();
+            self.water.set_wetness(Wetness::Wet);
         }
     }
 
@@ -126,22 +224,20 @@ impl Wrangler {
         if !self.first_frame_presented {
             return false;
         }
-        let mut changed = false;
-        for census in self.nexus.census.try_iter() {
-            if let Some(census) =
-                admit_census(self.census.is_some(), &mut self.void_sighted, census)
-            {
-                self.census_label = census_count(census.cards.len());
-                self.census = Some(census);
-                changed = true;
-            }
-        }
-        changed
+        let Some(census) = self.nexus.take_census() else {
+            return false;
+        };
+        self.census_label = census_count(census.cards.len());
+        self.census = Some(census);
+        true
     }
 
     fn sight_posture(&mut self) {
         match crate::desktop::Desktop::process_floating(std::process::id()) {
-            Ok(Some(floating)) => self.posture = Posture::from_floating(floating),
+            Ok(Some(floating)) => {
+                self.posture = Posture::from_floating(floating);
+                self.ledger.remember(self.posture);
+            }
             Ok(None) => {}
             Err(error) => {
                 eprintln!("codex-wrangler could not read its i3 window mode: {error:#}");
@@ -164,6 +260,12 @@ impl Wrangler {
                     })
             }),
             loading: self.census.is_none(),
+            jiggling: self.jiggling,
+            flight: if self.pending_activation.is_some() {
+                Flight::Striking
+            } else {
+                Flight::Grounded
+            },
             cards: self
                 .census
                 .iter()
@@ -174,23 +276,50 @@ impl Wrangler {
                     thread: card.thread.clone(),
                     work: card.work,
                     workspace: card.workspace,
+                    open: card.window.is_some(),
+                    archived: card.retention == Retention::Archived,
                 })
                 .collect(),
         }
     }
 }
 
-impl NativeApp for Wrangler {
-    const WINDOW: WindowSpec = WindowSpec::new("Codex Wrangler", [1_260.0, 820.0]).floating();
+impl<const START_FLOATING: bool> Drop for Wrangler<START_FLOATING> {
+    fn drop(&mut self) {
+        self.sight_posture();
+        self.ledger.remember(self.posture);
+    }
+}
+
+impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
+    const WINDOW: WindowSpec = if START_FLOATING {
+        WindowSpec::new("Codex Wrangler", [1_260.0, 820.0]).floating()
+    } else {
+        WindowSpec::new("Codex Wrangler", [1_260.0, 820.0])
+    };
 
     fn draw(&mut self, ui: &mut egui::Ui) {
+        self.kindle_if_summoned();
         self.hovered = None;
+        self.reap_activation(ui);
+        if self.concealed {
+            return;
+        }
         if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.sight_posture();
+            self.quench();
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
         }
         let basin = ui.max_rect();
+        let jiggling = ui.input(|input| input.modifiers.shift);
+        let recoiling = self.jiggling && !jiggling;
+        self.jiggling = jiggling;
+        if jiggling {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(45));
+        }
         self.water.begin(Domain::basin(basin));
         self.water.set_floor(Some(Floor::shallow(basin)));
         let mut selected = None;
@@ -207,6 +336,8 @@ impl NativeApp for Wrangler {
                     let _count = ui.label(chrome::muted(&self.census_label).size(13.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         legend(ui, "DONE", Work::Done);
+                        legend(ui, "SLEEP", Work::Sleeping);
+                        archive_legend(ui);
                         legend(ui, "GOAL", Work::Goal);
                         legend(ui, "WORKING", Work::Turn);
                         legend(ui, "INPUT", Work::Input);
@@ -238,23 +369,33 @@ impl NativeApp for Wrangler {
                                 )
                             });
                         } else if let Some(census) = &self.census {
-                            selected =
-                                gallery(ui, &census.cards, &mut self.water, &mut self.hovered);
+                            selected = gallery(
+                                ui,
+                                &census.cards,
+                                jiggling,
+                                recoiling,
+                                &mut self.water,
+                                &mut self.jolts,
+                                &mut self.hovered,
+                            );
                         }
                     });
                 scroll.state.offset.y
             });
-        if let Some(window) = selected {
+        if !jiggling {
+            self.jolts.clear();
+        }
+        if let Some(strike) = selected
+            && self.pending_activation.is_none()
+        {
             self.summon_attempts = None;
             self.sight_posture();
-            let _sent = self.nexus.strike.try_send(Strike::Activate(window));
-            if self.posture.floating() {
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if self.nexus.strike.try_send(strike.clone()).is_ok() {
+                self.pending_activation = Some(ActivationFlight::launch(strike));
             }
         }
         self.water.heave(ui.ctx(), panel.inner);
-        if self.hovered.is_none() && self.drain() {
+        if self.hovered.is_none() && !jiggling && self.drain() {
             ui.ctx().request_repaint();
         }
     }
@@ -262,6 +403,7 @@ impl NativeApp for Wrangler {
     fn close_requested(&mut self) -> CloseDisposition {
         if self.tray.as_ref().is_some_and(Tray::available) {
             self.sight_posture();
+            self.quench();
             CloseDisposition::Hide
         } else {
             CloseDisposition::Exit
@@ -273,6 +415,9 @@ impl NativeApp for Wrangler {
     }
 
     fn after_present(&mut self) -> bool {
+        if let Some(flight) = &mut self.pending_activation {
+            flight.witness();
+        }
         let first = if self.first_frame_presented {
             false
         } else {
@@ -322,7 +467,9 @@ impl NativeApp for Wrangler {
         pixels_per_point: f32,
         tooltip_rects: &[egui::Rect],
     ) -> WaterFrame {
-        self.living_wait.compose(ctx, &mut self.water);
+        if !self.concealed {
+            self.living_wait.compose(ctx, &mut self.water);
+        }
         self.water.frame(ctx, pixels_per_point, tooltip_rects, None)
     }
 
@@ -345,9 +492,12 @@ impl NativeApp for Wrangler {
 fn gallery(
     ui: &mut egui::Ui,
     cards: &[Card],
+    jiggling: bool,
+    recoiling: bool,
     water: &mut Surface,
+    jolts: &mut JoltLedger,
     hovered: &mut Option<usize>,
-) -> Option<u32> {
+) -> Option<Strike> {
     let width = ui.available_width();
     let mut columns = 1_usize;
     let mut column_count = 1.0_f32;
@@ -357,6 +507,12 @@ fn gallery(
     }
     let tile_width = ((width - GAP * (column_count - 1.0)) / column_count).max(180.0);
     let mut selected = None;
+    let mut physics = CardPhysics {
+        jiggling,
+        recoiling,
+        water,
+        jolts,
+    };
     for (row_index, row) in cards.chunks(columns).enumerate() {
         let _row = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
@@ -366,10 +522,12 @@ fn gallery(
                     card_model,
                     row_index * columns + column,
                     tile_width,
-                    water,
+                    &mut physics,
                     hovered,
                 );
-                selected = selected.or(clicked);
+                if selected.is_none() {
+                    selected = clicked;
+                }
             }
         });
         ui.add_space(GAP);
@@ -382,11 +540,26 @@ fn card(
     card: &Card,
     index: usize,
     width: f32,
-    water: &mut Surface,
+    physics: &mut CardPhysics<'_>,
     hovered_card: &mut Option<usize>,
-) -> Option<u32> {
+) -> Option<Strike> {
     let (id, rect) = ui.allocate_space(Vec2::new(width, TILE_HEIGHT));
     let pointer_inside = ui.rect_contains_pointer(rect);
+    let offset = if physics.jiggling {
+        jolt(&card.thread, ui.input(|input| input.time))
+    } else {
+        Vec2::ZERO
+    };
+    let visual = rect.translate(offset);
+    if physics.jiggling || physics.recoiling {
+        let travel = advance_jolt(
+            physics.jolts,
+            card.harness,
+            &card.thread,
+            physics.jiggling.then_some(offset),
+        );
+        displace_tile(physics.water, visual, travel);
+    }
     let stroke = if pointer_inside {
         Stroke::new(1.5_f32, chrome::EDGE_STRONG)
     } else {
@@ -397,12 +570,12 @@ fn card(
     } else {
         Color32::from_rgba_unmultiplied(19, 16, 13, 218)
     };
-    ui.painter().rect_filled(rect, 2, fill);
+    ui.painter().rect_filled(visual, 2, fill);
     ui.painter()
-        .rect_stroke(rect, 2, stroke, StrokeKind::Inside);
-    let badge_width = paint_harness_badges(ui, rect, card.harness, &card.thread, card.workspace);
+        .rect_stroke(visual, 2, stroke, StrokeKind::Inside);
+    let badge_width = paint_harness_badges(ui, visual, card.harness, &card.thread, card.workspace);
 
-    let inner = rect.shrink2(Vec2::new(14.0, 11.0));
+    let inner = visual.shrink2(Vec2::new(14.0, 11.0));
     let mut body = ui.new_child(
         egui::UiBuilder::new()
             .id_salt(("harness-card-body", card.harness, &card.thread))
@@ -441,12 +614,7 @@ fn card(
             .show_tooltip_when_elided(false),
     );
     drop(body);
-    paint_work(
-        ui.painter(),
-        rect.right_bottom() - egui::vec2(13.0, 13.0),
-        4.5,
-        card.work,
-    );
+    paint_card_state(ui.painter(), visual, card);
 
     // This interaction is deliberately registered after every inert child.
     // One final authority owns the entire rectangle, including text pixels.
@@ -460,13 +628,95 @@ fn card(
     );
     if response.hovered() {
         *hovered_card = Some(index);
-        water.hover((card.harness.slug(), &card.thread), rect);
+        physics
+            .water
+            .hover((card.harness.slug(), &card.thread), rect);
     }
     if response.clicked() {
-        water.click(rect);
-        Some(card.window)
+        physics.water.click(rect);
+        let intent = if physics.jiggling {
+            Intent::Archive
+        } else {
+            Intent::Open
+        };
+        Some(Strike {
+            harness: card.harness,
+            thread: card.thread.clone(),
+            intent,
+        })
     } else {
         None
+    }
+}
+
+fn jolt(thread: &str, time: f64) -> Vec2 {
+    const AXIS: [f32; 9] = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0];
+    let millis = std::time::Duration::from_secs_f64(time.max(0.0)).as_millis();
+    let tick = u64::try_from(millis / 59).unwrap_or(u64::MAX);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ tick.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for byte in thread.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let component = |bits: u64| AXIS[usize::try_from(bits % 9).expect("jolt axis is bounded")];
+    egui::vec2(component(hash), component(hash.rotate_left(29)))
+}
+
+fn advance_jolt(
+    ledger: &mut JoltLedger,
+    harness: Harness,
+    thread: &str,
+    current: Option<Vec2>,
+) -> Vec2 {
+    let bank = ledger.entry(harness).or_default();
+    match current {
+        Some(current) => {
+            if let Some(prior) = bank.get_mut(thread) {
+                let travel = current - *prior;
+                *prior = current;
+                travel
+            } else {
+                let _vacant = bank.insert(thread.to_owned(), current);
+                current
+            }
+        }
+        None => bank.remove(thread).map_or(Vec2::ZERO, |prior| -prior),
+    }
+}
+
+/// Couple the tile's projected swept volume into both water axes. `rect` is
+/// the current visual pose; layout motion is deliberately excluded because
+/// tray heave already owns it.
+fn displace_tile(water: &mut Surface, rect: egui::Rect, travel: Vec2) {
+    let envelope = rect.union(rect.translate(-travel));
+    let horizontal = travel.x.abs() * rect.height();
+    if horizontal >= TILE_SWEEP_EPSILON {
+        water.poke(
+            envelope,
+            Poke::slide(
+                (horizontal / TILE_AREA_PER_IMPULSE).min(TILE_IMPULSE_CEIL),
+                travel.x.signum(),
+            ),
+        );
+    }
+    let vertical = travel.y.abs() * rect.width();
+    if vertical >= TILE_SWEEP_EPSILON {
+        water.poke(
+            envelope,
+            Poke::drag(
+                (vertical / TILE_AREA_PER_IMPULSE).min(TILE_IMPULSE_CEIL),
+                travel.y.signum(),
+            ),
+        );
+    }
+}
+
+fn paint_card_state(painter: &egui::Painter, tile: egui::Rect, card: &Card) {
+    let center = tile.right_bottom() - egui::vec2(13.0, 13.0);
+    if card.retention == Retention::Archived {
+        paint_archive(painter, center, 5.25);
+    } else {
+        paint_work(painter, center, 4.5, card.work);
     }
 }
 
@@ -478,13 +728,34 @@ fn legend(ui: &mut egui::Ui, label: &str, work: Work) {
     });
 }
 
+fn archive_legend(ui: &mut egui::Ui) {
+    let _legend = ui.horizontal(|ui| {
+        let (rect, _response) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+        paint_archive(ui.painter(), rect.center(), 4.0);
+        let _label = ui.label(RichText::new("ARCHIVE").small().color(chrome::MUTED));
+    });
+}
+
+fn paint_archive(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    let points = vec![
+        center + egui::vec2(0.0, -radius),
+        center + egui::vec2(radius, radius),
+        center + egui::vec2(-radius, radius),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        Color32::BLACK,
+        Stroke::new(1.0_f32, chrome::MUTED),
+    ));
+}
+
 fn paint_work(painter: &egui::Painter, center: egui::Pos2, radius: f32, work: Work) {
     let color = work_color(work);
     match work {
         Work::Goal | Work::Turn => {
             painter.circle_filled(center, radius, color);
         }
-        Work::Input | Work::Done => {
+        Work::Input | Work::Sleeping | Work::Done => {
             painter.rect_filled(
                 egui::Rect::from_center_size(center, Vec2::splat(radius * 2.0)),
                 0,
@@ -559,6 +830,7 @@ const fn work_color(work: Work) -> Color32 {
         Work::Input => RED,
         Work::Goal => VIOLET,
         Work::Turn => GREEN,
+        Work::Sleeping => ASH,
         Work::Done => WHITE,
     }
 }
@@ -566,14 +838,6 @@ const fn work_color(work: Work) -> Color32 {
 fn census_count(count: usize) -> String {
     let noun = if count == 1 { "THREAD" } else { "THREADS" };
     format!("{count} MANUAL {noun}")
-}
-
-fn admit_census(settled: bool, void_sighted: &mut bool, census: Census) -> Option<Census> {
-    let unconfirmed_void = !settled
-        && census.fault.is_none()
-        && census.cards.is_empty()
-        && !std::mem::replace(void_sighted, true);
-    if unconfirmed_void { None } else { Some(census) }
 }
 
 fn lift_typography(ctx: &egui::Context) {
@@ -615,20 +879,8 @@ mod tests {
         assert_eq!(work_color(Work::Turn), GREEN);
         assert_eq!(work_color(Work::Goal), VIOLET);
         assert_eq!(work_color(Work::Input), RED);
+        assert_eq!(work_color(Work::Sleeping), ASH);
         assert_eq!(work_color(Work::Done), WHITE);
-    }
-
-    #[test]
-    fn the_initial_void_must_survive_two_censuses() {
-        let mut void_sighted = false;
-        assert_eq!(
-            admit_census(false, &mut void_sighted, Census::default()),
-            None
-        );
-        assert_eq!(
-            admit_census(false, &mut void_sighted, Census::default()),
-            Some(Census::default())
-        );
     }
 
     #[test]
@@ -639,5 +891,37 @@ mod tests {
         for (text_style, font) in &ctx.global_style().text_styles {
             assert!((font.size - before[text_style].size - 1.0).abs() < f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn restored_posture_selects_the_native_window_species() {
+        const {
+            assert!(<Wrangler<true> as NativeApp>::WINDOW.floating);
+            assert!(!<Wrangler<false> as NativeApp>::WINDOW.floating);
+        }
+    }
+
+    #[test]
+    fn jiggle_is_bounded_and_alive() {
+        let samples = (0..20)
+            .map(|tick| jolt("thread", f64::from(tick) / 17.0))
+            .collect::<Vec<_>>();
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample.x.abs() <= 2.0 && sample.y.abs() <= 2.0)
+        );
+        assert!(samples.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn jiggle_sweeps_actual_tile_volume_into_water() {
+        let ctx = egui::Context::default();
+        let mut water = Surface::new(Wetness::Wet);
+        let rect = egui::Rect::from_min_size(egui::pos2(40.0, 50.0), egui::vec2(300.0, 185.0));
+        displace_tile(&mut water, rect, egui::vec2(2.0, -1.5));
+        water.begin(Domain::basin(rect.expand(100.0)));
+        let frame = water.frame(&ctx, 1.0, &[], None);
+        assert!(frame.wants_repaint());
     }
 }

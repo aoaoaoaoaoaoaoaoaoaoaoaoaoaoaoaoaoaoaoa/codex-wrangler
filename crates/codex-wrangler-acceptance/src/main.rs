@@ -4,19 +4,23 @@ use std::{
     io::Write as _,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
-    time::Duration,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
 };
 
 use egui_tester::{
-    AppCommand, Application, Condition, Error as TesterError, Key, ReactionBudget, Result, Story,
-    Testbed, TestbedBuilder, Window, WindowQuery, demand,
+    AppCommand, Application, Button, Condition, Error as TesterError, Key, ReactionBudget, Result,
+    Story, Testbed, TestbedBuilder, Window, WindowQuery, demand,
 };
 use rusqlite::{Connection, params};
+use serde_json::Value;
 
 #[path = "../../codex-wrangler/src/contract.rs"]
 mod contract;
 use contract::{
-    CardKey, CardTarget, Harness, LogoTarget, Observation, UI_FINGERPRINT, Work, WorkspaceTarget,
+    CardKey, CardTarget, Flight, Harness, LogoTarget, Observation, UI_FINGERPRINT, Work,
+    WorkspaceTarget,
 };
 
 const GOAL: &str = "10000000-0000-7000-8000-000000000001";
@@ -25,6 +29,12 @@ const DONE: &str = "30000000-0000-7000-8000-000000000003";
 const INPUT: &str = "40000000-0000-7000-8000-000000000004";
 const CLAUDE: &str = "50000000-0000-7000-8000-000000000005";
 const PRIME: &str = "60000000-0000-7000-8000-000000000006";
+const PERMISSION: &str = "70000000-0000-7000-8000-000000000007";
+const ROTATE: &str = "80000000-0000-7000-8000-000000000008";
+const DORMANT: &str = "90000000-0000-7000-8000-000000000009";
+const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
+const OLD_RESET: i64 = 1_000_000;
+const NEW_RESET: i64 = 2_000_000;
 
 fn main() -> Result<()> {
     let binary = sibling_binary()?;
@@ -43,11 +53,7 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
             .witness("probes/wrangler")
             .runtime(Duration::from_secs(90)),
     )?;
-    let wrangler = testbed.x11()?.wait_window_query(
-        &app,
-        WindowQuery::title_exact("Codex Wrangler"),
-        Duration::from_secs(8),
-    )?;
+    let wrangler = wait_named_window(testbed, &app, "Codex Wrangler", Duration::from_secs(8))?;
     verify_switcher_present(testbed, &fixture, wrangler.id(), false)?;
     let mut story: Story<'_, '_, Observation> = Story::bind(
         testbed,
@@ -55,19 +61,32 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
         WindowQuery::title_exact("Codex Wrangler"),
         ReactionBudget::functional(Duration::from_secs(10)),
     )?;
+    verify_window_posture(testbed, &fixture, wrangler.id(), "tiled")?;
+    verify_switcher_present(testbed, &fixture, wrangler.id(), false)?;
+    let _floated = story.session().key(Key::Function(8))?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "Wrangler to become floating after its restored tiled opening",
+        || Ok(fixture.floating_proof.is_file()),
+    )?;
+    verify_window_posture(testbed, &fixture, wrangler.id(), "floating")?;
     verify_gallery(testbed, &mut story, &fixture)?;
 
     let target = story.anchor(CardTarget(Harness::Codex, GOAL))?;
-    let _clicked = story.session().click(
-        target.center().0,
-        target.center().1,
-        egui_tester::Button::Primary,
-    )?;
+    let _clicked = story
+        .session()
+        .click(target.center().0, target.center().1, Button::Primary)?;
     app.wait_until(
         Duration::from_secs(8),
         "Wrangler to conceal itself after choosing a Codex terminal",
         || Ok(wrangler_count(testbed)? == Some(0)),
     )?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "floating posture to reach XDG state before concealment",
+        || Ok(saved_posture(&fixture.state) == Some("floating")),
+    )?;
+    verify_hidden_cpu(&app)?;
     app.wait_until(
         Duration::from_secs(8),
         "tile to activate its Codex TTY",
@@ -83,6 +102,99 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
     verify_residency(testbed, binary, &app, &mut story, &fixture)
 }
 
+fn verify_hidden_cpu(app: &Application<'_>) -> Result<()> {
+    let sample_seconds = env::var("CODEX_WRANGLER_CPU_SAMPLE_SECONDS")
+        .ok()
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .unwrap_or(5);
+    thread::sleep(Duration::from_millis(250));
+    let pids = application_processes(app.unit())?;
+    let before = pids
+        .iter()
+        .map(|pid| cpu_ticks(*pid))
+        .sum::<Result<u64>>()?;
+    thread::sleep(Duration::from_secs(sample_seconds));
+    let after = pids
+        .iter()
+        .map(|pid| cpu_ticks(*pid))
+        .sum::<Result<u64>>()?;
+    let consumed = after.saturating_sub(before);
+    demand(
+        consumed <= sample_seconds,
+        format!(
+            "hidden Wrangler pids {pids:?} consumed {consumed} CPU ticks in {sample_seconds} seconds ({before} -> {after})"
+        ),
+    )
+}
+
+fn application_processes(unit: &str) -> Result<Vec<u32>> {
+    let status =
+        fs::read_to_string("/proc/self/status").map_err(io_verdict("read acceptance uid"))?;
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|uids| uids.split_ascii_whitespace().next())
+        .ok_or_else(|| TesterError::Verdict {
+            detail: "process status omitted its uid".to_owned(),
+        })?;
+    let runtime = format!("/run/user/{uid}");
+    let output = Command::new("systemctl")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={runtime}/bus"),
+        )
+        .args(["--user", "show", unit, "-p", "ControlGroup", "--value"])
+        .output()
+        .map_err(io_verdict("query acceptance cgroup"))?;
+    demand(
+        output.status.success(),
+        format!(
+            "could not query acceptance cgroup: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    )?;
+    let control_group = String::from_utf8_lossy(&output.stdout);
+    let processes = fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(control_group.trim().trim_start_matches('/'))
+            .join("cgroup.procs"),
+    )
+    .map_err(io_verdict("read acceptance cgroup"))?
+    .split_ascii_whitespace()
+    .filter_map(|pid| pid.parse::<u32>().ok())
+    .filter(|pid| {
+        fs::read_to_string(format!("/proc/{pid}/comm"))
+            .is_ok_and(|comm| comm.trim() == "codex-wrangler")
+    })
+    .collect::<Vec<_>>();
+    demand(
+        !processes.is_empty(),
+        "acceptance cgroup omitted the Wrangler process",
+    )?;
+    Ok(processes)
+}
+
+fn cpu_ticks(pid: u32) -> Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(io_verdict("read Wrangler CPU ticks"))?;
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields.split_ascii_whitespace().collect::<Vec<_>>())
+        .ok_or_else(|| TesterError::Verdict {
+            detail: format!("malformed process stat for Wrangler pid {pid}"),
+        })?;
+    let tick = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(|| TesterError::Verdict {
+                detail: format!("process stat omitted CPU field {index} for Wrangler pid {pid}"),
+            })
+    };
+    Ok(tick(11)? + tick(12)?)
+}
+
 fn verify_residency(
     testbed: &Testbed,
     binary: &Path,
@@ -92,18 +204,14 @@ fn verify_residency(
 ) -> Result<()> {
     let x11 = testbed.x11()?;
     let wrangler_id = story.session().window().id();
-    let tray = x11.wait_window_query(
-        app,
-        WindowQuery::title_exact("Codex Wrangler tray"),
-        Duration::from_secs(8),
-    )?;
+    let tray = wait_named_window(testbed, app, "Codex Wrangler tray", Duration::from_secs(8))?;
     let _switched = story.session().key(Key::Function(2))?;
     app.wait_until(
         Duration::from_secs(8),
         "i3 to enter a different workspace",
         || Ok(fixture.workspace_proof.is_file()),
     )?;
-    let _clicked = x11.click(&tray, 12, 12, egui_tester::Button::Primary)?;
+    let _clicked = x11.click(&tray, 12, 12, Button::Primary)?;
     app.wait_until(
         Duration::from_secs(8),
         "tray click to reveal the gallery",
@@ -147,17 +255,22 @@ fn verify_residency(
     verify_switcher_present(testbed, fixture, wrangler_id, false)?;
     verify_tiled_mode(testbed, app, story, fixture, &tray, wrangler_id)?;
 
-    let _menu_opened = x11.click(&tray, 12, 12, egui_tester::Button::Secondary)?;
-    let menu = x11.wait_window_query(
+    let _menu_opened = x11.click(&tray, 12, 12, Button::Secondary)?;
+    let menu = wait_named_window(
+        testbed,
         app,
-        WindowQuery::title_exact("Codex Wrangler tray menu"),
+        "Codex Wrangler tray menu",
         Duration::from_secs(8),
     )?;
-    let _quit = x11.click(&menu, 70, 15, egui_tester::Button::Primary)?;
+    let _quit = x11.click(&menu, 70, 15, Button::Primary)?;
     let exit = app.wait(Duration::from_secs(8))?;
     demand(
         exit.success(),
         format!("tray quit did not end Wrangler cleanly: {exit:?}"),
+    )?;
+    demand(
+        saved_posture(&fixture.state) == Some("tiled"),
+        "tray quit did not preserve the final tiled posture in XDG state",
     )
 }
 
@@ -177,6 +290,33 @@ fn verify_switcher_present(
         exit.success(),
         format!("Wrangler did not converge on the current workspace with focus: {exit:?}"),
     )
+}
+
+fn verify_window_posture(
+    testbed: &Testbed,
+    fixture: &Fixture,
+    window: u32,
+    expected: &str,
+) -> Result<()> {
+    let probe = testbed.launch(
+        AppCommand::new(&fixture.posture_probe)
+            .arg(window.to_string())
+            .arg(expected)
+            .runtime(Duration::from_secs(6)),
+    )?;
+    let exit = probe.wait(Duration::from_secs(6))?;
+    demand(
+        exit.success(),
+        format!("Wrangler did not open {expected}: {exit:?}"),
+    )
+}
+
+fn saved_posture(path: &Path) -> Option<&str> {
+    match fs::read_to_string(path).ok()?.trim() {
+        "floating" => Some("floating"),
+        "tiled" => Some("tiled"),
+        _ => None,
+    }
 }
 
 fn verify_tiled_mode(
@@ -204,11 +344,9 @@ fn verify_tiled_mode(
     )?;
 
     let target = story.anchor(CardTarget(Harness::Codex, TURN))?;
-    let _selected = story.session().click(
-        target.center().0,
-        target.center().1,
-        egui_tester::Button::Primary,
-    )?;
+    let _selected = story
+        .session()
+        .click(target.center().0, target.center().1, Button::Primary)?;
     app.wait_until(
         Duration::from_secs(8),
         "card selection to leave the fixed Wrangler workspace",
@@ -233,10 +371,250 @@ fn verify_tiled_mode(
         "i3 to leave the fixed Wrangler workspace",
         || Ok(fixture.tiled_away_proof.is_file()),
     )?;
-    let _summoned = testbed
-        .x11()?
-        .click(tray, 12, 12, egui_tester::Button::Primary)?;
-    verify_switcher_present(testbed, fixture, wrangler, true)
+    let _summoned = testbed.x11()?.click(tray, 12, 12, Button::Primary)?;
+    verify_switcher_present(testbed, fixture, wrangler, true)?;
+    verify_session_lifecycle(testbed, app, story, fixture)
+}
+
+fn verify_session_lifecycle(
+    testbed: &Testbed,
+    app: &Application<'_>,
+    story: &mut Story<'_, '_, Observation>,
+    fixture: &Fixture,
+) -> Result<()> {
+    let state = read_roster(&fixture.roster)?;
+    let sessions = state["sessions"]
+        .as_object()
+        .ok_or_else(|| TesterError::Verdict {
+            detail: "known-session state omitted its session map".to_owned(),
+        })?;
+    demand(
+        sessions.contains_key(DORMANT) && !sessions.contains_key(UNSEEN),
+        "Wrangler did not preserve its remembered session boundary",
+    )?;
+
+    verify_management_veto(story, fixture)?;
+
+    select_and_return(testbed, story, app, ROTATE, &fixture.rotate_resume)?;
+    demand(
+        fs::read_to_string(&fixture.rotate_resume).is_ok_and(|proof| proof.trim() == "resume 7"),
+        "rolled session did not resume on its terminal workspace",
+    )?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "rolled session to bind the current Codex account",
+        || Ok(read_roster(&fixture.roster)?["sessions"][ROTATE]["account"]["account"].is_string()),
+    )?;
+    demand(
+        read_roster(&fixture.roster)?["sessions"][ROTATE]["account"]["account"].is_string(),
+        "rolled session was not rebound to the current Codex account",
+    )?;
+
+    select_and_return(testbed, story, app, DORMANT, &fixture.dormant_resume)?;
+    demand(
+        fs::read_to_string(&fixture.dormant_resume).is_ok_and(|proof| proof.trim() == "resume 6"),
+        "resurrected session did not return to its remembered workspace",
+    )?;
+
+    shift_click_card(story, DONE)?;
+    let archived = wait_card(story, DONE, |card| !card.open && card.archived)?;
+    demand(
+        archived.work == Work::Done,
+        "archived session acquired a spurious work state",
+    )?;
+    demand(
+        thread_archived(&fixture.index, DONE) == Some(true)
+            && fixture.archived_rollout.is_file()
+            && read_roster(&fixture.roster)?["sessions"][DONE]["retention"] == "archived",
+        "archive did not converge across Codex storage and Wrangler state",
+    )?;
+
+    shift_click_card(story, DONE)?;
+    let _gone = story.wait_stable(
+        Duration::from_secs(8),
+        Duration::from_millis(150),
+        "forgotten archive to leave the gallery",
+        |frame| {
+            frame
+                .state
+                .cards
+                .iter()
+                .all(|card| card.thread != DONE)
+                .then_some(())
+        },
+    )?;
+    demand(
+        read_roster(&fixture.roster)?["sessions"]
+            .get(DONE)
+            .is_none()
+            && thread_archived(&fixture.index, DONE) == Some(true)
+            && fixture.archived_rollout.is_file(),
+        "forgetting an archive mutated Codex storage or was not sealed immediately",
+    )?;
+    Ok(())
+}
+
+fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixture) -> Result<()> {
+    let shift_down = story.session().key_down(Key::Shift)?;
+    let _jiggling = story
+        .reaction(shift_down)
+        .within(ReactionBudget::performance(Duration::from_millis(50)))
+        .until(Condition::new(
+            "held Shift to animate management mode",
+            |state: &Observation| state.jiggling,
+        ))?;
+    let shift_up = story.session().key_up(Key::Shift)?;
+    let _settled = story
+        .reaction(shift_up)
+        .within(ReactionBudget::performance(Duration::from_millis(50)))
+        .until(Condition::new(
+            "released Shift to still the management mode",
+            |state: &Observation| !state.jiggling,
+        ))?;
+
+    for thread in [TURN, INPUT, PERMISSION] {
+        shift_click_card(story, thread)?;
+        thread::sleep(Duration::from_millis(250));
+        let frame = story.frame()?;
+        demand(
+            frame
+                .state
+                .cards
+                .iter()
+                .any(|card| card.thread == thread && card.open && !card.archived),
+            format!("Shift retired active Codex session {thread}"),
+        )?;
+        demand(
+            thread_archived(&fixture.index, thread) == Some(false),
+            format!("Shift archived active Codex session {thread}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Result<()> {
+    story.session().focus()?;
+    let target = story.anchor(CardTarget(Harness::Codex, thread))?;
+    let (center_x, center_y) = target.center();
+    let x = center_x.saturating_sub(100);
+    let moved = story.session().move_to(x, center_y)?;
+    let sought = thread.to_owned();
+    let _hovered = story.reaction(moved).until(Condition::new(
+        "management card to acquire the pointer",
+        move |state: &Observation| hovered(state, Harness::Codex, &sought),
+    ))?;
+    let shift_down = story.session().key_down(Key::Shift)?;
+    let _jiggling = story.reaction(shift_down).until(Condition::new(
+        "management mode to acquire Shift",
+        |state: &Observation| state.jiggling,
+    ))?;
+    let clicked = story.session().click(x, center_y, Button::Primary)?;
+    let _struck = story.reaction(clicked).until(Condition::new(
+        "management click to enter flight",
+        |state: &Observation| state.flight == Flight::Striking,
+    ))?;
+    let shift_up = story.session().key_up(Key::Shift)?;
+    let _stilled = story.reaction(shift_up).until(Condition::new(
+        "management mode to release Shift",
+        |state: &Observation| !state.jiggling,
+    ))?;
+    let _landed = story.wait(Condition::new(
+        "management click to leave flight",
+        |state: &Observation| state.flight == Flight::Grounded,
+    ))?;
+    park_pointer(
+        story,
+        "management pointer to release gallery reconciliation",
+    )?;
+    Ok(())
+}
+
+fn select_and_return(
+    testbed: &Testbed,
+    story: &mut Story<'_, '_, Observation>,
+    app: &Application<'_>,
+    thread: &str,
+    proof: &Path,
+) -> Result<()> {
+    story.session().focus()?;
+    let target = story.anchor(CardTarget(Harness::Codex, thread))?;
+    let (center_x, center_y) = target.center();
+    let strike_x = center_x.saturating_sub(100);
+    let moved = story.session().move_to(strike_x, center_y)?;
+    let sought = thread.to_owned();
+    let _hovered = story.reaction(moved).until(Condition::new(
+        "resume card to acquire the pointer",
+        move |state: &Observation| hovered(state, Harness::Codex, &sought),
+    ))?;
+    let selected = story.session().click(strike_x, center_y, Button::Primary)?;
+    let _armed = story.reaction(selected).until(Condition::new(
+        "card strike to enter flight",
+        |state: &Observation| state.flight == Flight::Striking,
+    ))?;
+    app.wait_until(
+        Duration::from_secs(10),
+        "Codex session to be resumed in a fresh Alacritty",
+        || Ok(proof.is_file()),
+    )?;
+    let _returned = story.session().key(Key::Function(7))?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "i3 to return to the fixed Wrangler workspace after resume",
+        || Ok(wrangler_count(testbed)? == Some(1)),
+    )?;
+    let _landed = story.wait(Condition::new(
+        "Codex session strike to leave flight",
+        |state: &Observation| state.flight == Flight::Grounded,
+    ))?;
+    Ok(())
+}
+
+fn wait_card(
+    story: &mut Story<'_, '_, Observation>,
+    thread: &str,
+    predicate: impl Fn(&contract::CardObservation) -> bool,
+) -> Result<contract::CardObservation> {
+    let thread = thread.to_owned();
+    let sought = thread.clone();
+    let frame = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(150),
+        "Codex card to reach its expected lifecycle state",
+        move |frame| {
+            frame
+                .state
+                .cards
+                .iter()
+                .find(|card| card.thread == sought && predicate(card))
+                .cloned()
+        },
+    )?;
+    frame
+        .state
+        .cards
+        .into_iter()
+        .find(|card| card.thread == thread)
+        .ok_or_else(|| TesterError::Verdict {
+            detail: format!("expected lifecycle card `{thread}` vanished after stabilization"),
+        })
+}
+
+fn read_roster(path: &Path) -> Result<Value> {
+    serde_json::from_slice(&fs::read(path).map_err(io_verdict("read known-session state"))?)
+        .map_err(|error| TesterError::Verdict {
+            detail: format!("decode known-session state: {error}"),
+        })
+}
+
+fn thread_archived(index: &Path, thread: &str) -> Option<bool> {
+    Connection::open(index)
+        .ok()?
+        .query_row(
+            "SELECT archived FROM threads WHERE id = ?1",
+            params![thread],
+            |row| row.get(0),
+        )
+        .ok()
 }
 
 fn wrangler_count(testbed: &Testbed) -> Result<Option<usize>> {
@@ -250,6 +628,29 @@ fn wrangler_count(testbed: &Testbed) -> Result<Option<usize>> {
     }
 }
 
+fn wait_named_window(
+    testbed: &Testbed,
+    app: &Application<'_>,
+    title: &str,
+    timeout: Duration,
+) -> Result<Window> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match testbed
+            .x11()?
+            .wait_window_query(app, WindowQuery::title_exact(title), remaining)
+        {
+            Err(TesterError::X11 { detail, .. })
+                if !remaining.is_zero() && detail.contains("error_kind: Window") =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn verify_gallery(
     testbed: &Testbed,
     story: &mut Story<'_, '_, Observation>,
@@ -259,14 +660,17 @@ fn verify_gallery(
     let frame = story.wait_stable(
         Duration::from_secs(30),
         Duration::from_millis(250),
-        "six manual terminals across three harnesses",
+        "eight live terminals and one remembered Codex session",
         |frame| {
-            (frame.state.cards.len() == 6
-                && frame
-                    .state
-                    .cards
-                    .iter()
-                    .all(|card| card.workspace == Some(7)))
+            (frame.state.cards.len() == 9
+                && frame.state.cards.iter().all(|card| {
+                    card.workspace
+                        == if card.thread == DORMANT {
+                            Some(6)
+                        } else {
+                            Some(7)
+                        }
+                }))
             .then(|| frame.state.cards.clone())
         },
     )?;
@@ -329,6 +733,8 @@ fn verify_census(state: &Observation) -> Result<()> {
                 card.work,
                 card.name.as_deref(),
                 card.workspace,
+                card.open,
+                card.archived,
             )
         })
         .collect::<BTreeSet<_>>();
@@ -339,6 +745,8 @@ fn verify_census(state: &Observation) -> Result<()> {
             Work::Input,
             Some("Awaiting verdict"),
             Some(7),
+            true,
+            false,
         ),
         (
             Harness::Codex,
@@ -346,14 +754,45 @@ fn verify_census(state: &Observation) -> Result<()> {
             Work::Goal,
             Some("Violet frontier"),
             Some(7),
+            true,
+            false,
         ),
-        (Harness::Codex, TURN, Work::Turn, None, Some(7)),
+        (Harness::Codex, TURN, Work::Turn, None, Some(7), true, false),
         (
             Harness::Codex,
             DONE,
             Work::Done,
             Some("Silent machine"),
             Some(7),
+            true,
+            false,
+        ),
+        (
+            Harness::Codex,
+            PERMISSION,
+            Work::Input,
+            None,
+            Some(7),
+            true,
+            false,
+        ),
+        (
+            Harness::Codex,
+            ROTATE,
+            Work::Done,
+            Some("Old account"),
+            Some(7),
+            true,
+            false,
+        ),
+        (
+            Harness::Codex,
+            DORMANT,
+            Work::Done,
+            Some("Buried engine"),
+            Some(6),
+            false,
+            false,
         ),
         (
             Harness::ClaudeCode,
@@ -361,6 +800,8 @@ fn verify_census(state: &Observation) -> Result<()> {
             Work::Done,
             Some("Copper invader"),
             Some(7),
+            true,
+            false,
         ),
         (
             Harness::PrimeAgent,
@@ -368,6 +809,8 @@ fn verify_census(state: &Observation) -> Result<()> {
             Work::Turn,
             Some("Butterfly engine"),
             Some(7),
+            true,
+            false,
         ),
     ]);
     demand(states == expected, format!("wrong card census: {states:?}"))
@@ -499,6 +942,7 @@ fn append_rollout(path: &Path, line: &str) -> Result<()> {
 }
 
 fn park_pointer(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
+    let _jolted = story.session().move_to(629, 31)?;
     let receipt = story.session().move_to(630, 32)?;
     let _parked = story
         .reaction(receipt)
@@ -535,6 +979,7 @@ struct Fixture {
     wrapper: PathBuf,
     focus_probe: PathBuf,
     desktop_recorder: PathBuf,
+    posture_probe: PathBuf,
     goals: PathBuf,
     input_rollout: PathBuf,
     proof: PathBuf,
@@ -543,17 +988,29 @@ struct Fixture {
     tiled_proof: PathBuf,
     tiled_away_proof: PathBuf,
     tiled_home_proof: PathBuf,
+    floating_proof: PathBuf,
+    state: PathBuf,
+    roster: PathBuf,
+    index: PathBuf,
+    rotate_resume: PathBuf,
+    dormant_resume: PathBuf,
+    archived_rollout: PathBuf,
 }
 
 impl Fixture {
     fn forge(testbed: &Testbed, binary: &Path) -> Result<Self> {
         let codex = testbed.create_private_dir("home/.codex/sessions/2026/08/03")?;
+        let [goal, turn, done, input, permission, rotate, _dormant] = seed_rollouts(&codex)?;
         let db_path = testbed.private_path("home/.codex/state_5.sqlite")?;
         seed_index(&db_path)?;
         let goals = testbed.private_path("home/.codex/goals_1.sqlite")?;
         seed_goals(&goals)?;
         seed_names(testbed)?;
-        let [goal, turn, done, input] = seed_rollouts(&codex)?;
+        let state = testbed.write_private("xdg/state/codex-wrangler/window-mode", b"tiled\n")?;
+        let roster = seed_roster(testbed)?;
+        let _rotate_work = testbed.create_private_dir("work/rotate")?;
+        let _dormant_work = testbed.create_private_dir("work/dormant")?;
+        let _archive = testbed.create_private_dir("home/.codex/archived_sessions")?;
         let (claude, prime) = seed_foreign_transcripts(testbed)?;
 
         let fake = testbed.write_private(
@@ -567,13 +1024,21 @@ print -r -- "$key" > "$proof"
 sleep 90
 "#,
         )?;
+        let fake_cli = forge_fake_cli(testbed)?;
         let proof = testbed.private_path("focus-proof")?;
+        let rotate_resume = testbed.private_path(format!("resume-proof-{ROTATE}"))?;
+        let dormant_resume = testbed.private_path(format!("resume-proof-{DORMANT}"))?;
+        let archived_rollout = testbed.private_path(format!(
+            "home/.codex/archived_sessions/{}",
+            done.file_name().unwrap_or_default().to_string_lossy()
+        ))?;
         let workspace_proof = testbed.private_path("workspace-proof")?;
         let launch_workspace_proof = testbed.private_path("launch-workspace-proof")?;
         let tiled_proof = testbed.private_path("tiled-proof")?;
         let tiled_away_proof = testbed.private_path("tiled-away-proof")?;
         let tiled_home_proof = testbed.private_path("tiled-home-proof")?;
-        let (focus_probe, desktop_recorder) = forge_desktop_probes(testbed)?;
+        let floating_proof = testbed.private_path("floating-proof")?;
+        let (focus_probe, desktop_recorder, posture_probe) = forge_desktop_probes(testbed)?;
         let i3 = testbed.write_private(
             "i3.config",
             "font pango:monospace 8\n\
@@ -584,50 +1049,40 @@ sleep 90
              bindsym F4 workspace number 9, exec --no-startup-id touch /test/launch-workspace-proof\n\
              bindsym F5 floating disable, exec --no-startup-id touch /test/tiled-proof\n\
              bindsym F6 workspace number 8, exec --no-startup-id touch /test/tiled-away-proof\n\
-             bindsym F7 workspace number 9, exec --no-startup-id touch /test/tiled-home-proof\n",
+             bindsym F7 workspace number 9, exec --no-startup-id touch /test/tiled-home-proof\n\
+             bindsym F8 floating enable, exec --no-startup-id touch /test/floating-proof\n",
         )?;
-        let binary = binary.display();
-        let wrapper_text = format!(
-            "#!/bin/sh\n\
-             i3 -c /test/i3.config &\n\
-             for attempt in $(seq 1 100); do\n\
-               i3-msg -t get_workspaces >/dev/null 2>&1 && break\n\
-               sleep 0.02\n\
-             done\n\
-             i3-msg 'workspace number 7' >/dev/null\n\
-             alacritty --title 'Goal Codex' -o 'window.position={{x=1500,y=0}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-               'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof' &\n\
-             alacritty --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-               'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof' &\n\
-             alacritty --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-               'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
-             alacritty --title 'Input Codex' -o 'window.position={{x=1500,y=600}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-               'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/input-proof' &\n\
-             alacritty --title 'Claude Code' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-               'exec -a claude zsh /test/fake-codex.zsh /test/home/.claude/projects/-work-claude/{} /test/claude-proof' &\n\
-             alacritty --title 'Prime Agent' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-               'exec -a prime-agent zsh /test/fake-codex.zsh /test/home/.prime/agent/sessions/{} /test/prime-proof' &\n\
-             exec {binary}\n",
-            goal.file_name().unwrap_or_default().to_string_lossy(),
-            turn.file_name().unwrap_or_default().to_string_lossy(),
-            done.file_name().unwrap_or_default().to_string_lossy(),
-            input.file_name().unwrap_or_default().to_string_lossy(),
-            claude.file_name().unwrap_or_default().to_string_lossy(),
-            prime.file_name().unwrap_or_default().to_string_lossy(),
-        );
-        let wrapper = testbed.write_private("launch-wrangler", wrapper_text)?;
+        let wrapper = forge_wrapper(
+            testbed,
+            binary,
+            [
+                &goal,
+                &turn,
+                &done,
+                &input,
+                &permission,
+                &rotate,
+                &claude,
+                &prime,
+            ],
+        )?;
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
             .map_err(io_verdict("make fixture wrapper executable"))?;
+        fs::set_permissions(&fake_cli, fs::Permissions::from_mode(0o700))
+            .map_err(io_verdict("make fake Codex CLI executable"))?;
         fs::set_permissions(&focus_probe, fs::Permissions::from_mode(0o700))
             .map_err(io_verdict("make focus probe executable"))?;
         fs::set_permissions(&desktop_recorder, fs::Permissions::from_mode(0o700))
             .map_err(io_verdict("make desktop recorder executable"))?;
+        fs::set_permissions(&posture_probe, fs::Permissions::from_mode(0o700))
+            .map_err(io_verdict("make posture probe executable"))?;
         demand(fake.is_file(), "fake Codex script was not created")?;
         demand(i3.is_file(), "private i3 config was not created")?;
         Ok(Self {
             wrapper,
             focus_probe,
             desktop_recorder,
+            posture_probe,
             goals,
             input_rollout: input,
             proof,
@@ -636,8 +1091,111 @@ sleep 90
             tiled_proof,
             tiled_away_proof,
             tiled_home_proof,
+            floating_proof,
+            state,
+            roster,
+            index: db_path,
+            rotate_resume,
+            dormant_resume,
+            archived_rollout,
         })
     }
+}
+
+fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 8]) -> Result<PathBuf> {
+    let names = logs.map(|path| path.file_name().unwrap_or_default().to_string_lossy());
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         export PATH=/test/bin:/usr/bin\n\
+         i3 -c /test/i3.config &\n\
+         for attempt in $(seq 1 100); do\n\
+           i3-msg -t get_workspaces >/dev/null 2>&1 && break\n\
+           sleep 0.02\n\
+         done\n\
+         i3-msg 'workspace number 7' >/dev/null\n\
+         alacritty --title 'Goal Codex' -o 'window.position={{x=1500,y=0}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof' &\n\
+         alacritty --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof' &\n\
+         alacritty --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
+         alacritty --title 'Input Codex' -o 'window.position={{x=1500,y=600}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/input-proof' &\n\
+         alacritty --title '[ ! ] Action Required | Permission Codex' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/permission-proof' &\n\
+         alacritty --title 'Old Account Codex' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/rotate-proof' &\n\
+         alacritty --title 'Claude Code' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a claude zsh /test/fake-codex.zsh /test/home/.claude/projects/-work-claude/{} /test/claude-proof' &\n\
+         alacritty --title 'Prime Agent' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a prime-agent zsh /test/fake-codex.zsh /test/home/.prime/agent/sessions/{} /test/prime-proof' &\n\
+         exec {}\n",
+        names[0],
+        names[1],
+        names[2],
+        names[3],
+        names[4],
+        names[5],
+        names[6],
+        names[7],
+        binary.display(),
+    );
+    testbed.write_private("launch-wrangler", wrapper)
+}
+
+fn forge_fake_cli(testbed: &Testbed) -> Result<PathBuf> {
+    let _bin = testbed.create_private_dir("bin")?;
+    testbed.write_private(
+        "bin/codex",
+        format!(
+            r#"#!/bin/zsh
+db=/test/home/.codex/state_5.sqlite
+if [[ $1 == app-server ]]; then
+  while IFS= read -r request; do
+    id=$(print -r -- "$request" | jq -r '.id // empty')
+    method=$(print -r -- "$request" | jq -r '.method')
+    [[ -z $id ]] && continue
+    case $method in
+      initialize)
+        print -r -- '{{"id":'$id',"result":{{}}}}'
+        ;;
+      account/read)
+        print -r -- '{{"id":'$id',"result":{{"account":{{"type":"chatgpt","email":"new@example.invalid","planType":"pro"}},"requiresOpenaiAuth":true}}}}'
+        ;;
+      account/rateLimits/read)
+        print -r -- '{{"id":'$id',"result":{{"rateLimits":{{"limitId":"codex","primary":{{"usedPercent":1,"windowDurationMins":10080,"resetsAt":{NEW_RESET}}}}},"rateLimitsByLimitId":{{}}}}}}'
+        ;;
+      thread/archive)
+        thread=$(print -r -- "$request" | jq -r '.params.threadId')
+        rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+        destination=/test/home/.codex/archived_sessions/${{rollout:t}}
+        mv "$rollout" "$destination"
+        sqlite3 "$db" "UPDATE threads SET archived = 1, rollout_path = '$destination' WHERE id = '$thread'"
+        print -r -- '{{"id":'$id',"result":{{}}}}'
+        ;;
+      *)
+        print -r -- '{{"id":'$id',"result":{{}}}}'
+        ;;
+    esac
+  done
+  exit 0
+fi
+
+operation=$1
+thread=$2
+if [[ $operation == unarchive ]]; then
+  rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+  destination=/test/home/.codex/sessions/2026/08/03/${{rollout:t}}
+  mv "$rollout" "$destination"
+  sqlite3 "$db" "UPDATE threads SET archived = 0, rollout_path = '$destination' WHERE id = '$thread'"
+fi
+workspace=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused).num')
+print -r -- "$operation $workspace" > "/test/${{operation}}-proof-${{thread}}"
+rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+exec -a codex zsh -c 'exec 9<"$1"; sleep 90; :' wrangler-resume "$rollout"
+"#,
+        ),
+    )
 }
 
 fn seed_foreign_transcripts(testbed: &Testbed) -> Result<(PathBuf, PathBuf)> {
@@ -667,7 +1225,7 @@ fn seed_foreign_transcripts(testbed: &Testbed) -> Result<(PathBuf, PathBuf)> {
     Ok((claude, prime))
 }
 
-fn forge_desktop_probes(testbed: &Testbed) -> Result<(PathBuf, PathBuf)> {
+fn forge_desktop_probes(testbed: &Testbed) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let focus = testbed.write_private(
         "focus-probe",
         br#"#!/bin/sh
@@ -708,7 +1266,39 @@ done
 exit 1
 "#,
     )?;
-    Ok((focus, recorder))
+    let posture = testbed.write_private(
+        "posture-probe",
+        br#"#!/bin/sh
+window=$1
+expected=$2
+for attempt in $(seq 1 200); do
+  tree=$(i3-msg -t get_tree 2>/dev/null)
+  actual=$(printf '%s\n' "$tree" | jq -r \
+    --argjson window "$window" '
+      def sight($inherited):
+        ((.floating == "auto_on") or (.floating == "user_on")) as $own
+        | ($inherited or $own) as $here
+        | if .window == $window then $here
+          else (([.nodes[]? | sight($here)] + [.floating_nodes[]? | sight(true)])
+            | map(select(. != null)) | if length > 0 then .[0] else null end)
+          end;
+      sight(false)
+    ')
+  if [ "$actual" = true ]; then
+    actual=floating
+  elif [ "$actual" = false ]; then
+    actual=tiled
+  fi
+  if [ "$actual" = "$expected" ]; then
+    exit 0
+  fi
+  sleep 0.02
+done
+printf 'window=%s expected=%s actual=%s\n' "$window" "$expected" "$actual" >&2
+exit 1
+"#,
+    )?;
+    Ok((focus, recorder, posture))
 }
 
 fn seed_goals(path: &Path) -> Result<()> {
@@ -742,7 +1332,8 @@ fn seed_index(path: &Path) -> Result<()> {
         "CREATE TABLE threads (
            id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT, cwd TEXT NOT NULL,
            updated_at_ms INTEGER NOT NULL, thread_source TEXT, source TEXT NOT NULL,
-           agent_role TEXT
+           agent_role TEXT, rollout_path TEXT NOT NULL,
+           archived INTEGER NOT NULL DEFAULT 0
          );",
     )
     .map_err(verdict("declare fixture thread index"))?;
@@ -753,6 +1344,7 @@ fn seed_index(path: &Path) -> Result<()> {
             None::<&str>,
             "/work/goal",
             30_i64,
+            rollout_test_path(GOAL, "goal"),
         ),
         (
             TURN,
@@ -760,20 +1352,95 @@ fn seed_index(path: &Path) -> Result<()> {
             None,
             "/work/turn",
             20,
+            rollout_test_path(TURN, "turn"),
         ),
-        (DONE, "Prompt-derived done title", None, "/work/done", 10),
-        (INPUT, "Prompt-derived input title", None, "/work/input", 40),
+        (
+            DONE,
+            "Prompt-derived done title",
+            None,
+            "/work/done",
+            10,
+            rollout_test_path(DONE, "done"),
+        ),
+        (
+            INPUT,
+            "Prompt-derived input title",
+            None,
+            "/work/input",
+            40,
+            rollout_test_path(INPUT, "input"),
+        ),
+        (
+            PERMISSION,
+            "Prompt-derived permission title",
+            None,
+            "/work/permission",
+            50,
+            rollout_test_path(PERMISSION, "permission"),
+        ),
+        (
+            ROTATE,
+            "Prompt-derived rotated title",
+            Some("Old account"),
+            "/test/work/rotate",
+            9,
+            rollout_test_path(ROTATE, "rotate"),
+        ),
+        (
+            DORMANT,
+            "Prompt-derived dormant title",
+            Some("Buried engine"),
+            "/test/work/dormant",
+            8,
+            rollout_test_path(DORMANT, "dormant"),
+        ),
+        (
+            UNSEEN,
+            "Forbidden historical thread",
+            Some("Never enumerate me"),
+            "/test/work/dormant",
+            7,
+            rollout_test_path(UNSEEN, "unseen"),
+        ),
     ] {
         let _inserted = db
             .execute(
                 "INSERT INTO threads
-                 (id, title, name, cwd, updated_at_ms, thread_source, source, agent_role)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'user', 'cli', NULL)",
-                params![row.0, row.1, row.2, row.3, row.4],
+                 (id, title, name, cwd, updated_at_ms, thread_source, source, agent_role,
+                  rollout_path, archived)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'user', 'cli', NULL, ?6, 0)",
+                params![row.0, row.1, row.2, row.3, row.4, row.5],
             )
             .map_err(verdict("seed fixture thread"))?;
     }
     Ok(())
+}
+
+fn seed_roster(testbed: &Testbed) -> Result<PathBuf> {
+    let state = serde_json::json!({
+        "version": 1,
+        "sessions": {
+            DORMANT: {
+                "name": "Buried engine",
+                "cwd": "/test/work/dormant",
+                "preview": "Waiting below.",
+                "updated_at_ms": 8,
+                "workspace": 6,
+                "retention": "active",
+                "account": {
+                    "quotas": [{
+                        "limit": "codex",
+                        "window_minutes": 10_080,
+                        "resets_at": OLD_RESET
+                    }]
+                }
+            }
+        }
+    });
+    let bytes = serde_json::to_vec(&state).map_err(|error| TesterError::Verdict {
+        detail: format!("encode known-session fixture: {error}"),
+    })?;
+    testbed.write_private("xdg/state/codex-wrangler/known-sessions.json", bytes)
 }
 
 fn seed_names(testbed: &Testbed) -> Result<()> {
@@ -792,11 +1459,14 @@ fn seed_names(testbed: &Testbed) -> Result<()> {
     demand(index.is_file(), "session-name index was not created")
 }
 
-fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 4]> {
+fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 7]> {
     let goal = rollout(directory, GOAL, "goal");
     let turn = rollout(directory, TURN, "turn");
     let done = rollout(directory, DONE, "done");
     let input = rollout(directory, INPUT, "input");
+    let permission = rollout(directory, PERMISSION, "permission");
+    let rotate = rollout(directory, ROTATE, "rotate");
+    let dormant = rollout(directory, DORMANT, "dormant");
     fs::write(
         &goal,
         concat!(
@@ -833,11 +1503,58 @@ fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 4]> {
         ),
     )
     .map_err(io_verdict("write input-wait rollout"))?;
-    Ok([goal, turn, done, input])
+    fs::write(
+        &permission,
+        concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Request a permission.\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
+        ),
+    )
+    .map_err(io_verdict("write permission-wait rollout"))?;
+    let rotate_events = [
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "Change the guard."}
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {"window_minutes": 10_080, "resets_at": OLD_RESET}
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "last_agent_message": "The old guard sleeps."}
+        }),
+    ];
+    let rotate_text = rotate_events
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&rotate, rotate_text).map_err(io_verdict("write account-rollover rollout"))?;
+    fs::write(
+        &dormant,
+        concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Wake the buried engine.\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"Waiting below.\"}}\n"
+        ),
+    )
+    .map_err(io_verdict("write dormant rollout"))?;
+    Ok([goal, turn, done, input, permission, rotate, dormant])
 }
 
 fn rollout(directory: &Path, id: &str, stamp: &str) -> PathBuf {
     directory.join(format!("rollout-2026-08-03T00-00-00-{stamp}-{id}.jsonl"))
+}
+
+fn rollout_test_path(id: &str, stamp: &str) -> String {
+    format!("/test/home/.codex/sessions/2026/08/03/rollout-2026-08-03T00-00-00-{stamp}-{id}.jsonl")
 }
 
 fn sibling_binary() -> Result<PathBuf> {

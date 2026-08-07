@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "egui-test")]
-pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/6";
+pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/11";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -32,7 +32,16 @@ pub enum Work {
     Input,
     Goal,
     Turn,
+    Sleeping,
     Done,
+}
+
+#[cfg(feature = "egui-test")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Flight {
+    Grounded,
+    Striking,
 }
 
 #[cfg(feature = "egui-test")]
@@ -43,6 +52,8 @@ pub struct CardObservation {
     pub thread: String,
     pub work: Work,
     pub workspace: Option<u32>,
+    pub open: bool,
+    pub archived: bool,
 }
 
 #[cfg(feature = "egui-test")]
@@ -52,6 +63,8 @@ pub struct Observation {
     pub summoning: bool,
     pub hovered: Option<CardKey>,
     pub loading: bool,
+    pub jiggling: bool,
+    pub flight: Flight,
     pub cards: Vec<CardObservation>,
 }
 

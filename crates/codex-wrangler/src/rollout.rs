@@ -8,7 +8,10 @@ use std::{
 use memchr::memmem;
 use serde_json::Value;
 
+use crate::roster::{AccountMark, QuotaMark};
+
 const BLOCK: usize = 1 << 20;
+const ACCOUNT_HORIZON: u64 = 4 << 20;
 const INPUT_REQUEST: &[u8] = b"\"name\":\"request_user_input\"";
 const CALL_OUTPUT: &[u8] = b"\"type\":\"function_call_output\"";
 const CALL_ID: &[u8] = b"\"call_id\":\"";
@@ -18,6 +21,7 @@ struct Pulse {
     running: bool,
     input_call: Option<String>,
     preview: String,
+    account: Option<AccountMark>,
 }
 
 impl Pulse {
@@ -44,6 +48,12 @@ impl Pulse {
             return;
         }
         match payload.get("type").and_then(Value::as_str) {
+            Some("token_count") => {
+                self.account = payload
+                    .get("rate_limits")
+                    .and_then(quota)
+                    .map(AccountMark::quota);
+            }
             Some("task_started" | "turn_started") => self.running = true,
             Some("task_complete" | "turn_complete" | "turn_aborted") => {
                 self.running = false;
@@ -74,6 +84,7 @@ fn interesting(line: &[u8]) -> bool {
         b"\"type\":\"turn_".as_slice(),
         b"\"type\":\"user_message\"".as_slice(),
         b"\"type\":\"agent_message\"".as_slice(),
+        b"\"type\":\"token_count\"".as_slice(),
     ]
     .iter()
     .any(|needle| memmem::find(line, needle).is_some())
@@ -102,6 +113,7 @@ pub struct RolloutSummary {
     pub preview: String,
     pub running: bool,
     pub waiting_for_input: bool,
+    pub account: Option<AccountMark>,
 }
 
 impl Rollouts {
@@ -120,6 +132,7 @@ impl Rollouts {
             preview: pulse.preview.clone(),
             running: pulse.running,
             waiting_for_input: pulse.input_call.is_some(),
+            account: pulse.account.clone(),
         };
         let _prior = self.memo.insert(path.to_owned(), Memo { length, pulse });
         Ok(summary)
@@ -143,9 +156,13 @@ fn scan_reverse(path: &Path, length: u64) -> std::io::Result<Pulse> {
     let mut found_work = false;
     let mut found_preview = false;
     let mut found_input_call = false;
+    let mut found_account = false;
+    let mut account_horizon_exhausted = false;
     let mut resolved_calls = HashSet::new();
 
-    while cursor > 0 && !(found_work && found_preview) {
+    while cursor > 0
+        && !(found_work && found_preview && (found_account || account_horizon_exhausted))
+    {
         let start = cursor.saturating_sub(BLOCK as u64);
         let span = usize::try_from(cursor - start).unwrap_or(BLOCK);
         let mut bytes = vec![0; span];
@@ -166,14 +183,16 @@ fn scan_reverse(path: &Path, length: u64) -> std::io::Result<Pulse> {
                 &mut found_work,
                 &mut found_preview,
                 &mut found_input_call,
+                &mut found_account,
                 &mut resolved_calls,
             );
-            if found_work && found_preview {
+            if found_work && found_preview && found_account {
                 break;
             }
         }
         suffix = bytes[..complete_from.saturating_sub(1)].to_vec();
         cursor = start;
+        account_horizon_exhausted = length.saturating_sub(start) >= ACCOUNT_HORIZON;
     }
     Ok(newest)
 }
@@ -184,6 +203,7 @@ fn inspect_reverse(
     found_work: &mut bool,
     found_preview: &mut bool,
     found_input_call: &mut bool,
+    found_account: &mut bool,
     resolved_calls: &mut HashSet<String>,
 ) {
     if memmem::find(line, CALL_OUTPUT).is_some() {
@@ -212,6 +232,13 @@ fn inspect_reverse(
     }
     let payload = &event["payload"];
     match payload.get("type").and_then(Value::as_str) {
+        Some("token_count") if !*found_account => {
+            newest.account = payload
+                .get("rate_limits")
+                .and_then(quota)
+                .map(AccountMark::quota);
+            *found_account = true;
+        }
         Some("task_started" | "turn_started") if !*found_work => {
             newest.running = true;
             *found_work = true;
@@ -237,6 +264,15 @@ fn inspect_reverse(
         }
         _ => {}
     }
+}
+
+fn quota(value: &Value) -> Option<QuotaMark> {
+    let primary = value.get("primary")?;
+    Some(QuotaMark {
+        limit: value.get("limit_id")?.as_str()?.to_owned(),
+        window_minutes: primary.get("window_minutes")?.as_i64()?,
+        resets_at: primary.get("resets_at")?.as_i64()?,
+    })
 }
 
 #[cfg(test)]
@@ -361,6 +397,43 @@ mod tests {
                 .read(file.path())
                 .expect("answered")
                 .waiting_for_input
+        );
+    }
+
+    #[test]
+    fn account_quota_survives_cold_and_incremental_scans() {
+        let mut file = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"begin"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"window_minutes":10080,"resets_at":1000000}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        ]);
+        let mut rollouts = Rollouts::default();
+        let first = rollouts.read(file.path()).expect("cold quota");
+        assert!(
+            !first
+                .account
+                .expect("cold account")
+                .rotated_to(&AccountMark::quota(QuotaMark {
+                    limit: "codex".to_owned(),
+                    window_minutes: 10_080,
+                    resets_at: 1_000_000,
+                }))
+        );
+
+        file.write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit_id\":\"codex\",\"primary\":{\"window_minutes\":10080,\"resets_at\":2000000}}}}\n",
+        )
+        .expect("append quota");
+        let second = rollouts.read(file.path()).expect("incremental quota");
+        assert!(
+            !second
+                .account
+                .expect("incremental account")
+                .rotated_to(&AccountMark::quota(QuotaMark {
+                    limit: "codex".to_owned(),
+                    window_minutes: 10_080,
+                    resets_at: 2_000_000,
+                }))
         );
     }
 }

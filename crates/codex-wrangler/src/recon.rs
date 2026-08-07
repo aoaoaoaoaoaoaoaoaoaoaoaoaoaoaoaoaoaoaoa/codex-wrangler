@@ -2,84 +2,392 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs,
-    os::unix::ffi::OsStringExt as _,
+    io::{Read as _, Write as _},
+    os::{
+        fd::AsFd as _,
+        unix::{ffi::OsStringExt as _, net::UnixStream},
+    },
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context as _, Result};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 
 use crate::{
+    codex_rpc::CodexRpc,
     contract::{Harness, Work},
-    desktop::Desktop,
-    model::{Card, Census, snip},
+    desktop::{Desktop, DesktopSignal},
+    model::{Card, Census, Retention, snip},
     rollout::Rollouts,
+    roster::{AccountMark, Roster, Sighting as SessionSighting},
+    stasis::{ProcessKey, Quarry, Stasis, children},
     transcript::Transcripts,
+    watchfire::Watchfire,
 };
 
-const REFRESH: Duration = Duration::from_millis(800);
+const FOREST_AUDIT: Duration = Duration::from_secs(2);
+const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 
-#[derive(Clone, Copy, Debug)]
-pub enum Strike {
-    Activate(u32),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Intent {
+    Open,
+    Archive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Strike {
+    pub harness: Harness,
+    pub thread: String,
+    pub intent: Intent,
+}
+
+#[derive(Clone, Debug)]
+pub struct Activation {
+    pub strike: Strike,
+    pub succeeded: bool,
+    pub conceal: bool,
 }
 
 pub struct Nexus {
-    pub census: Receiver<Census>,
-    pub strike: Sender<Strike>,
+    latest: Arc<Mutex<Option<Census>>>,
+    activation: Arc<Mutex<Option<Activation>>>,
+    pub strike: Striker,
+    alive: Arc<AtomicBool>,
+    wake: UnixStream,
+    thread: Option<JoinHandle<()>>,
+}
+
+pub struct Striker {
+    channel: Sender<Strike>,
+    wake: UnixStream,
+}
+
+impl Striker {
+    pub fn try_send(&self, strike: Strike) -> Result<(), TrySendError<Strike>> {
+        self.channel.try_send(strike)?;
+        let _woken = (&self.wake).write_all(&[0]);
+        Ok(())
+    }
+}
+
+impl Nexus {
+    pub fn take_census(&self) -> Option<Census> {
+        self.latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    pub fn take_activation(&self) -> Option<Activation> {
+        self.activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl Drop for Nexus {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        let _woken = self.wake.write_all(&[0]);
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
 }
 
 pub fn spawn(ctx: egui::Context) -> Nexus {
-    let (census_tx, census) = bounded(1);
+    let latest = Arc::new(Mutex::new(None));
+    let activation = Arc::new(Mutex::new(None));
     let (strike, strike_rx) = bounded(16);
-    let _thread = std::thread::Builder::new()
+    let (wake, thread_wake) = UnixStream::pair().expect("forge recon wake pipe");
+    wake.set_nonblocking(true)
+        .expect("make recon wake pipe nonblocking");
+    thread_wake
+        .set_nonblocking(true)
+        .expect("make worker wake pipe nonblocking");
+    let striker_wake = wake.try_clone().expect("clone recon wake pipe");
+    let alive = Arc::new(AtomicBool::new(true));
+    let worker_alive = Arc::clone(&alive);
+    let worker_latest = Arc::clone(&latest);
+    let worker_activation = Arc::clone(&activation);
+    let thread = thread::Builder::new()
         .name("codex-wrangler-recon".to_owned())
-        .spawn(move || raid(&ctx, &census_tx, &strike_rx));
-    Nexus { census, strike }
+        .spawn(move || {
+            raid(
+                &ctx,
+                &worker_latest,
+                &worker_activation,
+                &strike_rx,
+                &thread_wake,
+                &worker_alive,
+            );
+        })
+        .expect("spawn reconnaissance worker");
+    Nexus {
+        latest,
+        activation,
+        strike: Striker {
+            channel: strike,
+            wake: striker_wake,
+        },
+        alive,
+        wake,
+        thread: Some(thread),
+    }
 }
 
-fn raid(ctx: &egui::Context, census: &Sender<Census>, strikes: &Receiver<Strike>) {
-    let mut recon = Recon::raise();
-    loop {
-        while let Ok(strike) = strikes.try_recv() {
-            if let (Ok(recon), Strike::Activate(window)) = (&mut recon, strike)
-                && let Err(error) = recon.desktop.activate(window)
-            {
-                eprintln!("codex-wrangler could not activate window {window}: {error:#}");
+fn raid(
+    ctx: &egui::Context,
+    latest: &Mutex<Option<Census>>,
+    activation: &Mutex<Option<Activation>>,
+    strikes: &Receiver<Strike>,
+    wake: &UnixStream,
+    alive: &AtomicBool,
+) {
+    let mut recon = match Recon::raise() {
+        Ok(recon) => recon,
+        Err(error) => {
+            publish(
+                ctx,
+                latest,
+                Census {
+                    cards: Vec::new(),
+                    fault: Some(format!("Could not arm reconnaissance: {error:#}")),
+                },
+            );
+            return;
+        }
+    };
+    let mut prior = None;
+    if let Err(error) = recon
+        .refresh_forest()
+        .and_then(|_| recon.project(Instant::now()))
+    {
+        publish_fault(ctx, latest, &error);
+    } else {
+        publish_changed(ctx, latest, &mut prior, recon.census());
+    }
+    let mut forest_audit = Instant::now() + FOREST_AUDIT;
+    let mut integrity_audit = Instant::now() + INTEGRITY_AUDIT;
+    while alive.load(Ordering::Acquire) {
+        let deadline = [
+            Some(forest_audit),
+            Some(integrity_audit),
+            recon.stasis.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or_else(|| Instant::now() + INTEGRITY_AUDIT);
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let readiness = match wait_for_signal(&recon, wake, timeout) {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                eprintln!("codex-wrangler reconnaissance wait failed: {error:#}");
+                break;
+            }
+        };
+        if readiness[2] {
+            drain_wake(wake);
+        }
+        if !alive.load(Ordering::Acquire) {
+            break;
+        }
+
+        let now = Instant::now();
+        let mut dirty = execute_strikes(ctx, activation, strikes, &mut recon, now);
+
+        if readiness[0] {
+            let (changed, forest_hint) = heed_desktop(&mut recon, now);
+            dirty |= changed;
+            if forest_hint {
+                forest_audit = now;
             }
         }
-        let next = match &mut recon {
-            Ok(recon) => recon.census().unwrap_or_else(|error| Census {
-                cards: Vec::new(),
-                fault: Some(format!("Could not inspect harnesses: {error:#}")),
-            }),
-            Err(error) => Census {
-                cards: Vec::new(),
-                fault: Some(format!("Could not arm reconnaissance: {error:#}")),
-            },
-        };
-        let _published = census.try_send(next);
-        ctx.request_repaint();
-        match strikes.recv_timeout(REFRESH) {
-            Ok(strike) => {
-                if let (Ok(recon), Strike::Activate(window)) = (&mut recon, strike)
-                    && let Err(error) = recon.desktop.activate(window)
-                {
-                    eprintln!("codex-wrangler could not activate window {window}: {error:#}");
-                }
+        if readiness[1] {
+            dirty |= reap_watchfire(&mut recon);
+        }
+        if now >= forest_audit {
+            match recon.refresh_forest() {
+                Ok(changed) => dirty |= changed,
+                Err(error) => publish_fault(ctx, latest, &error),
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            forest_audit = now + FOREST_AUDIT;
+        }
+        if now >= integrity_audit {
+            dirty = true;
+            integrity_audit = now + INTEGRITY_AUDIT;
+        }
+        if dirty {
+            match recon.project(now) {
+                Ok(()) => publish_changed(ctx, latest, &mut prior, recon.census()),
+                Err(error) => publish_fault(ctx, latest, &error),
+            }
+        }
+        if recon
+            .stasis
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            recon.refresh_focus(now);
+            recon.stasis.freeze_due(now);
+            recon.refresh_focus(Instant::now());
+            publish_changed(ctx, latest, &mut prior, recon.census());
         }
     }
+}
+
+fn wait_for_signal(recon: &Recon, wake: &UnixStream, timeout: Duration) -> Result<[bool; 3]> {
+    let mut descriptors = [
+        PollFd::new(recon.desktop.as_fd(), PollFlags::POLLIN),
+        PollFd::new(recon.watchfire.as_fd(), PollFlags::POLLIN),
+        PollFd::new(wake.as_fd(), PollFlags::POLLIN),
+    ];
+    let timeout = PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX);
+    let _ready = poll(&mut descriptors, timeout).context("poll reconnaissance sources")?;
+    Ok(descriptors.map(|descriptor| {
+        descriptor
+            .revents()
+            .is_some_and(|events| events.contains(PollFlags::POLLIN))
+    }))
+}
+
+fn execute_strikes(
+    ctx: &egui::Context,
+    activation: &Mutex<Option<Activation>>,
+    strikes: &Receiver<Strike>,
+    recon: &mut Recon,
+    now: Instant,
+) -> bool {
+    let mut struck = false;
+    while let Ok(strike) = strikes.try_recv() {
+        let conceal = strike.intent == Intent::Open;
+        let succeeded = recon.execute(&strike, now).unwrap_or_else(|error| {
+            eprintln!(
+                "codex-wrangler could not execute {:?} for {}: {error:#}",
+                strike.intent, strike.thread
+            );
+            false
+        });
+        if succeeded {
+            let _changed = recon.refresh_forest();
+        }
+        *activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Activation {
+            strike,
+            succeeded,
+            conceal,
+        });
+        ctx.request_repaint();
+        struck = true;
+    }
+    struck
+}
+
+fn heed_desktop(recon: &mut Recon, now: Instant) -> (bool, bool) {
+    match recon.desktop.drain_events() {
+        Ok(signals) => {
+            let focus = signals.contains(&DesktopSignal::Focus);
+            if focus {
+                recon.refresh_focus(now);
+            }
+            (
+                focus || signals.contains(&DesktopSignal::Workspace),
+                signals.contains(&DesktopSignal::Topology)
+                    || signals.contains(&DesktopSignal::Terminal),
+            )
+        }
+        Err(error) => {
+            recon.stasis.focus_uncertain();
+            eprintln!("codex-wrangler lost X11 focus truth: {error:#}");
+            (true, false)
+        }
+    }
+}
+
+fn reap_watchfire(recon: &mut Recon) -> bool {
+    match recon.watchfire.reap() {
+        Ok(flare) => flare.overflowed || !flare.paths.is_empty(),
+        Err(error) => {
+            eprintln!("codex-wrangler file watch failed: {error:#}");
+            true
+        }
+    }
+}
+
+fn drain_wake(mut wake: &UnixStream) {
+    let mut bytes = [0_u8; 64];
+    loop {
+        match wake.read(&mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+fn publish_changed(
+    ctx: &egui::Context,
+    latest: &Mutex<Option<Census>>,
+    prior: &mut Option<Census>,
+    census: Census,
+) {
+    if prior.as_ref() != Some(&census) {
+        *prior = Some(census.clone());
+        publish(ctx, latest, census);
+    }
+}
+
+fn publish_fault(ctx: &egui::Context, latest: &Mutex<Option<Census>>, error: &anyhow::Error) {
+    publish(
+        ctx,
+        latest,
+        Census {
+            cards: Vec::new(),
+            fault: Some(format!("Could not inspect harnesses: {error:#}")),
+        },
+    );
+}
+
+fn publish(ctx: &egui::Context, latest: &Mutex<Option<Census>>, census: Census) {
+    *latest
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(census);
+    ctx.request_repaint();
+}
+
+#[derive(Eq, PartialEq)]
+struct Sighting {
+    process: Process,
+    window: u32,
 }
 
 struct Recon {
     codex: Option<Codex>,
     desktop: Desktop,
+    process_cache: HashMap<ProcessKey, Process>,
+    sightings: Vec<Sighting>,
+    semantic: Vec<Card>,
+    codex_seats: HashMap<String, Seat>,
+    stasis: Stasis,
     transcripts: Transcripts,
+    watchfire: Watchfire,
+}
+
+#[derive(Clone, Copy)]
+struct Seat {
+    process: ProcessKey,
+    window: u32,
 }
 
 impl Recon {
@@ -94,55 +402,332 @@ impl Recon {
         Ok(Self {
             codex,
             desktop: Desktop::connect()?,
+            process_cache: HashMap::new(),
+            sightings: Vec::new(),
+            semantic: Vec::new(),
+            codex_seats: HashMap::new(),
+            stasis: Stasis::arm(),
             transcripts: Transcripts::default(),
+            watchfire: Watchfire::kindle()?,
         })
     }
 
-    fn census(&mut self) -> Result<Census> {
+    fn refresh_forest(&mut self) -> Result<bool> {
+        let terminals = self
+            .desktop
+            .windows_by_pid()?
+            .into_iter()
+            .filter(|(pid, _)| alacritty(*pid))
+            .collect::<HashMap<_, _>>();
+        self.desktop.watch_terminals(terminals.values().copied())?;
+        let sightings = manual_harnesses(&terminals, &mut self.process_cache);
+        let changed = sightings != self.sightings;
+        self.sightings = sightings;
+        Ok(changed)
+    }
+
+    fn project(&mut self, now: Instant) -> Result<()> {
         if let Some(codex) = &mut self.codex {
             codex.refresh_names()?;
         }
-        let windows = self.desktop.windows_by_pid()?;
         let workspaces = self
             .desktop
-            .workspace_numbers(windows.values().copied())
+            .workspace_numbers(self.sightings.iter().map(|sighting| sighting.window))
             .unwrap_or_default();
-        let mut processes = manual_harnesses()?;
-        processes.sort_by_key(|process| std::cmp::Reverse(process.pid));
+        let active = match self.desktop.active_window() {
+            Ok(active) => active,
+            Err(error) => {
+                self.stasis.focus_uncertain();
+                return Err(error.context("read active X11 window"));
+            }
+        };
         let mut locator = SessionLocator::default();
         let mut cards = Vec::new();
+        let mut quarry = Vec::new();
+        let mut watched = self
+            .codex
+            .as_ref()
+            .map_or_else(Vec::new, Codex::watch_paths);
         let mut seen = HashSet::new();
-        for process in processes {
-            let Some(terminal_pid) = alacritty_ancestor(process.pid)? else {
-                continue;
-            };
-            let Some(&window) = windows.get(&terminal_pid) else {
-                continue;
-            };
-            let workspace = workspaces.get(&window).copied();
-            let card = match process.harness {
+        let mut codex_seats = HashMap::new();
+        for sighting in &self.sightings {
+            let process = &sighting.process;
+            watched.extend(process.transcripts.iter().cloned());
+            let workspace = workspaces.get(&sighting.window).copied();
+            let observation = match process.harness {
                 Harness::Codex => match &mut self.codex {
-                    Some(codex) => codex.card(&process, window, workspace)?,
+                    Some(codex) => codex
+                        .card(process, sighting.window, workspace)?
+                        .map(|(card, transcript)| (card, Some(transcript))),
                     None => None,
                 },
                 Harness::ClaudeCode | Harness::PrimeAgent => Some(foreign_card(
                     &mut self.transcripts,
                     &mut locator,
-                    &process,
-                    window,
+                    process,
+                    sighting.window,
                     workspace,
                 )),
             };
-            let Some(card) = card else {
+            let Some((mut card, transcript)) = observation else {
                 continue;
             };
+            if card.harness == Harness::Codex && self.desktop.requires_action(sighting.window) {
+                card.work = Work::Input;
+                card.activity = Work::Input;
+            }
+            watched.extend(transcript);
             if seen.insert((card.harness, card.thread.clone())) {
+                if card.harness == Harness::Codex {
+                    let _prior = codex_seats.insert(
+                        card.thread.clone(),
+                        Seat {
+                            process: process.key,
+                            window: sighting.window,
+                        },
+                    );
+                    quarry.push(Quarry {
+                        process: process.key,
+                        window: sighting.window,
+                        work: card.activity,
+                    });
+                }
                 cards.push(card);
             }
         }
-        cards.sort();
-        Ok(Census { cards, fault: None })
+        if let Some(codex) = &mut self.codex {
+            cards.extend(codex.dormant_cards(codex_seats.keys().map(String::as_str))?);
+            codex.commit()?;
+        }
+        self.stasis.observe(now, active, &quarry);
+        self.watchfire.reconcile(watched)?;
+        self.codex_seats = codex_seats;
+        self.semantic = cards;
+        Ok(())
     }
+
+    fn refresh_focus(&mut self, now: Instant) {
+        match self.desktop.active_window() {
+            Ok(active) => self.stasis.focus(now, active),
+            Err(error) => {
+                self.stasis.focus_uncertain();
+                eprintln!("codex-wrangler could not establish focus truth: {error:#}");
+            }
+        }
+    }
+
+    fn census(&self) -> Census {
+        let mut cards = self.semantic.clone();
+        for card in &mut cards {
+            if card
+                .window
+                .is_some_and(|window| self.stasis.sleeping(window))
+            {
+                card.work = Work::Sleeping;
+            }
+        }
+        cards.sort();
+        Census { cards, fault: None }
+    }
+
+    fn execute(&mut self, strike: &Strike, now: Instant) -> Result<bool> {
+        let Some(card) = self
+            .semantic
+            .iter()
+            .find(|card| card.harness == strike.harness && card.thread == strike.thread)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if strike.harness != Harness::Codex {
+            return match (strike.intent, card.window) {
+                (Intent::Open, Some(window)) => self.activate(window, now),
+                _ => Ok(false),
+            };
+        }
+        match strike.intent {
+            Intent::Open => self.open_codex(&card, now),
+            Intent::Archive => self.archive_codex(&card, now),
+        }
+    }
+
+    fn activate(&mut self, window: u32, now: Instant) -> Result<bool> {
+        if !self.stasis.prepare_activation(now, window) {
+            anyhow::bail!("window {window} remains frozen");
+        }
+        self.desktop.activate(window)?;
+        Ok(true)
+    }
+
+    fn open_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
+        if card.retention == Retention::Archived || card.window.is_none() {
+            let active = self.active_account("bind resumed Codex login");
+            return self.summon_codex(
+                &card.thread,
+                card.retention == Retention::Archived,
+                card.workspace,
+                active,
+            );
+        }
+        let window = card.window.expect("live Codex card owns a window");
+        if card.activity == Work::Done {
+            let codex = self.codex.as_mut().context("Codex adapter is absent")?;
+            let home = codex.home.clone();
+            let active = inspect_account(&home, "inspect current Codex login");
+            let rotated = active.as_ref().is_some_and(|active| {
+                codex
+                    .roster
+                    .get(&card.thread)
+                    .is_some_and(|session| session.account.rotated_to(active))
+            });
+            if rotated {
+                let seat = self
+                    .codex_seats
+                    .get(&card.thread)
+                    .copied()
+                    .context("live Codex card has no process seat")?;
+                self.retire(seat, now)?;
+                return self.summon_codex(&card.thread, false, card.workspace, active);
+            }
+        }
+        self.activate(window, now)
+    }
+
+    fn archive_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
+        let codex = self.codex.as_mut().context("Codex adapter is absent")?;
+        if card.retention == Retention::Archived {
+            codex.roster.forget(&card.thread);
+            codex.commit()?;
+            return Ok(true);
+        }
+        if card.activity != Work::Done {
+            return Ok(false);
+        }
+        if let Some(seat) = self.codex_seats.get(&card.thread).copied() {
+            self.retire(seat, now)?;
+        }
+        let codex = self.codex.as_mut().context("Codex adapter is absent")?;
+        CodexRpc::open(&codex.home)?.archive(&card.thread)?;
+        codex
+            .roster
+            .set_retention(&card.thread, Retention::Archived);
+        codex.commit()?;
+        Ok(true)
+    }
+
+    fn retire(&mut self, seat: Seat, now: Instant) -> Result<()> {
+        if !self.stasis.prepare_retirement(now, seat.window) {
+            anyhow::bail!("Codex process {} remains frozen", seat.process.pid);
+        }
+        if let Err(error) = self.desktop.close(seat.window) {
+            eprintln!(
+                "codex-wrangler could not close terminal window {} cleanly: {error:#}",
+                seat.window
+            );
+        }
+        if wait_dead(seat.process, Duration::from_secs(2)) {
+            return Ok(());
+        }
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(seat.process.pid)?),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .context("terminate stopped Codex process")?;
+        anyhow::ensure!(
+            wait_dead(seat.process, Duration::from_secs(2)),
+            "Codex process {} survived terminal closure and SIGTERM",
+            seat.process.pid
+        );
+        Ok(())
+    }
+
+    fn summon_codex(
+        &mut self,
+        thread_id: &str,
+        archived: bool,
+        workspace: Option<u32>,
+        active: Option<AccountMark>,
+    ) -> Result<bool> {
+        let codex = self.codex.as_mut().context("Codex adapter is absent")?;
+        let session = codex
+            .roster
+            .get(thread_id)
+            .cloned()
+            .context("Codex session is absent from Wrangler state")?;
+        if let Some(workspace) = workspace {
+            let destination = format!("workspace number {workspace}");
+            let status = Command::new("i3-msg")
+                .args(["--quiet", &destination])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("switch to remembered Codex workspace")?;
+            anyhow::ensure!(status.success(), "i3 rejected workspace `{workspace}`");
+        }
+        let operation = if archived { "unarchive" } else { "resume" };
+        let mut child = Command::new("alacritty")
+            .arg("--working-directory")
+            .arg(&session.cwd)
+            .args(["-e", "codex", operation, thread_id])
+            .env("CODEX_HOME", &codex.home)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("raise Alacritty for Codex thread `{thread_id}`"))?;
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let window = loop {
+            if let Some(window) = self.desktop.window_by_pid(pid)? {
+                break window;
+            }
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("Alacritty exited before mapping its window: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _killed = child.kill();
+                let _waited = child.wait();
+                anyhow::bail!("Alacritty did not map a window within 8 seconds");
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        thread::Builder::new()
+            .name("codex-wrangler-terminal-reaper".to_owned())
+            .spawn(move || {
+                let _waited = child.wait();
+            })
+            .context("spawn Alacritty reaper")?;
+        self.desktop.activate(window)?;
+        let codex = self.codex.as_mut().context("Codex adapter is absent")?;
+        codex.roster.set_retention(thread_id, Retention::Active);
+        if let Some(active) = active {
+            codex.roster.bind(thread_id, active);
+        }
+        codex.commit()?;
+        Ok(true)
+    }
+
+    fn active_account(&self, operation: &str) -> Option<AccountMark> {
+        let codex = self.codex.as_ref()?;
+        inspect_account(&codex.home, operation)
+    }
+}
+
+fn inspect_account(home: &Path, operation: &str) -> Option<AccountMark> {
+    CodexRpc::open(home)
+        .and_then(|mut rpc| rpc.account())
+        .map_err(|error| eprintln!("codex-wrangler could not {operation}: {error:#}"))
+        .ok()
+}
+
+fn wait_dead(process: ProcessKey, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while process.alive() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    true
 }
 
 struct Codex {
@@ -151,6 +736,7 @@ struct Codex {
     goals: Option<Connection>,
     names: NameIndex,
     rollouts: Rollouts,
+    roster: Roster,
 }
 
 impl Codex {
@@ -187,6 +773,7 @@ impl Codex {
             goals,
             names: NameIndex::default(),
             rollouts: Rollouts::default(),
+            roster: Roster::restore().context("restore known Codex sessions")?,
         }))
     }
 
@@ -194,12 +781,25 @@ impl Codex {
         self.names.refresh(&self.home.join("session_index.jsonl"))
     }
 
+    fn watch_paths(&self) -> Vec<PathBuf> {
+        [
+            "session_index.jsonl",
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "goals_1.sqlite",
+            "goals_1.sqlite-wal",
+        ]
+        .into_iter()
+        .map(|name| self.home.join(name))
+        .collect()
+    }
+
     fn card(
         &mut self,
         process: &Process,
         window: u32,
         workspace: Option<u32>,
-    ) -> Result<Option<Card>> {
+    ) -> Result<Option<(Card, PathBuf)>> {
         let Some(thread) = self.current_thread(&process.transcripts)? else {
             return Ok(None);
         };
@@ -215,17 +815,80 @@ impl Codex {
             self.goal_active(&thread.id)?,
             summary.waiting_for_input,
         );
-        Ok(Some(Card {
-            harness: Harness::Codex,
-            thread: thread.id,
-            name,
-            cwd: compact_path(&thread.cwd, process.home.as_deref()),
-            tile_preview: snip(&summary.preview, 280),
-            work,
-            window,
-            workspace,
+        let rollout = thread.rollout.clone();
+        let preview = snip(&summary.preview, 280);
+        self.roster.sight(SessionSighting {
+            thread: &thread.id,
+            name: name.as_deref(),
+            cwd: &thread.cwd,
+            preview: &preview,
             updated_at_ms: thread.updated_at_ms,
-        }))
+            workspace,
+            account: summary.account,
+        });
+        Ok(Some((
+            Card {
+                harness: Harness::Codex,
+                thread: thread.id,
+                name,
+                cwd: compact_path(&thread.cwd, process.home.as_deref()),
+                tile_preview: preview,
+                work,
+                activity: work,
+                window: Some(window),
+                workspace,
+                updated_at_ms: thread.updated_at_ms,
+                retention: Retention::Active,
+            },
+            rollout,
+        )))
+    }
+
+    fn dormant_cards<'a>(&mut self, live: impl IntoIterator<Item = &'a str>) -> Result<Vec<Card>> {
+        let live = live.into_iter().collect::<HashSet<_>>();
+        let threads = self
+            .roster
+            .sessions()
+            .map(|(thread, _)| thread.to_owned())
+            .collect::<Vec<_>>();
+        for thread in &threads {
+            let archived = self
+                .db
+                .query_row(
+                    "SELECT archived FROM threads WHERE id = ?1",
+                    params![thread],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .with_context(|| format!("query retention for Codex thread `{thread}`"))?;
+            match archived {
+                Some(true) => self.roster.set_retention(thread, Retention::Archived),
+                Some(false) => self.roster.set_retention(thread, Retention::Active),
+                None => self.roster.forget(thread),
+            }
+        }
+        Ok(self
+            .roster
+            .sessions()
+            .filter(|(thread, _)| !live.contains(*thread))
+            .map(|(thread, session)| Card {
+                harness: Harness::Codex,
+                thread: thread.to_owned(),
+                name: session.name.clone(),
+                cwd: compact_path(&session.cwd, None),
+                tile_preview: session.preview.clone(),
+                work: Work::Done,
+                activity: Work::Done,
+                window: None,
+                workspace: session.workspace,
+                updated_at_ms: session.updated_at_ms,
+                retention: session.retention,
+            })
+            .collect())
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        self.roster.commit()
     }
 
     fn goal_active(&self, thread: &str) -> Result<bool> {
@@ -304,7 +967,7 @@ fn foreign_card(
     process: &Process,
     window: u32,
     workspace: Option<u32>,
-) -> Card {
+) -> (Card, Option<PathBuf>) {
     let path = locator.locate(process);
     let summary = path
         .as_deref()
@@ -319,7 +982,12 @@ fn foreign_card(
         .and_then(|summary| summary.cwd.as_deref())
         .unwrap_or(&process.cwd);
     let work = summary.as_ref().map_or(Work::Done, |summary| summary.work);
-    Card {
+    let activity = if process.goal && work == Work::Turn {
+        Work::Goal
+    } else {
+        work
+    };
+    let card = Card {
         harness: process.harness,
         thread,
         name: process
@@ -329,17 +997,16 @@ fn foreign_card(
         tile_preview: summary
             .as_ref()
             .map_or_else(String::new, |summary| snip(&summary.preview, 280)),
-        work: if process.goal && work == Work::Turn {
-            Work::Goal
-        } else {
-            work
-        },
-        window,
+        work: activity,
+        activity,
+        window: Some(window),
         workspace,
         updated_at_ms: summary
             .as_ref()
             .map_or_else(|| i64::from(process.pid), |summary| summary.updated_at_ms),
-    }
+        retention: Retention::Active,
+    };
+    (card, path)
 }
 
 const fn classify_work(running: bool, goal_active: bool, waiting_for_input: bool) -> Work {
@@ -433,7 +1100,9 @@ fn compact_path(path: &Path, home: Option<&Path>) -> String {
     })
 }
 
+#[derive(Clone, Eq, PartialEq)]
 struct Process {
+    key: ProcessKey,
     pid: u32,
     harness: Harness,
     argv: Vec<OsString>,
@@ -491,47 +1160,77 @@ impl Process {
     }
 }
 
-fn manual_harnesses() -> Result<Vec<Process>> {
-    let mut processes = Vec::new();
-    for entry in fs::read_dir("/proc").context("enumerate processes")? {
-        let entry = entry?;
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let root = entry.path();
-        let Ok(argv) = fs::read(root.join("cmdline")) else {
-            continue;
-        };
-        let argv = argv
-            .split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .map(|arg| OsString::from_vec(arg.to_vec()))
-            .collect::<Vec<_>>();
-        let Some(harness) = harness_argv(&argv) else {
-            continue;
-        };
-        if !foreground_tty(&root) {
+fn manual_harnesses(
+    terminals: &HashMap<u32, u32>,
+    cache: &mut HashMap<ProcessKey, Process>,
+) -> Vec<Sighting> {
+    let mut frontier = terminals
+        .iter()
+        .flat_map(|(pid, window)| children(*pid).into_iter().map(|child| (child, *window)))
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    let mut sightings = Vec::new();
+    while let Some((pid, window)) = frontier.pop() {
+        if !seen.insert(pid) {
             continue;
         }
-        let environment = process_environment(&root);
-        let home = environment
-            .get("HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-        let cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| PathBuf::from("."));
-        let goal = harness == Harness::PrimeAgent && has_option(&argv, "--goal");
-        processes.push(Process {
-            pid,
-            harness,
-            argv,
-            transcripts: open_jsonls(&root),
-            cwd,
-            environment,
-            home,
-            goal,
-        });
+        frontier.extend(children(pid).into_iter().map(|child| (child, window)));
+        if let Some(process) = harness_process(pid, cache) {
+            sightings.push(Sighting { process, window });
+        }
     }
-    Ok(processes)
+    sightings.sort_by_key(|sighting| std::cmp::Reverse(sighting.process.pid));
+    let living = sightings
+        .iter()
+        .map(|sighting| sighting.process.key)
+        .collect::<HashSet<_>>();
+    cache.retain(|key, _| living.contains(key));
+    sightings
+}
+
+fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option<Process> {
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let bytes = fs::read(root.join("cmdline")).ok()?;
+    let argv = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| OsString::from_vec(arg.to_vec()))
+        .collect::<Vec<_>>();
+    let harness = harness_argv(&argv)?;
+    let key = ProcessKey::sight(pid).ok()?;
+    if let Some(prior) = cache.get(&key)
+        && prior.argv == argv
+        && prior.harness == harness
+    {
+        let mut process = prior.clone();
+        process.transcripts = open_jsonls(&root);
+        process.cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| process.cwd.clone());
+        let _prior = cache.insert(key, process.clone());
+        return Some(process);
+    }
+    if !foreground_tty(&root) {
+        return None;
+    }
+    let environment = process_environment(&root);
+    let home = environment
+        .get("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| PathBuf::from("."));
+    let goal = harness == Harness::PrimeAgent && has_option(&argv, "--goal");
+    let process = Process {
+        key,
+        pid,
+        harness,
+        argv,
+        transcripts: open_jsonls(&root),
+        cwd,
+        environment,
+        home,
+        goal,
+    };
+    let _prior = cache.insert(key, process.clone());
+    Some(process)
 }
 
 fn harness_argv(argv: &[OsString]) -> Option<Harness> {
@@ -640,7 +1339,7 @@ fn foreground_tty(root: &Path) -> bool {
 }
 
 fn open_jsonls(root: &Path) -> Vec<PathBuf> {
-    fs::read_dir(root.join("fd"))
+    let mut paths = fs::read_dir(root.join("fd"))
         .into_iter()
         .flatten()
         .flatten()
@@ -651,7 +1350,10 @@ fn open_jsonls(root: &Path) -> Vec<PathBuf> {
                 .and_then(OsStr::to_str)
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
 }
 
 #[derive(Default)]
@@ -843,29 +1545,12 @@ fn rollout_id(path: &Path) -> Option<&str> {
     }
 }
 
-fn alacritty_ancestor(mut pid: u32) -> Result<Option<u32>> {
-    let mut seen = HashSet::new();
-    while pid > 1 && seen.insert(pid) {
-        let root = PathBuf::from(format!("/proc/{pid}"));
-        if fs::read_link(root.join("exe"))
-            .ok()
-            .and_then(|path| path.file_name().map(OsStr::to_owned))
-            .as_deref()
-            == Some(OsStr::new("alacritty"))
-        {
-            return Ok(Some(pid));
-        }
-        pid = parent_pid(&root)?.unwrap_or_default();
-    }
-    Ok(None)
-}
-
-fn parent_pid(root: &Path) -> Result<Option<u32>> {
-    let status = fs::read_to_string(root.join("status"))?;
-    Ok(status
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))
-        .and_then(|value| value.trim().parse().ok()))
+fn alacritty(pid: u32) -> bool {
+    fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| path.file_name().map(OsStr::to_owned))
+        .as_deref()
+        == Some(OsStr::new("alacritty"))
 }
 
 #[cfg(test)]

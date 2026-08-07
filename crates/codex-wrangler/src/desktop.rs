@@ -1,12 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    os::fd::{AsFd as _, BorrowedFd},
+};
 
 use anyhow::{Context as _, Result};
 use x11rb::{
     CURRENT_TIME, NONE,
     connection::Connection,
-    protocol::xproto::{
-        Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask,
-        PropMode, StackMode, Window,
+    errors::ReplyError,
+    protocol::{
+        ErrorKind, Event,
+        xproto::{
+            Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
+            ConnectionExt as _, EventMask, PropMode, StackMode, Window,
+        },
     },
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
@@ -19,12 +26,26 @@ struct Atoms {
     desktop: Atom,
     desktop_names: Atom,
     current_desktop: Atom,
+    name: Atom,
+    net_name: Atom,
+    protocols: Atom,
+    delete_window: Atom,
 }
 
 pub struct Desktop {
     conn: RustConnection,
     root: Window,
     atoms: Atoms,
+    watched: HashSet<Window>,
+    action_required: HashMap<Window, bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DesktopSignal {
+    Focus,
+    Topology,
+    Workspace,
+    Terminal,
 }
 
 impl Desktop {
@@ -38,8 +59,113 @@ impl Desktop {
             desktop: intern(&conn, "_NET_WM_DESKTOP")?,
             desktop_names: intern(&conn, "_NET_DESKTOP_NAMES")?,
             current_desktop: intern(&conn, "_NET_CURRENT_DESKTOP")?,
+            name: intern(&conn, "WM_NAME")?,
+            net_name: intern(&conn, "_NET_WM_NAME")?,
+            protocols: intern(&conn, "WM_PROTOCOLS")?,
+            delete_window: intern(&conn, "WM_DELETE_WINDOW")?,
         };
-        Ok(Self { conn, root, atoms })
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )?
+        .check()
+        .context("subscribe to X11 desktop changes")?;
+        conn.flush().context("arm X11 desktop watch")?;
+        Ok(Self {
+            conn,
+            root,
+            atoms,
+            watched: HashSet::new(),
+            action_required: HashMap::new(),
+        })
+    }
+
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.conn.stream().as_fd()
+    }
+
+    pub fn active_window(&self) -> Result<Option<Window>> {
+        self.window(self.root, self.atoms.active)
+    }
+
+    pub fn requires_action(&self, window: Window) -> bool {
+        self.action_required.get(&window).copied().unwrap_or(false)
+    }
+
+    fn read_requires_action(&self, window: Window) -> Result<bool> {
+        let title = match self.text(window, self.atoms.net_name)? {
+            Some(title) => Some(title),
+            None => self.text(window, self.atoms.name)?,
+        };
+        Ok(title.is_some_and(|title| title_requires_action(&title)))
+    }
+
+    pub fn watch_terminals(&mut self, windows: impl IntoIterator<Item = Window>) -> Result<()> {
+        let windows = windows.into_iter().collect::<HashSet<_>>();
+        let mut watched = self
+            .watched
+            .intersection(&windows)
+            .copied()
+            .collect::<HashSet<_>>();
+        for window in windows.difference(&self.watched) {
+            let result = self
+                .conn
+                .change_window_attributes(
+                    *window,
+                    &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+                )?
+                .check();
+            match result {
+                Ok(()) => {
+                    let _new = watched.insert(*window);
+                    let required = self.read_requires_action(*window)?;
+                    let _prior = self.action_required.insert(*window, required);
+                }
+                Err(error) if window_vanished(&error) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("watch terminal window {window}"));
+                }
+            }
+        }
+        self.watched = watched;
+        self.action_required
+            .retain(|window, _required| self.watched.contains(window));
+        self.conn.flush().context("arm terminal title watches")
+    }
+
+    pub fn drain_events(&mut self) -> Result<HashSet<DesktopSignal>> {
+        let mut signals = HashSet::new();
+        while let Some(event) = self
+            .conn
+            .poll_for_event()
+            .context("poll X11 desktop events")?
+        {
+            if let Event::PropertyNotify(event) = event {
+                if event.window == self.root {
+                    if event.atom == self.atoms.active {
+                        let _new = signals.insert(DesktopSignal::Focus);
+                    }
+                    if event.atom == self.atoms.clients {
+                        let _new = signals.insert(DesktopSignal::Topology);
+                    }
+                    if event.atom == self.atoms.desktop_names
+                        || event.atom == self.atoms.current_desktop
+                    {
+                        let _new = signals.insert(DesktopSignal::Workspace);
+                    }
+                } else if self.watched.contains(&event.window) {
+                    if event.atom == self.atoms.desktop {
+                        let _new = signals.insert(DesktopSignal::Workspace);
+                    }
+                    if event.atom == self.atoms.name || event.atom == self.atoms.net_name {
+                        let required = self.read_requires_action(event.window)?;
+                        let _prior = self.action_required.insert(event.window, required);
+                        let _new = signals.insert(DesktopSignal::Terminal);
+                    }
+                }
+            }
+        }
+        Ok(signals)
     }
 
     pub fn windows_by_pid(&self) -> Result<HashMap<u32, Window>> {
@@ -75,6 +201,20 @@ impl Desktop {
     pub fn activate(&self, window: Window) -> Result<()> {
         self.drive_window(window, None)?;
         self.conn.flush().context("activate harness terminal")
+    }
+
+    pub fn close(&self, window: Window) -> Result<()> {
+        let event = ClientMessageEvent::new(
+            32,
+            window,
+            self.atoms.protocols,
+            [self.atoms.delete_window, CURRENT_TIME, 0, 0, 0],
+        );
+        self.conn
+            .send_event(false, window, EventMask::NO_EVENT, event)?
+            .check()
+            .context("request terminal close")?;
+        self.conn.flush().context("flush terminal close")
     }
 
     fn drive_window(&self, window: Window, destination: Option<u32>) -> Result<()> {
@@ -186,7 +326,7 @@ impl Desktop {
         self.cardinal(window, self.atoms.pid)
     }
 
-    fn window_by_pid(&self, pid: u32) -> Result<Option<Window>> {
+    pub fn window_by_pid(&self, pid: u32) -> Result<Option<Window>> {
         if let Some(window) = self.windows_by_pid()?.get(&pid) {
             return Ok(Some(*window));
         }
@@ -199,23 +339,46 @@ impl Desktop {
     }
 
     fn cardinal(&self, window: Window, atom: Atom) -> Result<Option<u32>> {
-        Ok(self
+        let reply = self
             .conn
             .get_property(false, window, atom, AtomEnum::CARDINAL, 0, 1)?
-            .reply()
-            .with_context(|| format!("read X11 cardinal {atom} from window {window}"))?
-            .value32()
-            .and_then(|mut values| values.next()))
+            .reply();
+        match reply {
+            Ok(reply) => Ok(reply.value32().and_then(|mut values| values.next())),
+            Err(error) if window_vanished(&error) => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("read X11 cardinal {atom} from window {window}"))
+            }
+        }
     }
 
     fn window(&self, window: Window, atom: Atom) -> Result<Option<Window>> {
-        Ok(self
+        let reply = self
             .conn
             .get_property(false, window, atom, AtomEnum::WINDOW, 0, 1)?
-            .reply()
-            .with_context(|| format!("read X11 window {atom} from window {window}"))?
-            .value32()
-            .and_then(|mut values| values.next()))
+            .reply();
+        match reply {
+            Ok(reply) => Ok(reply.value32().and_then(|mut values| values.next())),
+            Err(error) if window_vanished(&error) => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("read X11 window {atom} from window {window}"))
+            }
+        }
+    }
+
+    fn text(&self, window: Window, atom: Atom) -> Result<Option<String>> {
+        let reply = self
+            .conn
+            .get_property(false, window, atom, AtomEnum::ANY, 0, u32::MAX)?
+            .reply();
+        match reply {
+            Ok(reply) if reply.value.is_empty() => Ok(None),
+            Ok(reply) => Ok(Some(String::from_utf8_lossy(&reply.value).into_owned())),
+            Err(error) if window_vanished(&error) => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("read X11 text {atom} from window {window}"))
+            }
+        }
     }
 
     fn desktop_names(&self) -> Result<Vec<Option<u32>>> {
@@ -243,12 +406,14 @@ impl Desktop {
         let mut seen = HashSet::from([self.root]);
         let mut descendants = Vec::new();
         while let Some(parent) = frontier.pop() {
-            let children = self
-                .conn
-                .query_tree(parent)?
-                .reply()
-                .with_context(|| format!("walk X11 window {parent}"))?
-                .children;
+            let reply = self.conn.query_tree(parent)?.reply();
+            let children = match reply {
+                Ok(reply) => reply.children,
+                Err(error) if window_vanished(&error) => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("walk X11 window {parent}"));
+                }
+            };
             for child in children {
                 if child != NONE && seen.insert(child) {
                     descendants.push(child);
@@ -258,6 +423,17 @@ impl Desktop {
         }
         Ok(descendants)
     }
+}
+
+fn window_vanished(error: &ReplyError) -> bool {
+    matches!(error, ReplyError::X11Error(error) if error.error_kind == ErrorKind::Window)
+}
+
+fn title_requires_action(title: &str) -> bool {
+    title
+        .split('|')
+        .next()
+        .is_some_and(|head| head.trim_end().ends_with("Action Required"))
 }
 
 fn workspace_number(name: &[u8]) -> Option<u32> {
@@ -286,5 +462,13 @@ mod tests {
         assert_eq!(workspace_number(b"8"), Some(8));
         assert_eq!(workspace_number(b"codex"), None);
         assert_eq!(workspace_number(b""), None);
+    }
+
+    #[test]
+    fn recognizes_codex_action_required_titles_without_eating_project_names() {
+        assert!(title_requires_action("[ ! ] Action Required | projects"));
+        assert!(title_requires_action("[ . ] Action Required | projects"));
+        assert!(!title_requires_action("[ * ] Working | projects"));
+        assert!(!title_requires_action("Action Required Cleanup"));
     }
 }
