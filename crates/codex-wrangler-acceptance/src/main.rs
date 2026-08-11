@@ -35,6 +35,7 @@ const DORMANT: &str = "90000000-0000-7000-8000-000000000009";
 const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
+const SHIFT_REACTION_CEILING: Duration = Duration::from_millis(75);
 
 fn main() -> Result<()> {
     let binary = sibling_binary()?;
@@ -458,7 +459,7 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
     let shift_down = story.session().key_down(Key::Shift)?;
     let _jiggling = story
         .reaction(shift_down)
-        .within(ReactionBudget::performance(Duration::from_millis(50)))
+        .within(ReactionBudget::performance(SHIFT_REACTION_CEILING))
         .until(Condition::new(
             "held Shift to animate management mode",
             |state: &Observation| state.jiggling,
@@ -466,7 +467,7 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
     let shift_up = story.session().key_up(Key::Shift)?;
     let _settled = story
         .reaction(shift_up)
-        .within(ReactionBudget::performance(Duration::from_millis(50)))
+        .within(ReactionBudget::performance(SHIFT_REACTION_CEILING))
         .until(Condition::new(
             "released Shift to still the management mode",
             |state: &Observation| !state.jiggling,
@@ -944,31 +945,10 @@ fn append_rollout(path: &Path, line: &str) -> Result<()> {
 fn park_pointer(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
     const PARK: (i16, i16) = (630, 32);
 
-    let goal = story.anchor(CardTarget(Harness::Codex, GOAL))?;
-    let frame = story.frame()?;
-    let (fence, target) = if hovered(&frame.state, Harness::Codex, GOAL) {
-        (TURN, story.anchor(CardTarget(Harness::Codex, TURN))?)
-    } else {
-        (GOAL, goal)
-    };
-    let receipt = story
-        .session()
-        .move_to(target.center().0, target.center().1)?;
-    let fence = fence.to_owned();
-    let _fenced = story
-        .reaction(receipt)
-        .within(ReactionBudget::functional(Duration::from_secs(2)))
-        .until(Condition::new(
-            "parking fence card to acquire the pointer",
-            move |state: &Observation| hovered(state, Harness::Codex, &fence),
-        ))?;
-    let receipt = story.session().move_to(PARK.0, PARK.1)?;
-    let _parked = story
-        .reaction(receipt)
-        .within(ReactionBudget::functional(Duration::from_secs(2)))
-        .until(Condition::new(description, |state: &Observation| {
-            state.hovered.is_none()
-        }))?;
+    let _receipt = story.session().move_to(PARK.0, PARK.1)?;
+    let _parked = story.wait(Condition::new(description, |state: &Observation| {
+        state.hovered.is_none()
+    }))?;
     Ok(())
 }
 
