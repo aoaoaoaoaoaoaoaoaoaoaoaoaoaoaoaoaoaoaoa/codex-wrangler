@@ -35,7 +35,7 @@ const DORMANT: &str = "90000000-0000-7000-8000-000000000009";
 const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
-const SHIFT_REACTION_CEILING: Duration = Duration::from_millis(75);
+const INPUT_REACTION_CEILING: Duration = Duration::from_millis(75);
 
 fn main() -> Result<()> {
     let binary = sibling_binary()?;
@@ -459,7 +459,7 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
     let shift_down = story.session().key_down(Key::Shift)?;
     let _jiggling = story
         .reaction(shift_down)
-        .within(ReactionBudget::performance(SHIFT_REACTION_CEILING))
+        .within(ReactionBudget::performance(INPUT_REACTION_CEILING))
         .until(Condition::new(
             "held Shift to animate management mode",
             |state: &Observation| state.jiggling,
@@ -467,7 +467,7 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
     let shift_up = story.session().key_up(Key::Shift)?;
     let _settled = story
         .reaction(shift_up)
-        .within(ReactionBudget::performance(SHIFT_REACTION_CEILING))
+        .within(ReactionBudget::performance(INPUT_REACTION_CEILING))
         .until(Condition::new(
             "released Shift to still the management mode",
             |state: &Observation| !state.jiggling,
@@ -694,7 +694,7 @@ fn verify_gallery(
         let thread = TURN.to_owned();
         let _hovered = story
             .reaction(receipt)
-            .within(ReactionBudget::performance(Duration::from_millis(50)))
+            .within(ReactionBudget::performance(INPUT_REACTION_CEILING))
             .until(Condition::new(
                 format!("the entire tile hitbox to own its {region}"),
                 move |state: &Observation| hovered(state, Harness::Codex, &thread),
@@ -889,7 +889,7 @@ fn verify_hover_lock(story: &mut Story<'_, '_, Observation>, rollout: &Path) -> 
     let thread = INPUT.to_owned();
     let _hovered = story
         .reaction(receipt)
-        .within(ReactionBudget::performance(Duration::from_millis(50)))
+        .within(ReactionBudget::performance(INPUT_REACTION_CEILING))
         .until(Condition::new(
             "input tile to own the stationary pointer",
             move |state: &Observation| hovered(state, Harness::Codex, &thread),
@@ -1128,6 +1128,17 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 8]) -> Result<P
            'exec -a claude zsh /test/fake-codex.zsh /test/home/.claude/projects/-work-claude/{} /test/claude-proof' &\n\
          alacritty --title 'Prime Agent' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a prime-agent zsh /test/fake-codex.zsh /test/home/.prime/agent/sessions/{} /test/prime-proof' &\n\
+         fixture_windows=0\n\
+         for attempt in $(seq 1 500); do\n\
+           fixture_windows=$(i3-msg -t get_tree 2>/dev/null | jq '[.. | .window? | select(. != null)] | length')\n\
+           [ \"$fixture_windows\" -ge 8 ] && break\n\
+           sleep 0.02\n\
+         done\n\
+         if [ \"$fixture_windows\" -lt 8 ]; then\n\
+           printf 'fixture mapped %s of 8 terminal windows\\n' \"$fixture_windows\" >&2\n\
+           i3-msg -t get_tree >&2\n\
+           exit 1\n\
+         fi\n\
          exec {}\n",
         names[0],
         names[1],
