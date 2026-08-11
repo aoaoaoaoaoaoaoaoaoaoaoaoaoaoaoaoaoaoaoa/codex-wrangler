@@ -36,6 +36,14 @@ const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
 const INPUT_REACTION_CEILING: Duration = Duration::from_millis(75);
+const FIXTURE_POLL_INTERVAL_MILLIS: u64 = 20;
+const I3_READINESS_POLLS: u64 = 100;
+const TERMINAL_READINESS_POLLS: u64 = 500;
+const APPLICATION_STARTUP_ALLOWANCE_MILLIS: u64 = 8_000;
+const APPLICATION_APPEARANCE_CEILING: Duration = Duration::from_millis(
+    FIXTURE_POLL_INTERVAL_MILLIS * (I3_READINESS_POLLS + TERMINAL_READINESS_POLLS)
+        + APPLICATION_STARTUP_ALLOWANCE_MILLIS,
+);
 
 fn main() -> Result<()> {
     let binary = sibling_binary()?;
@@ -54,7 +62,12 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
             .witness("probes/wrangler")
             .runtime(Duration::from_secs(90)),
     )?;
-    let wrangler = wait_named_window(testbed, &app, "Codex Wrangler", Duration::from_secs(8))?;
+    let wrangler = wait_named_window(
+        testbed,
+        &app,
+        "Codex Wrangler",
+        APPLICATION_APPEARANCE_CEILING,
+    )?;
     verify_switcher_present(testbed, &fixture, wrangler.id(), false)?;
     let mut story: Story<'_, '_, Observation> = Story::bind(
         testbed,
@@ -1107,9 +1120,9 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 8]) -> Result<P
         "#!/bin/sh\n\
          export PATH=/test/bin:/usr/bin\n\
          i3 -c /test/i3.config &\n\
-         for attempt in $(seq 1 100); do\n\
+         for attempt in $(seq 1 {I3_READINESS_POLLS}); do\n\
            i3-msg -t get_workspaces >/dev/null 2>&1 && break\n\
-           sleep 0.02\n\
+           sleep 0.{FIXTURE_POLL_INTERVAL_MILLIS:03}\n\
          done\n\
          i3-msg 'workspace number 7' >/dev/null\n\
          alacritty --title 'Goal Codex' -o 'window.position={{x=1500,y=0}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
@@ -1129,10 +1142,10 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 8]) -> Result<P
          alacritty --title 'Prime Agent' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a prime-agent zsh /test/fake-codex.zsh /test/home/.prime/agent/sessions/{} /test/prime-proof' &\n\
          fixture_windows=0\n\
-         for attempt in $(seq 1 500); do\n\
+         for attempt in $(seq 1 {TERMINAL_READINESS_POLLS}); do\n\
            fixture_windows=$(i3-msg -t get_tree 2>/dev/null | jq '[.. | .window? | select(. != null)] | length')\n\
            [ \"$fixture_windows\" -ge 8 ] && break\n\
-           sleep 0.02\n\
+           sleep 0.{FIXTURE_POLL_INTERVAL_MILLIS:03}\n\
          done\n\
          if [ \"$fixture_windows\" -lt 8 ]; then\n\
            printf 'fixture mapped %s of 8 terminal windows\\n' \"$fixture_windows\" >&2\n\
