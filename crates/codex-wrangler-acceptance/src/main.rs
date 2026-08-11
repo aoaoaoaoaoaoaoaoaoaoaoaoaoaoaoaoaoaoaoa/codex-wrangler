@@ -37,7 +37,9 @@ const DORMANT: &str = "90000000-0000-7000-8000-000000000009";
 const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
+const FUNCTIONAL_ACCEPTANCE_ENV: &str = "CODEX_WRANGLER_FUNCTIONAL_ACCEPTANCE";
 const INPUT_REACTION_CEILING: Duration = Duration::from_millis(75);
+const FUNCTIONAL_INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 const FIXTURE_POLL_INTERVAL_MILLIS: u64 = 20;
 const I3_READINESS_POLLS: u64 = 100;
 const TERMINAL_READINESS_POLLS: u64 = 500;
@@ -55,6 +57,14 @@ fn main() -> Result<()> {
     TestbedBuilder::default()
         .failure_artifacts("/tmp/codex-wrangler-acceptance-failure")
         .run(|testbed| story(testbed, &binary))
+}
+
+fn input_reaction_budget() -> ReactionBudget {
+    if env::var_os(FUNCTIONAL_ACCEPTANCE_ENV).is_some() {
+        ReactionBudget::functional(FUNCTIONAL_INPUT_TIMEOUT)
+    } else {
+        ReactionBudget::performance(INPUT_REACTION_CEILING)
+    }
 }
 
 fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
@@ -477,7 +487,7 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
     let shift_down = story.session().key_down(Key::Shift)?;
     let _jiggling = story
         .reaction(shift_down)
-        .within(ReactionBudget::performance(INPUT_REACTION_CEILING))
+        .within(input_reaction_budget())
         .until(Condition::new(
             "held Shift to animate management mode",
             |state: &Observation| state.jiggling,
@@ -485,7 +495,7 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
     let shift_up = story.session().key_up(Key::Shift)?;
     let _settled = story
         .reaction(shift_up)
-        .within(ReactionBudget::performance(INPUT_REACTION_CEILING))
+        .within(input_reaction_budget())
         .until(Condition::new(
             "released Shift to still the management mode",
             |state: &Observation| !state.jiggling,
@@ -717,7 +727,7 @@ fn verify_gallery(
         let thread = TURN.to_owned();
         let _hovered = story
             .reaction(receipt)
-            .within(ReactionBudget::performance(INPUT_REACTION_CEILING))
+            .within(input_reaction_budget())
             .until(Condition::new(
                 format!("the entire tile hitbox to own its {region}"),
                 move |state: &Observation| hovered(state, Harness::Codex, &thread),
@@ -912,7 +922,7 @@ fn verify_hover_lock(story: &mut Story<'_, '_, Observation>, rollout: &Path) -> 
     let thread = INPUT.to_owned();
     let _hovered = story
         .reaction(receipt)
-        .within(ReactionBudget::performance(INPUT_REACTION_CEILING))
+        .within(input_reaction_budget())
         .until(Condition::new(
             "input tile to own the stationary pointer",
             move |state: &Observation| hovered(state, Harness::Codex, &thread),
