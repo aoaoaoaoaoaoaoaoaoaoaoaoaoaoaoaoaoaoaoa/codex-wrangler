@@ -524,9 +524,8 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
 fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Result<()> {
     story.session().focus()?;
     let target = story.anchor(CardTarget(Harness::Codex, thread))?;
-    let (center_x, center_y) = target.center();
-    let x = center_x.saturating_sub(100);
-    let moved = story.session().move_to(x, center_y)?;
+    let (x, y) = target.center();
+    let moved = story.session().move_to(x, y)?;
     let sought = thread.to_owned();
     let _hovered = story.reaction(moved).until(Condition::new(
         "management card to acquire the pointer",
@@ -537,7 +536,7 @@ fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Res
         "management mode to acquire Shift",
         |state: &Observation| state.jiggling,
     ))?;
-    let clicked = story.session().click(x, center_y, Button::Primary)?;
+    let clicked = story.session().click(x, y, Button::Primary)?;
     let _struck = story.reaction(clicked).until(Condition::new(
         "management click to enter flight",
         |state: &Observation| state.flight == Flight::Striking,
@@ -567,15 +566,14 @@ fn select_and_return(
 ) -> Result<()> {
     story.session().focus()?;
     let target = story.anchor(CardTarget(Harness::Codex, thread))?;
-    let (center_x, center_y) = target.center();
-    let strike_x = center_x.saturating_sub(100);
-    let moved = story.session().move_to(strike_x, center_y)?;
+    let (strike_x, strike_y) = target.center();
+    let moved = story.session().move_to(strike_x, strike_y)?;
     let sought = thread.to_owned();
     let _hovered = story.reaction(moved).until(Condition::new(
         "resume card to acquire the pointer",
         move |state: &Observation| hovered(state, Harness::Codex, &sought),
     ))?;
-    let selected = story.session().click(strike_x, center_y, Button::Primary)?;
+    let selected = story.session().click(strike_x, strike_y, Button::Primary)?;
     let _armed = story.reaction(selected).until(Condition::new(
         "card strike to enter flight",
         |state: &Observation| state.flight == Flight::Striking,
