@@ -1,0 +1,51 @@
+schema = 1
+
+[product]
+name = "Codex Wrangler"
+package = "codex-wrangler"
+binary = "codex-wrangler"
+profile = "platform-bound"
+
+[coordinates]
+release-tested = ["linux-x86_64"]
+
+[[exclusions]]
+coordinate = "macos-aarch64"
+reason = "The product switches i3 workspaces, X11 windows, XEmbed tray state, and Alacritty TTYs."
+
+[[exclusions]]
+coordinate = "macos-x86_64"
+reason = "The product switches i3 workspaces, X11 windows, XEmbed tray state, and Alacritty TTYs."
+
+[[exclusions]]
+coordinate = "windows-x86_64"
+reason = "The product switches i3 workspaces, X11 windows, XEmbed tray state, and Alacritty TTYs."
+
+[delivery]
+linux = "cargo"
+
+[[proofs]]
+name = "source"
+laws = ["source"]
+run = ["scripts/check"]
+timeout-minutes = 45
+
+[[proofs]]
+name = "security"
+laws = ["security"]
+run = ["scripts/audit"]
+timeout-minutes = 15
+
+[[proofs]]
+name = "source-package"
+laws = ["source-package"]
+run = ["scripts/package"]
+timeout-minutes = 30
+
+[[proofs]]
+name = "runtime"
+laws = ["host", "lifecycle"]
+run = ["scripts/prove-runtime"]
+coordinates = ["linux-x86_64"]
+setup = "x11"
+timeout-minutes = 90

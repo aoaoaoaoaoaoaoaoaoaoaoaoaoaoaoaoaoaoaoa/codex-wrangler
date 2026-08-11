@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+die() {
+    printf 'release refused: %s\n' "$1" >&2
+    exit 1
+}
+
+version=${1:-}
+mode=${2:-check}
+[ -n "$version" ] || die 'usage: scripts/release VERSION [check|publish]'
+case "$version" in
+    *[!0-9.]*|'') die "invalid version: $version" ;;
+esac
+case "$mode" in
+    check|publish) ;;
+    *) die "invalid mode: $mode" ;;
+esac
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+[ "$(git branch --show-current)" = main ] || die 'release checkout is not main'
+[ -z "$(git status --porcelain)" ] || die 'worktree is dirty'
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] ||
+    die 'HEAD is not the pushed origin/main commit'
+grep -Fqx "version = \"$version\"" Cargo.toml ||
+    die "Cargo.toml does not declare workspace version $version"
+git tag --points-at HEAD | grep -Fqx "v$version" ||
+    die "v$version does not tag HEAD"
+git tag -v "v$version" >/dev/null 2>&1 || die "v$version is not a valid signed tag"
+
+scripts/check
+scripts/audit
+scripts/package
+scripts/prove-runtime
+
+if [ "$mode" = publish ]; then
+    cargo publish --locked --package codex-wrangler
+else
+    printf 'release candidate v%s passed; publication was not requested\n' "$version"
+fi

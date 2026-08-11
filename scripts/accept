@@ -9,5 +9,7 @@ if [ "$#" -eq 1 ]; then
   export CODEX_WRANGLER_ACCEPTANCE_CAPTURE=$1
 fi
 
-cargo build --release --features egui-test --bin codex-wrangler
-cargo run --release -p codex-wrangler-acceptance
+if [ -z "${CODEX_WRANGLER_ACCEPTANCE_BINARY:-}" ]; then
+  cargo build --release --locked --features egui-test --bin codex-wrangler
+fi
+cargo run --release --locked -p codex-wrangler-acceptance

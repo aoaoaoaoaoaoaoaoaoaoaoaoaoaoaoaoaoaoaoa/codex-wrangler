@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cell=$(mktemp -d "${TMPDIR:-/tmp}/codex-wrangler-lifecycle.XXXXXX")
+trap 'rm -rf -- "$cell"' EXIT HUP INT TERM
+cd "$root"
+
+cargo install --locked --force --features egui-test --path crates/codex-wrangler --root "$cell/prefix"
+binary=$cell/prefix/bin/codex-wrangler
+test -x "$binary"
+CODEX_WRANGLER_ACCEPTANCE_BINARY=$binary scripts/accept
+mkdir -p "$cell/state/codex-wrangler"
+printf '%s\n' preserved >"$cell/state/codex-wrangler/uninstall-sentinel"
+cargo uninstall --root "$cell/prefix" codex-wrangler
+test ! -e "$binary"
+test -f "$cell/state/codex-wrangler/uninstall-sentinel"
