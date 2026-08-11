@@ -942,12 +942,27 @@ fn append_rollout(path: &Path, line: &str) -> Result<()> {
 }
 
 fn park_pointer(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
-    let jolted = story.session().move_to(629, 31)?;
-    let _jolt_frame = story
-        .reaction(jolted)
+    const PARK: (i16, i16) = (630, 32);
+
+    let goal = story.anchor(CardTarget(Harness::Codex, GOAL))?;
+    let frame = story.frame()?;
+    let (fence, target) = if hovered(&frame.state, Harness::Codex, GOAL) {
+        (TURN, story.anchor(CardTarget(Harness::Codex, TURN))?)
+    } else {
+        (GOAL, goal)
+    };
+    let receipt = story
+        .session()
+        .move_to(target.center().0, target.center().1)?;
+    let fence = fence.to_owned();
+    let _fenced = story
+        .reaction(receipt)
         .within(ReactionBudget::functional(Duration::from_secs(2)))
-        .next_frame()?;
-    let receipt = story.session().move_to(630, 32)?;
+        .until(Condition::new(
+            "parking fence card to acquire the pointer",
+            move |state: &Observation| hovered(state, Harness::Codex, &fence),
+        ))?;
+    let receipt = story.session().move_to(PARK.0, PARK.1)?;
     let _parked = story
         .reaction(receipt)
         .within(ReactionBudget::functional(Duration::from_secs(2)))
