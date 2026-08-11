@@ -54,8 +54,12 @@ fn main() -> Result<()> {
         return terminal_fixture::serve();
     }
     let binary = sibling_binary()?;
+    let failure_artifacts = env::var_os("FOUNDRY_EVIDENCE_DIR").map_or_else(
+        || PathBuf::from("/tmp/codex-wrangler-acceptance-failure"),
+        |root| PathBuf::from(root).join("acceptance-failure"),
+    );
     TestbedBuilder::default()
-        .failure_artifacts("/tmp/codex-wrangler-acceptance-failure")
+        .failure_artifacts(failure_artifacts)
         .run(|testbed| story(testbed, &binary))
 }
 
@@ -523,14 +527,7 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
 
 fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Result<()> {
     story.session().focus()?;
-    let target = story.anchor(CardTarget(Harness::Codex, thread))?;
-    let (x, y) = target.center();
-    let moved = story.session().move_to(x, y)?;
-    let sought = thread.to_owned();
-    let _hovered = story.reaction(moved).until(Condition::new(
-        "management card to acquire the pointer",
-        move |state: &Observation| hovered(state, Harness::Codex, &sought),
-    ))?;
+    let (x, y) = seize_card(story, thread, "management")?;
     let shift_down = story.session().key_down(Key::Shift)?;
     let _jiggling = story.reaction(shift_down).until(Condition::new(
         "management mode to acquire Shift",
@@ -565,14 +562,7 @@ fn select_and_return(
     proof: &Path,
 ) -> Result<()> {
     story.session().focus()?;
-    let target = story.anchor(CardTarget(Harness::Codex, thread))?;
-    let (strike_x, strike_y) = target.center();
-    let moved = story.session().move_to(strike_x, strike_y)?;
-    let sought = thread.to_owned();
-    let _hovered = story.reaction(moved).until(Condition::new(
-        "resume card to acquire the pointer",
-        move |state: &Observation| hovered(state, Harness::Codex, &sought),
-    ))?;
+    let (strike_x, strike_y) = seize_card(story, thread, "resume")?;
     let selected = story.session().click(strike_x, strike_y, Button::Primary)?;
     let _armed = story.reaction(selected).until(Condition::new(
         "card strike to enter flight",
@@ -599,6 +589,46 @@ fn select_and_return(
         || Ok(wrangler_count(testbed)? == Some(1)),
     )?;
     Ok(())
+}
+
+fn seize_card(
+    story: &mut Story<'_, '_, Observation>,
+    thread: &str,
+    purpose: &'static str,
+) -> Result<(i16, i16)> {
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 1;
+
+    loop {
+        park_pointer(
+            story,
+            "pointer to vacate the gallery before card acquisition",
+        )?;
+        let point = story.anchor(CardTarget(Harness::Codex, thread))?.center();
+        let moved = story.session().move_to(point.0, point.1)?;
+        let sought = thread.to_owned();
+        let description = format!("{purpose} card `{thread}` to acquire the pointer");
+        let rejection = description.clone();
+        let condition = Condition::diagnostic(description, move |state: &Observation| {
+            hovered(state, Harness::Codex, &sought)
+                .then_some(())
+                .ok_or_else(|| {
+                    format!(
+                        "{rejection}; actual hover={:?}, flight={:?}",
+                        state.hovered, state.flight
+                    )
+                })
+        });
+        let mut reaction = story.reaction(moved);
+        match reaction
+            .within(ReactionBudget::functional(Duration::from_secs(2)))
+            .until(condition)
+        {
+            Ok(_) => return Ok(point),
+            Err(TesterError::Condition { .. }) if attempt < ATTEMPTS => attempt += 1,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn wait_card(
@@ -976,10 +1006,12 @@ fn append_rollout(path: &Path, line: &str) -> Result<()> {
 fn park_pointer(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
     const PARK: (i16, i16) = (630, 32);
 
-    let _receipt = story.session().move_to(PARK.0, PARK.1)?;
-    let _parked = story.wait(Condition::new(description, |state: &Observation| {
-        state.hovered.is_none()
-    }))?;
+    let receipt = story.session().move_to(PARK.0, PARK.1)?;
+    let _parked = story
+        .reaction(receipt)
+        .until(Condition::new(description, |state: &Observation| {
+            state.hovered.is_none()
+        }))?;
     Ok(())
 }
 
