@@ -1036,13 +1036,13 @@ impl Fixture {
         let (claude, prime) = seed_foreign_transcripts(testbed)?;
 
         let fake = testbed.write_private(
-            "fake-codex.zsh",
+            "fake-session.bash",
             br#"rollout=$1
 proof=$2
 exec 9<"$rollout"
 xprop -id "$WINDOWID" -f _NET_WM_DESKTOP 32c -set _NET_WM_DESKTOP 0
-IFS= read -rk1 key
-print -r -- "$key" > "$proof"
+IFS= read -r -n 1 key
+printf '%s\n' "$key" > "$proof"
 sleep 90
 "#,
         )?;
@@ -1133,21 +1133,21 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 8]) -> Result<P
          done\n\
          i3-msg 'workspace number 7' >/dev/null\n\
          alacritty --title 'Goal Codex' -o 'window.position={{x=1500,y=0}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof' &\n\
          alacritty --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof' &\n\
          alacritty --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
          alacritty --title 'Input Codex' -o 'window.position={{x=1500,y=600}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/input-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/input-proof' &\n\
          alacritty --title '[ ! ] Action Required | Permission Codex' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/permission-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/permission-proof' &\n\
          alacritty --title 'Old Account Codex' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex zsh /test/fake-codex.zsh /test/home/.codex/sessions/2026/08/03/{} /test/rotate-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/rotate-proof' &\n\
          alacritty --title 'Claude Code' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a claude zsh /test/fake-codex.zsh /test/home/.claude/projects/-work-claude/{} /test/claude-proof' &\n\
+           'exec -a claude bash /test/fake-session.bash /test/home/.claude/projects/-work-claude/{} /test/claude-proof' &\n\
          alacritty --title 'Prime Agent' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a prime-agent zsh /test/fake-codex.zsh /test/home/.prime/agent/sessions/{} /test/prime-proof' &\n\
+           'exec -a prime-agent bash /test/fake-session.bash /test/home/.prime/agent/sessions/{} /test/prime-proof' &\n\
          fixture_windows=0\n\
          for attempt in $(seq 1 {TERMINAL_READINESS_POLLS}); do\n\
            fixture_windows=$(i3-msg -t get_tree 2>/dev/null | jq '[.. | .window? | select(. != null)] | length')\n\
@@ -1156,7 +1156,7 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 8]) -> Result<P
          done\n\
          if [ \"$fixture_windows\" -lt 8 ]; then\n\
            printf 'fixture mapped %s of 8 terminal windows\\n' \"$fixture_windows\" >&2\n\
-           i3-msg -t get_tree >&2\n\
+           i3-msg -t get_tree | jq -c '[.. | objects | select(.window? != null) | .name]' >&2\n\
            exit 1\n\
          fi\n\
          exec {}\n",
@@ -1178,33 +1178,33 @@ fn forge_fake_cli(testbed: &Testbed) -> Result<PathBuf> {
     testbed.write_private(
         "bin/codex",
         format!(
-            r#"#!/bin/zsh
+            r#"#!/bin/bash
 db=/test/home/.codex/state_5.sqlite
-if [[ $1 == app-server ]]; then
+if [ "${{1:-}}" = app-server ]; then
   while IFS= read -r request; do
-    id=$(print -r -- "$request" | jq -r '.id // empty')
-    method=$(print -r -- "$request" | jq -r '.method')
-    [[ -z $id ]] && continue
+    id=$(printf '%s\n' "$request" | jq -r '.id // empty')
+    method=$(printf '%s\n' "$request" | jq -r '.method')
+    [ -z "$id" ] && continue
     case $method in
       initialize)
-        print -r -- '{{"id":'$id',"result":{{}}}}'
+        printf '%s\n' '{{"id":'$id',"result":{{}}}}'
         ;;
       account/read)
-        print -r -- '{{"id":'$id',"result":{{"account":{{"type":"chatgpt","email":"new@example.invalid","planType":"pro"}},"requiresOpenaiAuth":true}}}}'
+        printf '%s\n' '{{"id":'$id',"result":{{"account":{{"type":"chatgpt","email":"new@example.invalid","planType":"pro"}},"requiresOpenaiAuth":true}}}}'
         ;;
       account/rateLimits/read)
-        print -r -- '{{"id":'$id',"result":{{"rateLimits":{{"limitId":"codex","primary":{{"usedPercent":1,"windowDurationMins":10080,"resetsAt":{NEW_RESET}}}}},"rateLimitsByLimitId":{{}}}}}}'
+        printf '%s\n' '{{"id":'$id',"result":{{"rateLimits":{{"limitId":"codex","primary":{{"usedPercent":1,"windowDurationMins":10080,"resetsAt":{NEW_RESET}}}}},"rateLimitsByLimitId":{{}}}}}}'
         ;;
       thread/archive)
-        thread=$(print -r -- "$request" | jq -r '.params.threadId')
+        thread=$(printf '%s\n' "$request" | jq -r '.params.threadId')
         rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
-        destination=/test/home/.codex/archived_sessions/${{rollout:t}}
+        destination=/test/home/.codex/archived_sessions/${{rollout##*/}}
         mv "$rollout" "$destination"
         sqlite3 "$db" "UPDATE threads SET archived = 1, rollout_path = '$destination' WHERE id = '$thread'"
-        print -r -- '{{"id":'$id',"result":{{}}}}'
+        printf '%s\n' '{{"id":'$id',"result":{{}}}}'
         ;;
       *)
-        print -r -- '{{"id":'$id',"result":{{}}}}'
+        printf '%s\n' '{{"id":'$id',"result":{{}}}}'
         ;;
     esac
   done
@@ -1213,16 +1213,16 @@ fi
 
 operation=$1
 thread=$2
-if [[ $operation == unarchive ]]; then
+if [ "$operation" = unarchive ]; then
   rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
-  destination=/test/home/.codex/sessions/2026/08/03/${{rollout:t}}
+  destination=/test/home/.codex/sessions/2026/08/03/${{rollout##*/}}
   mv "$rollout" "$destination"
   sqlite3 "$db" "UPDATE threads SET archived = 0, rollout_path = '$destination' WHERE id = '$thread'"
 fi
 workspace=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused).num')
-print -r -- "$operation $workspace" > "/test/${{operation}}-proof-${{thread}}"
+printf '%s\n' "$operation $workspace" > "/test/${{operation}}-proof-${{thread}}"
 rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
-exec -a codex zsh -c 'exec 9<"$1"; sleep 90; :' wrangler-resume "$rollout"
+exec -a codex bash -c 'exec 9<"$1"; sleep 90; :' wrangler-resume "$rollout"
 "#,
         ),
     )
