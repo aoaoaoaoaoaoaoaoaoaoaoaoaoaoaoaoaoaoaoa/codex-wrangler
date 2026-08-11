@@ -942,7 +942,11 @@ fn append_rollout(path: &Path, line: &str) -> Result<()> {
 }
 
 fn park_pointer(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
-    let _jolted = story.session().move_to(629, 31)?;
+    let jolted = story.session().move_to(629, 31)?;
+    let _jolt_frame = story
+        .reaction(jolted)
+        .within(ReactionBudget::functional(Duration::from_secs(2)))
+        .next_frame()?;
     let receipt = story.session().move_to(630, 32)?;
     let _parked = story
         .reaction(receipt)
