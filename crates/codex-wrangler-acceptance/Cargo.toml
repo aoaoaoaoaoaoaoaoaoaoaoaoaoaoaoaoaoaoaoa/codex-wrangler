@@ -13,9 +13,11 @@ egui-test = []
 
 [dependencies]
 egui-tester.workspace = true
+nix = { workspace = true, features = ["term"] }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+x11rb.workspace = true
 
 [lints]
 workspace = true

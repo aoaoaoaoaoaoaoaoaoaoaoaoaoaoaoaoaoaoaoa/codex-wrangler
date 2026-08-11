@@ -283,9 +283,11 @@ name = "codex-wrangler-acceptance"
 version = "1.0.0"
 dependencies = [
  "egui-tester",
+ "nix",
  "rusqlite",
  "serde",
  "serde_json",
+ "x11rb",
 ]
 
 [[package]]

@@ -16,6 +16,8 @@ use egui_tester::{
 use rusqlite::{Connection, params};
 use serde_json::Value;
 
+mod terminal_fixture;
+
 #[path = "../../codex-wrangler/src/contract.rs"]
 mod contract;
 use contract::{
@@ -46,6 +48,9 @@ const APPLICATION_APPEARANCE_CEILING: Duration = Duration::from_millis(
 );
 
 fn main() -> Result<()> {
+    if terminal_fixture::invoked()? {
+        return terminal_fixture::serve();
+    }
     let binary = sibling_binary()?;
     TestbedBuilder::default()
         .failure_artifacts("/tmp/codex-wrangler-acceptance-failure")
@@ -570,16 +575,21 @@ fn select_and_return(
         "Codex session to be resumed in a fresh Alacritty",
         || Ok(proof.is_file()),
     )?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "Wrangler to conceal itself after resuming a Codex session",
+        || Ok(wrangler_count(testbed)? == Some(0)),
+    )?;
+    let _landed = story.wait(Condition::new(
+        "Codex session strike to leave flight",
+        |state: &Observation| state.flight == Flight::Grounded,
+    ))?;
     let _returned = story.session().key(Key::Function(7))?;
     app.wait_until(
         Duration::from_secs(8),
         "i3 to return to the fixed Wrangler workspace after resume",
         || Ok(wrangler_count(testbed)? == Some(1)),
     )?;
-    let _landed = story.wait(Condition::new(
-        "Codex session strike to leave flight",
-        |state: &Observation| state.flight == Flight::Grounded,
-    ))?;
     Ok(())
 }
 
@@ -1037,6 +1047,7 @@ sleep 90
 "#,
         )?;
         let fake_cli = forge_fake_cli(testbed)?;
+        let fake_terminal = forge_fake_terminal(testbed)?;
         let proof = testbed.private_path("focus-proof")?;
         let rotate_resume = testbed.private_path(format!("resume-proof-{ROTATE}"))?;
         let dormant_resume = testbed.private_path(format!("resume-proof-{DORMANT}"))?;
@@ -1078,16 +1089,12 @@ sleep 90
                 &prime,
             ],
         )?;
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
-            .map_err(io_verdict("make fixture wrapper executable"))?;
-        fs::set_permissions(&fake_cli, fs::Permissions::from_mode(0o700))
-            .map_err(io_verdict("make fake Codex CLI executable"))?;
-        fs::set_permissions(&focus_probe, fs::Permissions::from_mode(0o700))
-            .map_err(io_verdict("make focus probe executable"))?;
-        fs::set_permissions(&desktop_recorder, fs::Permissions::from_mode(0o700))
-            .map_err(io_verdict("make desktop recorder executable"))?;
-        fs::set_permissions(&posture_probe, fs::Permissions::from_mode(0o700))
-            .map_err(io_verdict("make posture probe executable"))?;
+        arm_executable(&wrapper, "make fixture wrapper executable")?;
+        arm_executable(&fake_cli, "make fake Codex CLI executable")?;
+        arm_executable(&fake_terminal, "make fake Alacritty executable")?;
+        arm_executable(&focus_probe, "make focus probe executable")?;
+        arm_executable(&desktop_recorder, "make desktop recorder executable")?;
+        arm_executable(&posture_probe, "make posture probe executable")?;
         demand(fake.is_file(), "fake Codex script was not created")?;
         demand(i3.is_file(), "private i3 config was not created")?;
         Ok(Self {
@@ -1219,6 +1226,17 @@ exec -a codex zsh -c 'exec 9<"$1"; sleep 90; :' wrangler-resume "$rollout"
 "#,
         ),
     )
+}
+
+fn forge_fake_terminal(testbed: &Testbed) -> Result<PathBuf> {
+    let source = env::current_exe().map_err(io_verdict("locate terminal fixture executable"))?;
+    let terminal = testbed.private_path("bin/alacritty")?;
+    fs::copy(source, &terminal).map_err(io_verdict("forge fake Alacritty"))?;
+    Ok(terminal)
+}
+
+fn arm_executable(path: &Path, operation: &'static str) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io_verdict(operation))
 }
 
 fn seed_foreign_transcripts(testbed: &Testbed) -> Result<(PathBuf, PathBuf)> {
