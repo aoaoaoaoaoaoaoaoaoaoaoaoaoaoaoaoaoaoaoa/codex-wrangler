@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler-acceptance"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "egui-tester",
  "nix",
@@ -520,9 +520,9 @@ dependencies = [
 
 [[package]]
 name = "egui-tester"
-version = "0.9.1"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae6c5ea36fc3da32b4e2cbae4e28fbd1f77987622500b0318401d58268cc8ced"
+checksum = "096fb4f1606112af0d562cc24a2a54247192057720d69a63906398b1bc60a241"
 dependencies = [
  "bitflags 2.13.1",
  "egui-tester-witness",
@@ -538,9 +538,9 @@ dependencies = [
 
 [[package]]
 name = "egui-tester-witness"
-version = "0.9.1"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23fcd5f6c8041d2fb86a2049d2d2e00a500f1e95792e31d8b59003978a06beb4"
+checksum = "3bc05a526d70f59631289dba5c4cc4de1b76d0dfc5697cd2fdf10bc735a5c0d2"
 dependencies = [
  "egui",
  "rustix 1.1.4",
@@ -650,9 +650,9 @@ dependencies = [
 
 [[package]]
 name = "eternalist-apps"
-version = "0.6.2"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a596415a0e138a827d65fd9bed1a970e970fb9f46d37e3cee6314508b1cb736"
+checksum = "184c5fa954efc33b31f973dbbb0998d282647192b6dd75a23be04270362fef7f"
 dependencies = [
  "anyhow",
  "brass_poolrooms",

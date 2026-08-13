@@ -238,7 +238,7 @@ fn verify_residency(
     let x11 = testbed.x11()?;
     let wrangler_id = story.session().window().id();
     let tray = wait_named_window(testbed, app, "Codex Wrangler tray", Duration::from_secs(8))?;
-    let tray = verify_tray_recovery(testbed, app, fixture, tray.id())?;
+    let tray = verify_tray_recovery(testbed, app, &tray)?;
     let _switched = story.session().key(Key::Function(2))?;
     app.wait_until(
         Duration::from_secs(8),
@@ -308,24 +308,12 @@ fn verify_residency(
     )
 }
 
-fn verify_tray_recovery(
-    testbed: &Testbed,
-    app: &Application<'_>,
-    fixture: &Fixture,
-    tray: u32,
-) -> Result<Window> {
-    let eviction = testbed.launch(
-        AppCommand::new(&fixture.tray_evictor)
-            .arg(tray.to_string())
-            .runtime(Duration::from_secs(8)),
-    )?;
-    let exit = eviction.wait(Duration::from_secs(8))?;
-    demand(
-        exit.success(),
-        format!("Wrangler did not redock its evicted tray icon: {exit:?}"),
-    )?;
+fn verify_tray_recovery(testbed: &Testbed, app: &Application<'_>, tray: &Window) -> Result<Window> {
+    let redocked = testbed
+        .x11()?
+        .evict_and_wait_redocked(app, tray, Duration::from_secs(4))?;
     app.ensure_running("Wrangler to survive system-tray eviction")?;
-    wait_named_window(testbed, app, "Codex Wrangler tray", Duration::from_secs(8))
+    Ok(redocked)
 }
 
 fn verify_switcher_present(
@@ -1219,7 +1207,6 @@ struct Fixture {
     focus_probe: PathBuf,
     desktop_recorder: PathBuf,
     posture_probe: PathBuf,
-    tray_evictor: PathBuf,
     goals: PathBuf,
     done_rollout: PathBuf,
     input_rollout: PathBuf,
@@ -1266,7 +1253,6 @@ impl Fixture {
         let tiled_home_proof = testbed.private_path("tiled-home-proof")?;
         let floating_proof = testbed.private_path("floating-proof")?;
         let (focus_probe, desktop_recorder, posture_probe) = forge_desktop_probes(testbed)?;
-        let tray_evictor = forge_tray_evictor(testbed)?;
         let i3 = testbed.write_private(
             "i3.config",
             "font pango:monospace 8\n\
@@ -1305,7 +1291,6 @@ impl Fixture {
         arm_executable(&focus_probe, "make focus probe executable")?;
         arm_executable(&desktop_recorder, "make desktop recorder executable")?;
         arm_executable(&posture_probe, "make posture probe executable")?;
-        arm_executable(&tray_evictor, "make tray evictor executable")?;
         demand(fake.is_file(), "fake Codex script was not created")?;
         demand(
             replaceable_alacritty.is_file(),
@@ -1317,7 +1302,6 @@ impl Fixture {
             focus_probe,
             desktop_recorder,
             posture_probe,
-            tray_evictor,
             goals,
             done_rollout: done,
             input_rollout: input,
@@ -1336,31 +1320,6 @@ impl Fixture {
             dormant_resume,
         })
     }
-}
-
-fn forge_tray_evictor(testbed: &Testbed) -> Result<PathBuf> {
-    testbed.write_private(
-        "tray-evictor",
-        br#"#!/bin/sh
-set -eu
-icon=$1
-root=$(xwininfo -root | sed -n 's/^xwininfo: Window id: \([^ ]*\).*/\1/p')
-parent() {
-  xwininfo -id "$1" -children 2>/dev/null | sed -n 's/^  Parent window id: \([^ ]*\).*/\1/p'
-}
-original=$(parent "$icon")
-[ -n "$root" ] && [ -n "$original" ] && [ "$original" != "$root" ] || exit 70
-xdotool windowreparent "$icon" "$root"
-for attempt in $(seq 1 200); do
-  for candidate in $(xdotool search --name '^Codex Wrangler tray$' 2>/dev/null || true); do
-    [ "$(parent "$candidate")" = "$original" ] && exit 0
-  done
-  sleep 0.02
-done
-printf 'no Wrangler tray icon redocked beneath manager %s\n' "$original" >&2
-exit 71
-"#,
-    )
 }
 
 fn forge_fake_harness(testbed: &Testbed) -> Result<PathBuf> {
