@@ -1131,18 +1131,7 @@ fn set_terminal_title(testbed: &Testbed, selector: &str, title: &str) -> Result<
 }
 
 fn verify_hover_lock(story: &mut Story<'_, '_, Observation>, rollout: &Path) -> Result<()> {
-    let target = story.anchor(CardTarget(Harness::Codex, INPUT))?;
-    let receipt = story
-        .session()
-        .move_to(target.center().0, target.center().1)?;
-    let thread = INPUT.to_owned();
-    let _hovered = story
-        .reaction(receipt)
-        .within(input_reaction_budget())
-        .until(Condition::new(
-            "input tile to own the stationary pointer",
-            move |state: &Observation| hovered(state, Harness::Codex, &thread),
-        ))?;
+    let _seized = seize_card(story, INPUT, "input hover lock")?;
 
     append_rollout(
         rollout,
