@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler-acceptance"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "egui-tester",
  "nix",
@@ -650,9 +650,9 @@ dependencies = [
 
 [[package]]
 name = "eternalist-apps"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0986ddc4dfdd49d9680ad6dd113d1c7e4844b033f128ad4db4f3391efda40bc"
+checksum = "5a596415a0e138a827d65fd9bed1a970e970fb9f46d37e3cee6314508b1cb736"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
