@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler-acceptance"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "egui-tester",
  "nix",
@@ -520,9 +520,9 @@ dependencies = [
 
 [[package]]
 name = "egui-tester"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "096fb4f1606112af0d562cc24a2a54247192057720d69a63906398b1bc60a241"
+checksum = "6205e1a05a02ebfc4ebb681decb7bea12e3f5456b8f56fe37c7287353616b1ae"
 dependencies = [
  "bitflags 2.13.1",
  "egui-tester-witness",
@@ -538,9 +538,9 @@ dependencies = [
 
 [[package]]
 name = "egui-tester-witness"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bc05a526d70f59631289dba5c4cc4de1b76d0dfc5697cd2fdf10bc735a5c0d2"
+checksum = "697f43a121da0d9558dab5e288a35ac3e0977546f269b76b85a58726ec5cac98"
 dependencies = [
  "egui",
  "rustix 1.1.4",

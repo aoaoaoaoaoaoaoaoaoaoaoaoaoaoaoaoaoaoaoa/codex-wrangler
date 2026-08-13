@@ -571,7 +571,7 @@ fn shift_click_ignored(story: &mut Story<'_, '_, Observation>, thread: &str) -> 
         "management mode to release Shift over running work",
         |state: &Observation| !state.jiggling,
     ))?;
-    park_pointer(story, "running management pointer to leave its card")
+    evict_pointer(story, "running management pointer to leave its card")
 }
 
 fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Result<()> {
@@ -596,7 +596,7 @@ fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Res
         "management click to leave flight",
         |state: &Observation| state.flight == Flight::Grounded,
     ))?;
-    park_pointer(
+    evict_pointer(
         story,
         "management pointer to release gallery reconciliation",
     )?;
@@ -652,7 +652,7 @@ fn seize_card(
     let mut attempt = 1;
 
     loop {
-        park_pointer(
+        evict_pointer(
             story,
             "pointer to vacate the gallery before card acquisition",
         )?;
@@ -770,7 +770,10 @@ fn verify_gallery(
     story: &mut Story<'_, '_, Observation>,
     fixture: &Fixture,
 ) -> Result<()> {
-    park_pointer(story, "pointer to park before the initial census")?;
+    evict_pointer(
+        story,
+        "pointer to leave the gallery before the initial census",
+    )?;
     let frame = story.wait_stable(
         Duration::from_secs(30),
         Duration::from_millis(250),
@@ -792,7 +795,7 @@ fn verify_gallery(
     verify_permission_title_events(testbed, story)?;
     verify_workspace_badges(story)?;
     verify_fear_geometry(story)?;
-    park_pointer(story, "pointer to leave the gallery before state mutation")?;
+    evict_pointer(story, "pointer to leave the gallery before state mutation")?;
     verify_goal_truth(story, &fixture.goals)?;
     verify_error_truth(story, &fixture.error_rollout)?;
     verify_hover_lock(story, &fixture.input_rollout)?;
@@ -817,7 +820,7 @@ fn verify_gallery(
             ))?;
     }
 
-    park_pointer(story, "pointer to leave every tile before capture")?;
+    evict_pointer(story, "pointer to leave every tile before capture")?;
     let _calm = story.wait_stable(
         Duration::from_secs(4),
         Duration::from_millis(500),
@@ -1140,7 +1143,7 @@ fn verify_hover_lock(story: &mut Story<'_, '_, Observation>, rollout: &Path) -> 
         },
     )?;
 
-    park_pointer(story, "pointer departure to release the census")?;
+    evict_pointer(story, "pointer departure to release the census")?;
     wait_for_work(
         story,
         INPUT,
@@ -1168,10 +1171,8 @@ fn append_rollout(path: &Path, line: &str) -> Result<()> {
     writeln!(file, "{line}").map_err(io_verdict("append fixture rollout event"))
 }
 
-fn park_pointer(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
-    const PARK: (i16, i16) = (630, 32);
-
-    let receipt = story.session().move_to(PARK.0, PARK.1)?;
+fn evict_pointer(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
+    let receipt = story.session().leave()?;
     let _parked = story
         .reaction(receipt)
         .until(Condition::new(description, |state: &Observation| {
