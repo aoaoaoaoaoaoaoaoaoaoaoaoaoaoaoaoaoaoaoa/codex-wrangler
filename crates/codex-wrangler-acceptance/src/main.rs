@@ -639,16 +639,19 @@ fn select_and_return(
         "Wrangler to conceal itself after resuming a Codex session",
         || Ok(wrangler_count(testbed)? == Some(0)),
     )?;
-    let _landed = story.wait(Condition::new(
-        "Codex session strike to leave flight",
-        |state: &Observation| state.flight == Flight::Grounded,
-    ))?;
     let _returned = story.session().key(Key::Function(7))?;
     app.wait_until(
         Duration::from_secs(8),
         "i3 to return to the fixed Wrangler workspace after resume",
         || Ok(wrangler_count(testbed)? == Some(1)),
     )?;
+    // Witnesses describe presented surfaces. The activation worker may finish
+    // while i3 has the Wrangler workspace occluded, so Grounded cannot lawfully
+    // appear until the gallery returns and presents another frame.
+    let _landed = story.wait(Condition::new(
+        "Codex session strike to leave flight",
+        |state: &Observation| state.flight == Flight::Grounded,
+    ))?;
     Ok(())
 }
 

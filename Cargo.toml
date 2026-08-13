@@ -16,12 +16,12 @@ version = "1.0.1"
 [workspace.dependencies]
 anyhow = "1.0.104"
 crossbeam-channel = "0.5.16"
-brass_poolrooms = { path = "../the_poolrooms/brass_poolrooms", version = "0.12.0" }
+brass_poolrooms = "0.12.1"
 egui = "=0.36.1"
-egui-tester = "0.9.0"
-egui-tester-witness = "0.9.0"
+egui-tester = "0.9.1"
+egui-tester-witness = "0.9.1"
 egui-wgpu = "=0.36.1"
-eternalist-apps = { path = "../the_poolrooms/eternalist_apps", version = "0.6.0" }
+eternalist-apps = "0.6.1"
 inotify = { version = "0.11.4", default-features = false }
 memchr = "2.8.3"
 nix = { version = "0.31.3", default-features = false, features = ["poll", "signal"] }
@@ -63,6 +63,3 @@ doc_command = ["cargo", "doc", "--workspace", "--all-features", "--no-deps"]
 max_lines = 3000
 include = ["*.rs", "**/*.rs"]
 exclude = []
-
-[patch.crates-io]
-brass_poolrooms = { path = "../the_poolrooms/brass_poolrooms" }

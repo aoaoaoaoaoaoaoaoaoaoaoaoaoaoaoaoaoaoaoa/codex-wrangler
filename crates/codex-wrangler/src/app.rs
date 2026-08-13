@@ -15,7 +15,7 @@ use brass_poolrooms::{
     water::{Domain, Floor, Frame as WaterFrame, Poke, Surface, Wetness},
 };
 use egui::{Color32, RichText, Sense, Stroke, StrokeKind, Vec2};
-use eternalist_apps::{CloseDisposition, LivingWait, NativeApp, WindowSpec};
+use eternalist_apps::{CloseDisposition, LivingWait, NativeApp, NativeWake, WindowSpec};
 
 use crate::{
     contract::{Harness, Work},
@@ -61,7 +61,13 @@ struct ActivationFlight {
 enum FlightWitness {
     Unpresented,
     Presented,
-    Reapable,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GalleryVisibility {
+    Visible,
+    ConcealPending,
+    Concealed,
 }
 
 impl ActivationFlight {
@@ -73,10 +79,7 @@ impl ActivationFlight {
     }
 
     fn witness(&mut self) {
-        self.witness = match self.witness {
-            FlightWitness::Unpresented => FlightWitness::Presented,
-            FlightWitness::Presented | FlightWitness::Reapable => FlightWitness::Reapable,
-        };
+        self.witness = FlightWitness::Presented;
     }
 }
 
@@ -96,7 +99,7 @@ struct Wrangler<const START_FLOATING: bool> {
     hovered: Option<usize>,
     jiggling: bool,
     jolts: JoltLedger,
-    concealed: bool,
+    visibility: GalleryVisibility,
     ledger: Ledger,
     tray: Option<Tray>,
 }
@@ -121,12 +124,13 @@ pub fn launch(
 impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     fn raise(ctx: &egui::Context, incumbent: Incumbent, ledger: Ledger) -> Self {
         lift_typography(ctx);
-        let nexus = spawn(ctx.clone());
+        let wake = NativeWake::from_context(ctx);
+        let nexus = spawn(wake.clone());
         let summon = Arc::new(AtomicU64::new(pack_summon(1, incumbent.launch_desktop())));
         let tray_summon = Arc::clone(&summon);
         let quit = Arc::new(AtomicBool::new(false));
         let tray_quit = Arc::clone(&quit);
-        let awaken = ctx.clone();
+        let tray_wake = wake;
         let tray = Tray::raise(incumbent, move |signal| match signal {
             TraySignal::Reveal(destination) => {
                 let destination = match destination {
@@ -142,12 +146,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     },
                 };
                 arm_summon(&tray_summon, destination);
-                awaken.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                awaken.request_repaint();
+                let _woken = tray_wake.wake();
             }
             TraySignal::Quit => {
                 tray_quit.store(true, Ordering::Release);
-                awaken.request_repaint();
+                let _woken = tray_wake.wake();
             }
         })
         .map_err(|error| eprintln!("codex-wrangler could not raise its tray: {error:#}"))
@@ -168,25 +171,30 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             hovered: None,
             jiggling: false,
             jolts: JoltLedger::new(),
-            concealed: false,
+            visibility: GalleryVisibility::Visible,
             ledger,
             tray,
         }
     }
 
     fn quench(&mut self) {
-        self.concealed = true;
+        self.visibility = GalleryVisibility::Concealed;
         self.jiggling = false;
         self.jolts.clear();
         self.water.reset();
         self.water.set_wetness(Wetness::Dry);
     }
 
-    fn reap_activation(&mut self, ui: &egui::Ui) {
+    fn request_conceal(&mut self) {
+        self.quench();
+        self.visibility = GalleryVisibility::ConcealPending;
+    }
+
+    fn reap_activation(&mut self) {
         if self
             .pending_activation
             .as_ref()
-            .is_some_and(|flight| flight.witness != FlightWitness::Reapable)
+            .is_some_and(|flight| flight.witness != FlightWitness::Presented)
         {
             return;
         }
@@ -204,24 +212,24 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         if activation.succeeded && activation.conceal {
             self.sight_posture();
             if self.posture.floating() {
-                self.quench();
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.request_conceal();
             }
         }
     }
 
-    fn kindle_if_summoned(&mut self) {
+    fn kindle_if_summoned(&mut self) -> bool {
         let generation = u32::try_from(self.summon.load(Ordering::Acquire) >> 32)
             .expect("summon generation occupies 32 bits");
-        if generation != self.summon_generation {
-            self.summon_generation = generation;
-            self.summon_attempts = Some(0);
-            self.concealed = false;
-            self.water.reset();
-            self.water.set_wetness(Wetness::Wet);
-            self.sight_posture();
+        if generation == self.summon_generation {
+            return false;
         }
+        self.summon_generation = generation;
+        self.summon_attempts = Some(0);
+        self.visibility = GalleryVisibility::Visible;
+        self.water.reset();
+        self.water.set_wetness(Wetness::Wet);
+        self.sight_posture();
+        true
     }
 
     fn drain(&mut self) -> bool {
@@ -303,15 +311,13 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
     fn draw(&mut self, ui: &mut egui::Ui) {
         self.kindle_if_summoned();
         self.hovered = None;
-        self.reap_activation(ui);
-        if self.concealed {
+        self.reap_activation();
+        if self.visibility != GalleryVisibility::Visible {
             return;
         }
         if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.sight_posture();
-            self.quench();
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.request_conceal();
             return;
         }
         let basin = ui.max_rect();
@@ -413,6 +419,19 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         }
     }
 
+    fn take_reveal_request(&mut self) -> bool {
+        self.kindle_if_summoned()
+    }
+
+    fn take_conceal_request(&mut self) -> bool {
+        if self.visibility == GalleryVisibility::ConcealPending {
+            self.visibility = GalleryVisibility::Concealed;
+            true
+        } else {
+            false
+        }
+    }
+
     fn exit_requested(&self) -> bool {
         self.quit.load(Ordering::Acquire)
     }
@@ -465,7 +484,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         pixels_per_point: f32,
         tooltip_rects: &[egui::Rect],
     ) -> WaterFrame {
-        if !self.concealed {
+        if self.visibility == GalleryVisibility::Visible {
             self.living_wait.compose(ctx, &mut self.water);
         }
         self.water.frame(ctx, pixels_per_point, tooltip_rects, None)

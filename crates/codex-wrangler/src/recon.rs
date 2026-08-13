@@ -19,6 +19,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use eternalist_apps::NativeWake;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 
@@ -105,7 +106,7 @@ impl Drop for Nexus {
     }
 }
 
-pub fn spawn(ctx: egui::Context) -> Nexus {
+pub fn spawn(repaint: NativeWake) -> Nexus {
     let latest = Arc::new(Mutex::new(None));
     let activation = Arc::new(Mutex::new(None));
     let (strike, strike_rx) = bounded(16);
@@ -124,7 +125,7 @@ pub fn spawn(ctx: egui::Context) -> Nexus {
         .name("codex-wrangler-recon".to_owned())
         .spawn(move || {
             raid(
-                &ctx,
+                &repaint,
                 &worker_latest,
                 &worker_activation,
                 &strike_rx,
@@ -147,7 +148,7 @@ pub fn spawn(ctx: egui::Context) -> Nexus {
 }
 
 fn raid(
-    ctx: &egui::Context,
+    repaint: &NativeWake,
     latest: &Mutex<Option<Census>>,
     activation: &Mutex<Option<Activation>>,
     strikes: &Receiver<Strike>,
@@ -158,7 +159,7 @@ fn raid(
         Ok(recon) => recon,
         Err(error) => {
             publish(
-                ctx,
+                repaint,
                 latest,
                 Census {
                     cards: Vec::new(),
@@ -173,9 +174,9 @@ fn raid(
         .refresh_forest()
         .and_then(|_| recon.project(Instant::now()))
     {
-        publish_fault(ctx, latest, &error);
+        publish_fault(repaint, latest, &error);
     } else {
-        publish_changed(ctx, latest, &mut prior, recon.census());
+        publish_changed(repaint, latest, &mut prior, recon.census());
     }
     let mut forest_audit = Instant::now() + FOREST_AUDIT;
     let mut integrity_audit = Instant::now() + INTEGRITY_AUDIT;
@@ -205,7 +206,7 @@ fn raid(
         }
 
         let now = Instant::now();
-        let mut dirty = execute_strikes(ctx, activation, strikes, &mut recon, now);
+        let mut dirty = execute_strikes(repaint, activation, strikes, &mut recon, now);
 
         if readiness[0] {
             let demand = heed_desktop(&mut recon, now);
@@ -220,7 +221,7 @@ fn raid(
         if now >= forest_audit {
             match recon.refresh_forest() {
                 Ok(changed) => dirty |= changed,
-                Err(error) => publish_fault(ctx, latest, &error),
+                Err(error) => publish_fault(repaint, latest, &error),
             }
             forest_audit = now + FOREST_AUDIT;
         }
@@ -230,8 +231,8 @@ fn raid(
         }
         if dirty {
             match recon.project(now) {
-                Ok(()) => publish_changed(ctx, latest, &mut prior, recon.census()),
-                Err(error) => publish_fault(ctx, latest, &error),
+                Ok(()) => publish_changed(repaint, latest, &mut prior, recon.census()),
+                Err(error) => publish_fault(repaint, latest, &error),
             }
         }
         if recon
@@ -242,7 +243,7 @@ fn raid(
             recon.refresh_focus(now);
             recon.stasis.freeze_due(now);
             recon.refresh_focus(Instant::now());
-            publish_changed(ctx, latest, &mut prior, recon.census());
+            publish_changed(repaint, latest, &mut prior, recon.census());
         }
     }
 }
@@ -263,7 +264,7 @@ fn wait_for_signal(recon: &Recon, wake: &UnixStream, timeout: Duration) -> Resul
 }
 
 fn execute_strikes(
-    ctx: &egui::Context,
+    repaint: &NativeWake,
     activation: &Mutex<Option<Activation>>,
     strikes: &Receiver<Strike>,
     recon: &mut Recon,
@@ -289,7 +290,7 @@ fn execute_strikes(
             succeeded,
             conceal,
         });
-        ctx.request_repaint();
+        let _repaint = repaint.request_repaint();
         struck = true;
     }
     struck
@@ -354,20 +355,20 @@ fn drain_wake(mut wake: &UnixStream) {
 }
 
 fn publish_changed(
-    ctx: &egui::Context,
+    repaint: &NativeWake,
     latest: &Mutex<Option<Census>>,
     prior: &mut Option<Census>,
     census: Census,
 ) {
     if prior.as_ref() != Some(&census) {
         *prior = Some(census.clone());
-        publish(ctx, latest, census);
+        publish(repaint, latest, census);
     }
 }
 
-fn publish_fault(ctx: &egui::Context, latest: &Mutex<Option<Census>>, error: &anyhow::Error) {
+fn publish_fault(repaint: &NativeWake, latest: &Mutex<Option<Census>>, error: &anyhow::Error) {
     publish(
-        ctx,
+        repaint,
         latest,
         Census {
             cards: Vec::new(),
@@ -376,11 +377,11 @@ fn publish_fault(ctx: &egui::Context, latest: &Mutex<Option<Census>>, error: &an
     );
 }
 
-fn publish(ctx: &egui::Context, latest: &Mutex<Option<Census>>, census: Census) {
+fn publish(repaint: &NativeWake, latest: &Mutex<Option<Census>>, census: Census) {
     *latest
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(census);
-    ctx.request_repaint();
+    let _repaint = repaint.request_repaint();
 }
 
 #[derive(Eq, PartialEq)]
