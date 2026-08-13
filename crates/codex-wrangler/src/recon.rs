@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -26,10 +26,10 @@ use crate::{
     codex_rpc::CodexRpc,
     contract::{Harness, Work},
     desktop::{Desktop, DesktopSignal},
-    model::{Card, Census, Retention, snip},
-    rollout::Rollouts,
+    model::{Card, Census, snip},
+    rollout::{Rollouts, TurnState},
     roster::{AccountMark, Roster, Sighting as SessionSighting},
-    stasis::{ProcessKey, Quarry, Stasis, children},
+    stasis::{ProcessKey, Quarry, Stasis},
     transcript::Transcripts,
     watchfire::Watchfire,
 };
@@ -39,8 +39,8 @@ const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Intent {
-    Open,
-    Archive,
+    Select,
+    Dismiss,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -208,9 +208,9 @@ fn raid(
         let mut dirty = execute_strikes(ctx, activation, strikes, &mut recon, now);
 
         if readiness[0] {
-            let (changed, forest_hint) = heed_desktop(&mut recon, now);
-            dirty |= changed;
-            if forest_hint {
+            let demand = heed_desktop(&mut recon, now);
+            dirty |= demand.projection;
+            if demand.forest {
                 forest_audit = now;
             }
         }
@@ -271,7 +271,7 @@ fn execute_strikes(
 ) -> bool {
     let mut struck = false;
     while let Ok(strike) = strikes.try_recv() {
-        let conceal = strike.intent == Intent::Open;
+        let conceal = strike.intent == Intent::Select;
         let succeeded = recon.execute(&strike, now).unwrap_or_else(|error| {
             eprintln!(
                 "codex-wrangler could not execute {:?} for {}: {error:#}",
@@ -295,24 +295,41 @@ fn execute_strikes(
     struck
 }
 
-fn heed_desktop(recon: &mut Recon, now: Instant) -> (bool, bool) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DesktopDemand {
+    projection: bool,
+    forest: bool,
+}
+
+fn heed_desktop(recon: &mut Recon, now: Instant) -> DesktopDemand {
     match recon.desktop.drain_events() {
         Ok(signals) => {
             let focus = signals.contains(&DesktopSignal::Focus);
             if focus {
                 recon.refresh_focus(now);
             }
-            (
-                focus || signals.contains(&DesktopSignal::Workspace),
-                signals.contains(&DesktopSignal::Topology)
-                    || signals.contains(&DesktopSignal::Terminal),
-            )
+            desktop_demand(&signals)
         }
         Err(error) => {
             recon.stasis.focus_uncertain();
             eprintln!("codex-wrangler lost X11 focus truth: {error:#}");
-            (true, false)
+            DesktopDemand {
+                projection: true,
+                forest: false,
+            }
         }
+    }
+}
+
+fn desktop_demand(signals: &HashSet<DesktopSignal>) -> DesktopDemand {
+    DesktopDemand {
+        projection: signals.iter().any(|signal| {
+            matches!(
+                signal,
+                DesktopSignal::Focus | DesktopSignal::Workspace | DesktopSignal::Terminal
+            )
+        }),
+        forest: signals.contains(&DesktopSignal::Topology),
     }
 }
 
@@ -413,14 +430,10 @@ impl Recon {
     }
 
     fn refresh_forest(&mut self) -> Result<bool> {
-        let terminals = self
-            .desktop
-            .windows_by_pid()?
-            .into_iter()
-            .filter(|(pid, _)| alacritty(*pid))
-            .collect::<HashMap<_, _>>();
-        self.desktop.watch_terminals(terminals.values().copied())?;
-        let sightings = manual_harnesses(&terminals, &mut self.process_cache);
+        let windows = self.desktop.windows_by_pid()?;
+        let sightings = manual_harnesses(&windows, &mut self.process_cache);
+        self.desktop
+            .watch_terminals(sightings.iter().map(|sighting| sighting.window))?;
         let changed = sightings != self.sightings;
         self.sightings = sightings;
         Ok(changed)
@@ -472,9 +485,11 @@ impl Recon {
             let Some((mut card, transcript)) = observation else {
                 continue;
             };
-            if card.harness == Harness::Codex && self.desktop.requires_action(sighting.window) {
+            if card.harness == Harness::Codex
+                && card.work != Work::Error
+                && self.desktop.requires_action(sighting.window)
+            {
                 card.work = Work::Input;
-                card.activity = Work::Input;
             }
             watched.extend(transcript);
             if seen.insert((card.harness, card.thread.clone())) {
@@ -489,15 +504,18 @@ impl Recon {
                     quarry.push(Quarry {
                         process: process.key,
                         window: sighting.window,
-                        work: card.activity,
+                        work: card.work,
                     });
                 }
                 cards.push(card);
             }
         }
         if let Some(codex) = &mut self.codex {
-            cards.extend(codex.dormant_cards(codex_seats.keys().map(String::as_str))?);
+            cards.extend(codex.closed_cards(codex_seats.keys().map(String::as_str)));
             codex.commit()?;
+        }
+        for card in &cards {
+            card.assert_lawful();
         }
         self.stasis.observe(now, active, &quarry);
         self.watchfire.reconcile(watched)?;
@@ -523,7 +541,7 @@ impl Recon {
                 .window
                 .is_some_and(|window| self.stasis.sleeping(window))
             {
-                card.work = Work::Sleeping;
+                card.work = Work::Sleep;
             }
         }
         cards.sort();
@@ -541,13 +559,13 @@ impl Recon {
         };
         if strike.harness != Harness::Codex {
             return match (strike.intent, card.window) {
-                (Intent::Open, Some(window)) => self.activate(window, now),
+                (Intent::Select, Some(window)) => self.activate(window, now),
                 _ => Ok(false),
             };
         }
         match strike.intent {
-            Intent::Open => self.open_codex(&card, now),
-            Intent::Archive => self.archive_codex(&card, now),
+            Intent::Select => self.select_codex(&card, now),
+            Intent::Dismiss => self.dismiss_codex(&card, now),
         }
     }
 
@@ -559,18 +577,13 @@ impl Recon {
         Ok(true)
     }
 
-    fn open_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
-        if card.retention == Retention::Archived || card.window.is_none() {
+    fn select_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
+        if card.work == Work::Closed {
             let active = self.active_account("bind resumed Codex login");
-            return self.summon_codex(
-                &card.thread,
-                card.retention == Retention::Archived,
-                card.workspace,
-                active,
-            );
+            return self.summon_codex(&card.thread, card.workspace, active);
         }
         let window = card.window.expect("live Codex card owns a window");
-        if card.activity == Work::Done {
+        if card.work == Work::Done {
             let codex = self.codex.as_mut().context("Codex adapter is absent")?;
             let home = codex.home.clone();
             let active = inspect_account(&home, "inspect current Codex login");
@@ -587,31 +600,28 @@ impl Recon {
                     .copied()
                     .context("live Codex card has no process seat")?;
                 self.retire(seat, now)?;
-                return self.summon_codex(&card.thread, false, card.workspace, active);
+                return self.summon_codex(&card.thread, card.workspace, active);
             }
         }
         self.activate(window, now)
     }
 
-    fn archive_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
+    fn dismiss_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
         let codex = self.codex.as_mut().context("Codex adapter is absent")?;
-        if card.retention == Retention::Archived {
+        if card.work == Work::Closed {
             codex.roster.forget(&card.thread);
             codex.commit()?;
             return Ok(true);
         }
-        if card.activity != Work::Done {
+        if card.work != Work::Done {
             return Ok(false);
         }
-        if let Some(seat) = self.codex_seats.get(&card.thread).copied() {
-            self.retire(seat, now)?;
-        }
-        let codex = self.codex.as_mut().context("Codex adapter is absent")?;
-        CodexRpc::open(&codex.home)?.archive(&card.thread)?;
-        codex
-            .roster
-            .set_retention(&card.thread, Retention::Archived);
-        codex.commit()?;
+        let seat = self
+            .codex_seats
+            .get(&card.thread)
+            .copied()
+            .context("open Codex card has no process seat")?;
+        self.retire(seat, now)?;
         Ok(true)
     }
 
@@ -644,7 +654,6 @@ impl Recon {
     fn summon_codex(
         &mut self,
         thread_id: &str,
-        archived: bool,
         workspace: Option<u32>,
         active: Option<AccountMark>,
     ) -> Result<bool> {
@@ -664,11 +673,10 @@ impl Recon {
                 .context("switch to remembered Codex workspace")?;
             anyhow::ensure!(status.success(), "i3 rejected workspace `{workspace}`");
         }
-        let operation = if archived { "unarchive" } else { "resume" };
         let mut child = Command::new("alacritty")
             .arg("--working-directory")
             .arg(&session.cwd)
-            .args(["-e", "codex", operation, thread_id])
+            .args(["-e", "codex", "resume", thread_id])
             .env("CODEX_HOME", &codex.home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -698,7 +706,6 @@ impl Recon {
             .context("spawn Alacritty reaper")?;
         self.desktop.activate(window)?;
         let codex = self.codex.as_mut().context("Codex adapter is absent")?;
-        codex.roster.set_retention(thread_id, Retention::Active);
         if let Some(active) = active {
             codex.roster.bind(thread_id, active);
         }
@@ -800,7 +807,7 @@ impl Codex {
         window: u32,
         workspace: Option<u32>,
     ) -> Result<Option<(Card, PathBuf)>> {
-        let Some(thread) = self.current_thread(&process.transcripts)? else {
+        let Some(thread) = self.current_thread(process)? else {
             return Ok(None);
         };
         let summary = self
@@ -811,7 +818,7 @@ impl Codex {
             .name
             .or_else(|| self.names.get(&thread.id).map(str::to_owned));
         let work = classify_work(
-            summary.running,
+            summary.state,
             self.goal_active(&thread.id)?,
             summary.waiting_for_input,
         );
@@ -834,41 +841,17 @@ impl Codex {
                 cwd: compact_path(&thread.cwd, process.home.as_deref()),
                 tile_preview: preview,
                 work,
-                activity: work,
                 window: Some(window),
                 workspace,
                 updated_at_ms: thread.updated_at_ms,
-                retention: Retention::Active,
             },
             rollout,
         )))
     }
 
-    fn dormant_cards<'a>(&mut self, live: impl IntoIterator<Item = &'a str>) -> Result<Vec<Card>> {
+    fn closed_cards<'a>(&self, live: impl IntoIterator<Item = &'a str>) -> Vec<Card> {
         let live = live.into_iter().collect::<HashSet<_>>();
-        let threads = self
-            .roster
-            .sessions()
-            .map(|(thread, _)| thread.to_owned())
-            .collect::<Vec<_>>();
-        for thread in &threads {
-            let archived = self
-                .db
-                .query_row(
-                    "SELECT archived FROM threads WHERE id = ?1",
-                    params![thread],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()
-                .with_context(|| format!("query retention for Codex thread `{thread}`"))?;
-            match archived {
-                Some(true) => self.roster.set_retention(thread, Retention::Archived),
-                Some(false) => self.roster.set_retention(thread, Retention::Active),
-                None => self.roster.forget(thread),
-            }
-        }
-        Ok(self
-            .roster
+        self.roster
             .sessions()
             .filter(|(thread, _)| !live.contains(*thread))
             .map(|(thread, session)| Card {
@@ -877,14 +860,12 @@ impl Codex {
                 name: session.name.clone(),
                 cwd: compact_path(&session.cwd, None),
                 tile_preview: session.preview.clone(),
-                work: Work::Done,
-                activity: Work::Done,
+                work: Work::Closed,
                 window: None,
                 workspace: session.workspace,
                 updated_at_ms: session.updated_at_ms,
-                retention: session.retention,
             })
-            .collect())
+            .collect()
     }
 
     fn commit(&mut self) -> Result<()> {
@@ -907,57 +888,81 @@ impl Codex {
             .with_context(|| format!("query current goal state for thread `{thread}`"))
     }
 
-    fn current_thread(&self, paths: &[PathBuf]) -> Result<Option<Thread>> {
-        let mut freshest = None;
-        for rollout in paths {
-            if !rollout.starts_with(self.home.join("sessions")) {
-                continue;
+    fn current_thread(&self, process: &Process) -> Result<Option<Thread>> {
+        if let Some(binding) = process.binding.get() {
+            if !binding.held_by(&process.transcripts) {
+                return Ok(None);
             }
-            let Some(id) = rollout_id(rollout) else {
-                continue;
-            };
-            let thread = self
-                .db
-                .query_row(
-                    "SELECT id, NULLIF(TRIM(name), ''), cwd, updated_at_ms, \
-                     thread_source, source, agent_role FROM threads WHERE id = ?1",
-                    params![id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            PathBuf::from(row.get::<_, String>(2)?),
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                        ))
-                    },
-                )
-                .optional()
-                .with_context(|| format!("query Codex thread `{id}`"))?;
-            let Some((id, name, cwd, updated_at_ms, thread_source, source, agent_role)) = thread
-            else {
-                continue;
-            };
-            if thread_source.as_deref() != Some("user") || source != "cli" || agent_role.is_some() {
-                continue;
-            }
-            let candidate = Thread {
-                id,
-                name,
-                cwd,
-                updated_at_ms,
-                rollout: rollout.clone(),
-            };
-            if freshest
-                .as_ref()
-                .is_none_or(|prior: &Thread| candidate.updated_at_ms > prior.updated_at_ms)
-            {
-                freshest = Some(candidate);
+            return self
+                .thread(&binding.rollout)
+                .map(|thread| thread.filter(|thread| thread.id == binding.id));
+        }
+        let mut candidates = Vec::new();
+        for rollout in &process.transcripts {
+            if let Some(thread) = self.thread(rollout)? {
+                candidates.push(thread);
             }
         }
-        Ok(freshest)
+        let Some(thread) = unique_candidate(candidates) else {
+            return Ok(None);
+        };
+        if process
+            .resumed_thread()
+            .is_some_and(|resumed| resumed != thread.id)
+        {
+            return Ok(None);
+        }
+        let binding = ThreadBinding {
+            id: thread.id.clone(),
+            rollout: thread.rollout.clone(),
+        };
+        process
+            .binding
+            .set(binding)
+            .expect("single reconnaissance thread binds each process once");
+        Ok(Some(thread))
+    }
+
+    fn thread(&self, rollout: &Path) -> Result<Option<Thread>> {
+        if !rollout.starts_with(self.home.join("sessions")) {
+            return Ok(None);
+        }
+        let Some(id) = rollout_id(rollout) else {
+            return Ok(None);
+        };
+        let thread = self
+            .db
+            .query_row(
+                "SELECT id, NULLIF(TRIM(name), ''), cwd, updated_at_ms, \
+                 thread_source, source, agent_role FROM threads WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        PathBuf::from(row.get::<_, String>(2)?),
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .with_context(|| format!("query Codex thread `{id}`"))?;
+        let Some((id, name, cwd, updated_at_ms, thread_source, source, agent_role)) = thread else {
+            return Ok(None);
+        };
+        if thread_source.as_deref() != Some("user") || source != "cli" || agent_role.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(Thread {
+            id,
+            name,
+            cwd,
+            updated_at_ms,
+            rollout: rollout.to_owned(),
+        }))
     }
 }
 
@@ -982,7 +987,7 @@ fn foreign_card(
         .and_then(|summary| summary.cwd.as_deref())
         .unwrap_or(&process.cwd);
     let work = summary.as_ref().map_or(Work::Done, |summary| summary.work);
-    let activity = if process.goal && work == Work::Turn {
+    let work = if process.goal && work == Work::Turn {
         Work::Goal
     } else {
         work
@@ -997,24 +1002,23 @@ fn foreign_card(
         tile_preview: summary
             .as_ref()
             .map_or_else(String::new, |summary| snip(&summary.preview, 280)),
-        work: activity,
-        activity,
+        work,
         window: Some(window),
         workspace,
         updated_at_ms: summary
             .as_ref()
             .map_or_else(|| i64::from(process.pid), |summary| summary.updated_at_ms),
-        retention: Retention::Active,
     };
     (card, path)
 }
 
-const fn classify_work(running: bool, goal_active: bool, waiting_for_input: bool) -> Work {
-    match (running, goal_active, waiting_for_input) {
-        (_, _, true) => Work::Input,
-        (true, true, false) => Work::Goal,
-        (true, false, false) => Work::Turn,
-        (false, _, false) => Work::Done,
+const fn classify_work(state: TurnState, goal_active: bool, waiting_for_input: bool) -> Work {
+    match (state, waiting_for_input, goal_active) {
+        (TurnState::Error, _, _) | (TurnState::Unknown, false, _) => Work::Error,
+        (_, true, _) => Work::Input,
+        (TurnState::Running, false, true) => Work::Goal,
+        (TurnState::Running, false, false) => Work::Turn,
+        (TurnState::Done, false, _) => Work::Done,
     }
 }
 
@@ -1082,6 +1086,24 @@ struct Thread {
     rollout: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ThreadBinding {
+    id: String,
+    rollout: PathBuf,
+}
+
+impl ThreadBinding {
+    fn held_by(&self, transcripts: &[PathBuf]) -> bool {
+        transcripts.contains(&self.rollout)
+    }
+}
+
+fn unique_candidate<T>(candidates: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut candidates = candidates.into_iter();
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
+}
+
 fn compact_path(path: &Path, home: Option<&Path>) -> String {
     let text = path.to_string_lossy().into_owned();
     let home = home
@@ -1107,6 +1129,7 @@ struct Process {
     harness: Harness,
     argv: Vec<OsString>,
     transcripts: Vec<PathBuf>,
+    binding: Arc<OnceLock<ThreadBinding>>,
     cwd: PathBuf,
     environment: HashMap<String, OsString>,
     home: Option<PathBuf>,
@@ -1158,26 +1181,35 @@ impl Process {
             }),
         }
     }
+
+    fn resumed_thread(&self) -> Option<&str> {
+        (self.harness == Harness::Codex)
+            .then(|| codex_resumed_thread(&self.argv))
+            .flatten()
+    }
+}
+
+fn codex_resumed_thread(argv: &[OsString]) -> Option<&str> {
+    let resume = argv.iter().position(|arg| arg == OsStr::new("resume"))?;
+    argv.iter()
+        .skip(resume + 1)
+        .filter_map(|arg| arg.to_str())
+        .find(|arg| uuid_literal(arg))
 }
 
 fn manual_harnesses(
-    terminals: &HashMap<u32, u32>,
+    windows: &HashMap<u32, Vec<u32>>,
     cache: &mut HashMap<ProcessKey, Process>,
 ) -> Vec<Sighting> {
-    let mut frontier = terminals
-        .iter()
-        .flat_map(|(pid, window)| children(*pid).into_iter().map(|child| (child, *window)))
-        .collect::<Vec<_>>();
-    let mut seen = HashSet::new();
     let mut sightings = Vec::new();
-    while let Some((pid, window)) = frontier.pop() {
-        if !seen.insert(pid) {
+    for pid in proc_pids() {
+        let Some(process) = harness_process(pid, cache) else {
             continue;
-        }
-        frontier.extend(children(pid).into_iter().map(|child| (child, window)));
-        if let Some(process) = harness_process(pid, cache) {
-            sightings.push(Sighting { process, window });
-        }
+        };
+        let Some(window) = nearest_window(&process, windows) else {
+            continue;
+        };
+        sightings.push(Sighting { process, window });
     }
     sightings.sort_by_key(|sighting| std::cmp::Reverse(sighting.process.pid));
     let living = sightings
@@ -1186,6 +1218,60 @@ fn manual_harnesses(
         .collect::<HashSet<_>>();
     cache.retain(|key, _| living.contains(key));
     sightings
+}
+
+fn proc_pids() -> Vec<u32> {
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .collect()
+}
+
+fn nearest_window(process: &Process, windows: &HashMap<u32, Vec<u32>>) -> Option<u32> {
+    let hint = process
+        .environment
+        .get("WINDOWID")
+        .and_then(|value| x11_window_id(value));
+    let mut ancestor = process.pid;
+    for _ in 0..256 {
+        if ancestor <= 1 {
+            return None;
+        }
+        if let Some(candidates) = windows.get(&ancestor) {
+            return choose_window(candidates, hint);
+        }
+        ancestor = parent_pid(ancestor)?;
+    }
+    None
+}
+
+fn choose_window(candidates: &[u32], hint: Option<u32>) -> Option<u32> {
+    hint.filter(|window| candidates.contains(window))
+        .or_else(|| unique_candidate(candidates.iter().copied()))
+}
+
+fn x11_window_id(value: &OsStr) -> Option<u32> {
+    let value = value.to_str()?.trim();
+    value.strip_prefix("0x").map_or_else(
+        || value.parse().ok(),
+        |hexadecimal| u32::from_str_radix(hexadecimal, 16).ok(),
+    )
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat_parent(&stat)
+}
+
+fn stat_parent(stat: &str) -> Option<u32> {
+    stat.rsplit_once(") ")?
+        .1
+        .split_ascii_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option<Process> {
@@ -1203,7 +1289,7 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         && prior.harness == harness
     {
         let mut process = prior.clone();
-        process.transcripts = open_jsonls(&root);
+        process.transcripts = open_jsonls(&root, JsonlAccess::for_harness(harness));
         process.cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| process.cwd.clone());
         let _prior = cache.insert(key, process.clone());
         return Some(process);
@@ -1218,12 +1304,20 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     let cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| PathBuf::from("."));
     let goal = harness == Harness::PrimeAgent && has_option(&argv, "--goal");
+    let binding = cache
+        .get(&key)
+        .filter(|prior| prior.harness == Harness::Codex && harness == Harness::Codex)
+        .map_or_else(
+            || Arc::new(OnceLock::new()),
+            |prior| Arc::clone(&prior.binding),
+        );
     let process = Process {
         key,
         pid,
         harness,
         argv,
-        transcripts: open_jsonls(&root),
+        transcripts: open_jsonls(&root, JsonlAccess::for_harness(harness)),
+        binding,
         cwd,
         environment,
         home,
@@ -1338,22 +1432,54 @@ fn foreground_tty(root: &Path) -> bool {
     })
 }
 
-fn open_jsonls(root: &Path) -> Vec<PathBuf> {
+#[derive(Clone, Copy)]
+enum JsonlAccess {
+    All,
+    Writable,
+}
+
+impl JsonlAccess {
+    const fn for_harness(harness: Harness) -> Self {
+        if matches!(harness, Harness::Codex) {
+            Self::Writable
+        } else {
+            Self::All
+        }
+    }
+}
+
+fn open_jsonls(root: &Path, access: JsonlAccess) -> Vec<PathBuf> {
     let mut paths = fs::read_dir(root.join("fd"))
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|entry| fs::read_link(entry.path()).ok())
-        .filter(|target| {
-            target
+        .filter_map(|entry| {
+            let target = fs::read_link(entry.path()).ok()?;
+            if !target
                 .extension()
                 .and_then(OsStr::to_str)
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+            {
+                return None;
+            }
+            if matches!(access, JsonlAccess::Writable) {
+                let fdinfo = fs::read(root.join("fdinfo").join(entry.file_name())).ok()?;
+                writable_access(&fdinfo).filter(|writable| *writable)?;
+            }
+            Some(target)
         })
         .collect::<Vec<_>>();
     paths.sort_unstable();
     paths.dedup();
     paths
+}
+
+fn writable_access(fdinfo: &[u8]) -> Option<bool> {
+    let flags = fdinfo.split(|byte| *byte == b'\n').find_map(|line| {
+        let value = line.strip_prefix(b"flags:")?;
+        u32::from_str_radix(std::str::from_utf8(value).ok()?.trim(), 8).ok()
+    })?;
+    Some(matches!(flags & 0o3, 0o1 | 0o2))
 }
 
 #[derive(Default)]
@@ -1545,12 +1671,15 @@ fn rollout_id(path: &Path) -> Option<&str> {
     }
 }
 
-fn alacritty(pid: u32) -> bool {
-    fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
-        .and_then(|path| path.file_name().map(OsStr::to_owned))
-        .as_deref()
-        == Some(OsStr::new("alacritty"))
+fn uuid_literal(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 #[cfg(test)]
@@ -1559,11 +1688,33 @@ mod tests {
 
     #[test]
     fn work_state_has_one_lawful_precedence() {
-        assert_eq!(classify_work(true, true, false), Work::Goal);
-        assert_eq!(classify_work(true, false, false), Work::Turn);
-        assert_eq!(classify_work(false, true, false), Work::Done);
-        assert_eq!(classify_work(false, false, false), Work::Done);
-        assert_eq!(classify_work(true, true, true), Work::Input);
+        assert_eq!(classify_work(TurnState::Running, true, false), Work::Goal);
+        assert_eq!(classify_work(TurnState::Running, false, false), Work::Turn);
+        assert_eq!(classify_work(TurnState::Done, true, false), Work::Done);
+        assert_eq!(classify_work(TurnState::Done, false, false), Work::Done);
+        assert_eq!(classify_work(TurnState::Running, true, true), Work::Input);
+        assert_eq!(classify_work(TurnState::Unknown, false, false), Work::Error);
+        assert_eq!(classify_work(TurnState::Unknown, false, true), Work::Input);
+        assert_eq!(classify_work(TurnState::Error, false, false), Work::Error);
+        assert_eq!(classify_work(TurnState::Error, false, true), Work::Error);
+    }
+
+    #[test]
+    fn terminal_title_changes_demand_projection_without_a_forest_scan() {
+        assert_eq!(
+            desktop_demand(&HashSet::from([DesktopSignal::Terminal])),
+            DesktopDemand {
+                projection: true,
+                forest: false,
+            }
+        );
+        assert_eq!(
+            desktop_demand(&HashSet::from([DesktopSignal::Topology])),
+            DesktopDemand {
+                projection: false,
+                forest: true,
+            }
+        );
     }
 
     #[test]
@@ -1642,6 +1793,77 @@ mod tests {
             rollout_id(path),
             Some("019fc940-b18f-7ad2-a012-71d86289bd60")
         );
+    }
+
+    #[test]
+    fn proc_fd_access_mode_distinguishes_readers_from_writers() {
+        assert_eq!(writable_access(b"pos:\t0\nflags:\t0100000\n"), Some(false));
+        assert_eq!(writable_access(b"pos:\t0\nflags:\t0100001\n"), Some(true));
+        assert_eq!(writable_access(b"pos:\t0\nflags:\t0104002\n"), Some(true));
+        assert_eq!(writable_access(b"pos:\t0\n"), None);
+        assert_eq!(writable_access(b"flags:\tnot-octal\n"), None);
+    }
+
+    #[test]
+    fn thread_identity_requires_one_uncontested_candidate() {
+        assert_eq!(unique_candidate(Vec::<u8>::new()), None);
+        assert_eq!(unique_candidate([7]), Some(7));
+        assert_eq!(unique_candidate([7, 8]), None);
+    }
+
+    #[test]
+    fn window_binding_is_exact_or_unambiguous() {
+        assert_eq!(choose_window(&[11], None), Some(11));
+        assert_eq!(choose_window(&[11, 12], Some(12)), Some(12));
+        assert_eq!(choose_window(&[11, 12], Some(13)), None);
+        assert_eq!(choose_window(&[11, 12], None), None);
+    }
+
+    #[test]
+    fn x11_window_hint_accepts_decimal_and_hexadecimal() {
+        assert_eq!(x11_window_id(OsStr::new("251658245")), Some(251_658_245));
+        assert_eq!(x11_window_id(OsStr::new("0x0f000005")), Some(251_658_245));
+        assert_eq!(x11_window_id(OsStr::new("terminal")), None);
+    }
+
+    #[test]
+    fn proc_parent_parser_survives_a_hostile_process_name() {
+        assert_eq!(stat_parent("42 (a ) hostile name) S 7 8 9"), Some(7));
+        assert_eq!(stat_parent("malformed"), None);
+    }
+
+    #[test]
+    fn explicit_codex_resume_recognizes_only_a_uuid() {
+        let id = "019fc940-b18f-7ad2-a012-71d86289bd60";
+        assert_eq!(
+            codex_resumed_thread(&[
+                OsString::from("codex"),
+                OsString::from("resume"),
+                OsString::from(id),
+            ]),
+            Some(id)
+        );
+        assert_eq!(
+            codex_resumed_thread(&[
+                OsString::from("codex"),
+                OsString::from("resume"),
+                OsString::from("--last"),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn immutable_binding_lives_only_while_its_writer_is_held() {
+        let binding = ThreadBinding {
+            id: "thread".to_owned(),
+            rollout: PathBuf::from("/sessions/current.jsonl"),
+        };
+        assert!(binding.held_by(&[
+            PathBuf::from("/sessions/other.jsonl"),
+            binding.rollout.clone(),
+        ]));
+        assert!(!binding.held_by(&[PathBuf::from("/sessions/replacement.jsonl")]));
     }
 
     #[test]

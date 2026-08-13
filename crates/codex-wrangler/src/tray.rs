@@ -17,17 +17,17 @@ use x11rb::{
         Event,
         randr::ConnectionExt as _,
         xproto::{
-            Arc as XArc, Atom, AtomEnum, ButtonPressEvent, CapStyle, ClientMessageEvent,
-            ConnectionExt as _, CoordMode, CreateGCAux, CreateWindowAux, EventMask, Gcontext,
-            GrabMode, JoinStyle, LineStyle, Point, PropMode, Rectangle, Screen, Window,
-            WindowClass,
+            Arc as XArc, Atom, AtomEnum, ButtonPressEvent, CapStyle, ChangeWindowAttributesAux,
+            ClientMessageEvent, ConnectionExt as _, CoordMode, CreateGCAux, CreateWindowAux,
+            EventMask, Gcontext, GrabMode, JoinStyle, LineStyle, Point, PropMode, Rectangle,
+            Screen, Window, WindowClass,
         },
     },
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
 };
 
-use crate::instance::{Incumbent, NO_DESKTOP};
+use crate::instance::{Incumbent, NO_DESKTOP, QUIT_REQUEST};
 
 const ICON_SIZE: u16 = 24;
 const MENU_WIDTH: u16 = 140;
@@ -36,7 +36,8 @@ const MENU_BORDER: u16 = 1;
 const MENU_GAP: i32 = 4;
 const DOCK_REQUEST: u32 = 0;
 const XEMBED_MAPPED: u32 = 1;
-const OWNER_POLL: Duration = Duration::from_millis(500);
+const DOCK_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const OWNER_WATCHDOG: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Signal {
@@ -93,6 +94,7 @@ struct Atoms {
     selection: Atom,
     opcode: Atom,
     xembed_info: Atom,
+    manager: Atom,
 }
 
 struct Inks {
@@ -107,6 +109,7 @@ struct X11Tray {
     root: Window,
     root_width: u16,
     root_height: u16,
+    screen_number: usize,
     anchor: Window,
     summons: Atom,
     icon: Window,
@@ -117,6 +120,11 @@ struct X11Tray {
     menu_ink: Gcontext,
     atoms: Atoms,
     owner: Window,
+    docked_owner: Window,
+    dock_retry_at: Option<Instant>,
+    dock_retry_delay: Duration,
+    dock_failures: u8,
+    reforged: bool,
     menu_live: bool,
     standalone: bool,
     available: Arc<AtomicBool>,
@@ -144,12 +152,19 @@ impl X11Tray {
             selection: intern(&conn, &format!("_NET_SYSTEM_TRAY_S{screen_number}"))?,
             opcode: intern(&conn, "_NET_SYSTEM_TRAY_OPCODE")?,
             xembed_info: intern(&conn, "_XEMBED_INFO")?,
+            manager: intern(&conn, "MANAGER")?,
         };
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )?
+        .check()
+        .context("watch system tray manager")?;
         #[cfg(feature = "egui-test")]
         let test_window = std::env::var_os("CODEX_WRANGLER_TEST_TRAY_WINDOW").is_some();
         #[cfg(not(feature = "egui-test"))]
         let test_window = false;
-        let icon = forge_icon(&conn, screen, &atoms, test_window)?;
+        let icon = forge_icon(&conn, screen, &atoms)?;
         let menu = forge_menu(&conn, screen)?;
         let Inks {
             rim,
@@ -162,6 +177,7 @@ impl X11Tray {
             root,
             root_width,
             root_height,
+            screen_number,
             anchor,
             summons,
             icon,
@@ -172,6 +188,11 @@ impl X11Tray {
             menu_ink,
             atoms,
             owner: NONE,
+            docked_owner: NONE,
+            dock_retry_at: None,
+            dock_retry_delay: DOCK_RETRY_INITIAL,
+            dock_failures: 0,
+            reforged: false,
             menu_live: false,
             standalone: test_window,
             available,
@@ -186,9 +207,12 @@ impl X11Tray {
     }
 
     fn run(&mut self, alive: &AtomicBool, wake: &UnixStream) -> Result<()> {
-        let mut owner_poll = Instant::now() + OWNER_POLL;
+        let mut owner_watchdog = Instant::now() + OWNER_WATCHDOG;
         while alive.load(Ordering::Acquire) {
-            let timeout = owner_poll.saturating_duration_since(Instant::now());
+            let deadline = self
+                .dock_retry_at
+                .map_or(owner_watchdog, |retry| retry.min(owner_watchdog));
+            let timeout = deadline.saturating_duration_since(Instant::now());
             let (x_ready, wake_ready) = {
                 let mut descriptors = [
                     PollFd::new(self.conn.stream().as_fd(), PollFlags::POLLIN),
@@ -213,9 +237,14 @@ impl X11Tray {
                     self.heed(&event)?;
                 }
             }
-            if Instant::now() >= owner_poll {
+            let now = Instant::now();
+            if self.dock_retry_at.is_some_and(|retry| now >= retry) {
+                self.dock_retry_at = None;
                 self.reconcile_owner()?;
-                owner_poll = Instant::now() + OWNER_POLL;
+            }
+            if now >= owner_watchdog {
+                self.reconcile_owner()?;
+                owner_watchdog = now + OWNER_WATCHDOG;
             }
         }
         Ok(())
@@ -228,36 +257,96 @@ impl X11Tray {
             .reply()
             .context("query system tray owner")?
             .owner;
+        let parent = self
+            .conn
+            .query_tree(self.icon)?
+            .reply()
+            .context("query tray icon parent")?
+            .parent;
+        let docked = owner != NONE && parent != self.root && self.docked_owner == owner;
         self.available
-            .store(self.standalone || owner != NONE, Ordering::Release);
-        if owner != self.owner {
-            self.owner = owner;
-            if owner != NONE {
-                let dock = ClientMessageEvent::new(
-                    32,
-                    owner,
-                    self.atoms.opcode,
-                    [CURRENT_TIME, DOCK_REQUEST, self.icon, 0, 0],
-                );
-                let _sent = self
-                    .conn
-                    .send_event(false, owner, EventMask::NO_EVENT, dock)?;
-                self.conn.flush().context("dock tray icon")?;
+            .store(self.standalone || docked, Ordering::Release);
+        let owner_changed = owner != self.owner;
+        if docked || owner == NONE || owner_changed {
+            self.dock_retry_at = None;
+            self.dock_retry_delay = DOCK_RETRY_INITIAL;
+            self.dock_failures = 0;
+            self.reforged = false;
+        }
+        if owner_changed {
+            self.docked_owner = NONE;
+        }
+        self.owner = owner;
+        if owner != NONE && (owner_changed || !docked) {
+            if self.dock_failures >= 2 && !self.reforged {
+                self.reforge_icon()?;
+                self.reforged = true;
             }
+            let dock = ClientMessageEvent::new(
+                32,
+                owner,
+                self.atoms.opcode,
+                [CURRENT_TIME, DOCK_REQUEST, self.icon, 0, 0],
+            );
+            let _sent = self
+                .conn
+                .send_event(false, owner, EventMask::NO_EVENT, dock)?;
+            self.conn.flush().context("dock tray icon")?;
+            let now = Instant::now();
+            self.dock_retry_at = Some(now + self.dock_retry_delay);
+            self.dock_retry_delay = self.dock_retry_delay.saturating_mul(2).min(OWNER_WATCHDOG);
+            self.dock_failures = self.dock_failures.saturating_add(1);
         }
         Ok(())
+    }
+
+    fn reforge_icon(&mut self) -> Result<()> {
+        let old = self.icon;
+        let screen = &self.conn.setup().roots[self.screen_number];
+        self.icon = forge_icon(&self.conn, screen, &self.atoms)?;
+        self.docked_owner = NONE;
+        self.conn
+            .destroy_window(old)?
+            .check()
+            .context("destroy orphaned tray icon")?;
+        self.conn.flush().context("publish reforged tray icon")
     }
 
     fn heed(&mut self, event: &Event) -> Result<()> {
         match event {
             Event::Expose(event) if event.window == self.icon => self.paint_icon()?,
             Event::ConfigureNotify(event) if event.window == self.icon => self.paint_icon()?,
+            Event::ReparentNotify(event) if event.window == self.icon => {
+                self.dock_retry_delay = DOCK_RETRY_INITIAL;
+                if event.parent == self.root {
+                    self.docked_owner = NONE;
+                } else {
+                    self.docked_owner = self.owner;
+                    self.dock_retry_at = None;
+                    self.dock_failures = 0;
+                    self.reforged = false;
+                }
+                self.reconcile_owner()?;
+            }
             Event::ButtonPress(event) if event.event == self.icon => self.click_icon(event)?,
+            Event::ClientMessage(event)
+                if event.window == self.root
+                    && event.type_ == self.atoms.manager
+                    && event.data.as_data32()[1] == self.atoms.selection =>
+            {
+                self.dock_retry_delay = DOCK_RETRY_INITIAL;
+                self.reconcile_owner()?;
+            }
             Event::ClientMessage(event)
                 if event.window == self.anchor && event.type_ == self.summons =>
             {
-                let desktop = event.data.as_data32()[0];
-                (self.emit)(Signal::Reveal((desktop != NO_DESKTOP).then_some(desktop)));
+                let message = event.data.as_data32();
+                if message[1] == QUIT_REQUEST {
+                    (self.emit)(Signal::Quit);
+                } else {
+                    let desktop = message[0];
+                    (self.emit)(Signal::Reveal((desktop != NO_DESKTOP).then_some(desktop)));
+                }
             }
             Event::Expose(event) if event.window == self.menu => self.paint_menu()?,
             Event::ButtonPress(event) if self.menu_live => self.click_menu(event)?,
@@ -438,19 +527,12 @@ impl X11Tray {
     }
 }
 
-fn forge_icon(
-    conn: &RustConnection,
-    screen: &Screen,
-    atoms: &Atoms,
-    standalone: bool,
-) -> Result<Window> {
+fn forge_icon(conn: &RustConnection, screen: &Screen, atoms: &Atoms) -> Result<Window> {
     let icon = conn.generate_id().context("allocate tray icon")?;
-    let mut attributes = CreateWindowAux::new()
+    let attributes = CreateWindowAux::new()
         .background_pixmap(x11rb::protocol::xproto::BackPixmap::PARENT_RELATIVE)
-        .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::STRUCTURE_NOTIFY);
-    if standalone {
-        attributes = attributes.override_redirect(1);
-    }
+        .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::STRUCTURE_NOTIFY)
+        .override_redirect(1);
     conn.create_window(
         screen.root_depth,
         icon,
@@ -609,6 +691,7 @@ impl Tray {
             .name("codex-wrangler-xembed".to_owned())
             .spawn(move || {
                 if let Err(error) = tray.run(&thread_alive, &thread_wake) {
+                    tray.available.store(false, Ordering::Release);
                     eprintln!("codex-wrangler tray failed: {error:#}");
                 }
             })

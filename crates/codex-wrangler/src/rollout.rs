@@ -16,9 +16,18 @@ const INPUT_REQUEST: &[u8] = b"\"name\":\"request_user_input\"";
 const CALL_OUTPUT: &[u8] = b"\"type\":\"function_call_output\"";
 const CALL_ID: &[u8] = b"\"call_id\":\"";
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TurnState {
+    #[default]
+    Unknown,
+    Running,
+    Done,
+    Error,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Pulse {
-    running: bool,
+    state: TurnState,
     input_call: Option<String>,
     preview: String,
     account: Option<AccountMark>,
@@ -54,28 +63,90 @@ impl Pulse {
                     .and_then(quota)
                     .map(AccountMark::quota);
             }
-            Some("task_started" | "turn_started") => self.running = true,
-            Some("task_complete" | "turn_complete" | "turn_aborted") => {
-                self.running = false;
+            Some("task_started" | "turn_started") => {
+                self.state = TurnState::Running;
+                self.input_call = None;
+            }
+            Some(kind @ ("task_complete" | "turn_complete" | "turn_aborted")) => {
+                self.state = completion_state(kind, payload);
                 self.input_call = None;
                 if let Some(message) = payload.get("last_agent_message").and_then(Value::as_str) {
                     assign_preview(&mut self.preview, message);
                 }
             }
-            Some("user_message" | "agent_message") => {
-                if let Some(message) = payload.get("message").and_then(Value::as_str) {
-                    assign_preview(&mut self.preview, message);
-                }
+            Some("user_message" | "agent_message" | "item_completed") => {
+                absorb_preview(&mut self.preview, payload);
+            }
+            Some(kind) if unknown_transition(kind) => {
+                self.state = TurnState::Unknown;
+                self.input_call = None;
             }
             _ => {}
         }
     }
 }
 
-fn assign_preview(slot: &mut String, message: &str) {
-    if !message.trim().is_empty() {
-        message.trim().clone_into(slot);
+fn absorb_preview(slot: &mut String, payload: &Value) -> bool {
+    match payload.get("type").and_then(Value::as_str) {
+        Some("user_message" | "agent_message") => payload
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| assign_preview(slot, message)),
+        Some("item_completed") => absorb_item_preview(slot, &payload["item"]),
+        _ => false,
     }
+}
+
+fn absorb_item_preview(slot: &mut String, item: &Value) -> bool {
+    let Some(content) = item.get("content").and_then(Value::as_array) else {
+        return false;
+    };
+    match item.get("type").and_then(Value::as_str) {
+        Some("UserMessage") => {
+            let message = content.iter().filter_map(text_content).collect::<String>();
+            assign_preview(slot, &message)
+        }
+        Some("AgentMessage") => {
+            let mut assigned = false;
+            for message in content.iter().filter_map(text_content) {
+                assigned |= assign_preview(slot, message);
+            }
+            assigned
+        }
+        _ => false,
+    }
+}
+
+fn text_content(content: &Value) -> Option<&str> {
+    if content.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    content.get("text").and_then(Value::as_str)
+}
+
+fn assign_preview(slot: &mut String, message: &str) -> bool {
+    let message = message.trim();
+    if message.is_empty() {
+        return false;
+    }
+    message.clone_into(slot);
+    true
+}
+
+fn completion_state(kind: &str, payload: &Value) -> TurnState {
+    if payload.get("error").is_some_and(|error| !error.is_null())
+        || (kind == "turn_aborted"
+            && payload.get("reason").and_then(Value::as_str) != Some("interrupted"))
+    {
+        TurnState::Error
+    } else {
+        TurnState::Done
+    }
+}
+
+fn unknown_transition(kind: &str) -> bool {
+    (kind.starts_with("task_") || kind.starts_with("turn_"))
+        && !matches!(kind, "turn_diff" | "turn_moderation_metadata")
 }
 
 fn interesting(line: &[u8]) -> bool {
@@ -84,6 +155,7 @@ fn interesting(line: &[u8]) -> bool {
         b"\"type\":\"turn_".as_slice(),
         b"\"type\":\"user_message\"".as_slice(),
         b"\"type\":\"agent_message\"".as_slice(),
+        b"\"type\":\"item_completed\"".as_slice(),
         b"\"type\":\"token_count\"".as_slice(),
     ]
     .iter()
@@ -111,7 +183,7 @@ pub struct Rollouts {
 #[derive(Clone, Debug)]
 pub struct RolloutSummary {
     pub preview: String,
-    pub running: bool,
+    pub state: TurnState,
     pub waiting_for_input: bool,
     pub account: Option<AccountMark>,
 }
@@ -130,7 +202,7 @@ impl Rollouts {
         };
         let summary = RolloutSummary {
             preview: pulse.preview.clone(),
-            running: pulse.running,
+            state: pulse.state,
             waiting_for_input: pulse.input_call.is_some(),
             account: pulse.account.clone(),
         };
@@ -240,12 +312,14 @@ fn inspect_reverse(
             *found_account = true;
         }
         Some("task_started" | "turn_started") if !*found_work => {
-            newest.running = true;
+            newest.state = TurnState::Running;
             *found_work = true;
+            *found_input_call = true;
         }
-        Some("task_complete" | "turn_complete" | "turn_aborted") if !*found_work => {
-            newest.running = false;
+        Some(kind @ ("task_complete" | "turn_complete" | "turn_aborted")) if !*found_work => {
+            newest.state = completion_state(kind, payload);
             *found_work = true;
+            *found_input_call = true;
             if !*found_preview
                 && let Some(message) = payload.get("last_agent_message").and_then(Value::as_str)
                 && !message.trim().is_empty()
@@ -254,13 +328,13 @@ fn inspect_reverse(
                 *found_preview = true;
             }
         }
-        Some("user_message" | "agent_message") if !*found_preview => {
-            if let Some(message) = payload.get("message").and_then(Value::as_str)
-                && !message.trim().is_empty()
-            {
-                assign_preview(&mut newest.preview, message);
-                *found_preview = true;
-            }
+        Some("user_message" | "agent_message" | "item_completed") if !*found_preview => {
+            *found_preview = absorb_preview(&mut newest.preview, payload);
+        }
+        Some(kind) if !*found_work && unknown_transition(kind) => {
+            newest.state = TurnState::Unknown;
+            *found_work = true;
+            *found_input_call = true;
         }
         _ => {}
     }
@@ -297,8 +371,147 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
         ]);
         let summary = Rollouts::default().read(file.path()).expect("summarize");
-        assert!(summary.running);
+        assert_eq!(summary.state, TurnState::Running);
         assert_eq!(summary.preview, "forge it");
+    }
+
+    #[test]
+    fn legacy_and_paginated_user_messages_converge() {
+        let legacy = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"forge it"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        ]);
+        let paginated = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-1","turn_id":"turn-1","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":" forge ","text_elements":[]},{"type":"image","image_url":"ignored"},{"type":"text","text":"it ","text_elements":[]}]},"started_at_ms":1,"completed_at_ms":1}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        ]);
+
+        for file in [&legacy, &paginated] {
+            let summary = Rollouts::default().read(file.path()).expect("summarize");
+            assert_eq!(summary.state, TurnState::Running);
+            assert_eq!(summary.preview, "forge it");
+        }
+    }
+
+    #[test]
+    fn paginated_agent_preview_survives_failed_completion() {
+        let mut file = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-1","turn_id":"turn-1","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"begin","text_elements":[]}]},"started_at_ms":1,"completed_at_ms":1}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        ]);
+        let mut rollouts = Rollouts::default();
+        assert_eq!(
+            rollouts.read(file.path()).expect("initial").preview,
+            "begin"
+        );
+        file.write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"thread_id\":\"thread-1\",\"turn_id\":\"turn-1\",\"item\":{\"type\":\"AgentMessage\",\"id\":\"agent-1\",\"content\":[{\"type\":\"text\",\"text\":\"progress\"},{\"type\":\"text\",\"text\":\"final fragment\"}]},\"started_at_ms\":2,\"completed_at_ms\":3}}\n",
+        )
+        .expect("append agent item");
+        assert_eq!(
+            rollouts.read(file.path()).expect("agent item").preview,
+            "final fragment"
+        );
+        file.write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":null,\"error\":{\"message\":\"failed\"}}}\n",
+        )
+        .expect("append failed completion");
+
+        let incremental = rollouts.read(file.path()).expect("incremental completion");
+        assert_eq!(incremental.state, TurnState::Error);
+        assert!(!incremental.waiting_for_input);
+        assert_eq!(incremental.preview, "final fragment");
+        let cold = Rollouts::default()
+            .read(file.path())
+            .expect("cold completion");
+        assert_eq!(cold.state, TurnState::Error);
+        assert!(!cold.waiting_for_input);
+        assert_eq!(cold.preview, "final fragment");
+    }
+
+    #[test]
+    fn every_completion_error_is_error_until_another_turn_starts() {
+        let mut file = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"inspect it"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        ]);
+        let mut rollouts = Rollouts::default();
+        let running = rollouts.read(file.path()).expect("running");
+        assert_eq!(running.state, TurnState::Running);
+        assert!(!running.waiting_for_input);
+
+        file.write_all(
+            br#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":null,"error":{"message":"A future upstream halt.","codex_error_info":"brand_new_halt"}}}
+"#,
+        )
+        .expect("append unknown error code");
+        for summary in [
+            rollouts.read(file.path()).expect("incremental error"),
+            Rollouts::default().read(file.path()).expect("cold error"),
+        ] {
+            assert_eq!(summary.state, TurnState::Error);
+            assert!(!summary.waiting_for_input);
+            assert_eq!(summary.preview, "inspect it");
+        }
+
+        file.write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n")
+            .expect("append next turn");
+        for summary in [
+            rollouts.read(file.path()).expect("incremental restart"),
+            Rollouts::default().read(file.path()).expect("cold restart"),
+        ] {
+            assert_eq!(summary.state, TurnState::Running);
+            assert!(!summary.waiting_for_input);
+        }
+    }
+
+    #[test]
+    fn unknown_task_transition_fails_closed() {
+        let mut file = fixture(&[r#"{"type":"event_msg","payload":{"type":"task_started"}}"#]);
+        let mut rollouts = Rollouts::default();
+        assert_eq!(
+            rollouts.read(file.path()).expect("running").state,
+            TurnState::Running
+        );
+        file.write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_suspended_by_future_codex\"}}\n",
+        )
+        .expect("append unknown transition");
+        for summary in [
+            rollouts.read(file.path()).expect("incremental unknown"),
+            Rollouts::default().read(file.path()).expect("cold unknown"),
+        ] {
+            assert_eq!(summary.state, TurnState::Unknown);
+        }
+    }
+
+    #[test]
+    fn only_explicit_user_interruption_is_a_clean_abort() {
+        for (reason, state) in [
+            ("interrupted", TurnState::Done),
+            ("future_abort", TurnState::Error),
+        ] {
+            let line = format!(
+                r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","reason":"{reason}"}}}}"#
+            );
+            let file = fixture(&[&line]);
+            assert_eq!(
+                Rollouts::default().read(file.path()).expect("abort").state,
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn completion_retires_an_unanswered_input_request_on_a_cold_scan() {
+        let file = fixture(&[
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call_7"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}"#,
+        ]);
+        let summary = Rollouts::default().read(file.path()).expect("summarize");
+        assert_eq!(summary.state, TurnState::Done);
+        assert!(!summary.waiting_for_input);
     }
 
     #[test]
@@ -308,13 +521,16 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
         ]);
         let mut rollouts = Rollouts::default();
-        assert!(rollouts.read(file.path()).expect("running").running);
+        assert_eq!(
+            rollouts.read(file.path()).expect("running").state,
+            TurnState::Running
+        );
         file.write_all(
             b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"slain\"}}\n",
         )
         .expect("append completion");
         let summary = rollouts.read(file.path()).expect("complete");
-        assert!(!summary.running);
+        assert_eq!(summary.state, TurnState::Done);
         assert_eq!(summary.preview, "slain");
     }
 
@@ -324,11 +540,12 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"status":"active"}}}"#,
             r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
         ]);
-        assert!(
-            !Rollouts::default()
+        assert_eq!(
+            Rollouts::default()
                 .read(file.path())
                 .expect("summarize")
-                .running
+                .state,
+            TurnState::Done
         );
     }
 
@@ -338,11 +555,12 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"status":"paused"}}}"#,
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
         ]);
-        assert!(
+        assert_eq!(
             Rollouts::default()
                 .read(file.path())
                 .expect("summarize")
-                .running
+                .state,
+            TurnState::Running
         );
     }
 
@@ -354,7 +572,7 @@ mod tests {
             r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call_7"}}"#,
         ]);
         let summary = Rollouts::default().read(file.path()).expect("summarize");
-        assert!(summary.running);
+        assert_eq!(summary.state, TurnState::Running);
         assert!(summary.waiting_for_input);
     }
 

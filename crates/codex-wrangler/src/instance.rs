@@ -12,6 +12,24 @@ use x11rb::{
 use crate::desktop::Desktop;
 
 pub const NO_DESKTOP: u32 = u32::MAX;
+pub const QUIT_REQUEST: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Invocation {
+    Summon,
+    Quit,
+}
+
+impl Invocation {
+    pub fn read() -> Result<Self> {
+        let mut arguments = std::env::args_os().skip(1);
+        match (arguments.next(), arguments.next()) {
+            (None, None) => Ok(Self::Summon),
+            (Some(argument), None) if argument == "--quit" => Ok(Self::Quit),
+            _ => anyhow::bail!("usage: codex-wrangler [--quit]"),
+        }
+    }
+}
 
 pub struct Incumbent {
     pub(crate) conn: RustConnection,
@@ -22,7 +40,7 @@ pub struct Incumbent {
 }
 
 impl Incumbent {
-    pub fn seize() -> Result<Option<Self>> {
+    pub fn seize(invocation: Invocation) -> Result<Option<Self>> {
         let (conn, screen_number) =
             RustConnection::connect(None).context("connect instance rendezvous to X11")?;
         let screen = &conn.setup().roots[screen_number];
@@ -43,35 +61,43 @@ impl Incumbent {
         .check()
         .context("create instance anchor")?;
         let summons = intern(&conn, &format!("_CODEX_WRANGLER_INSTANCE_S{screen_number}"))?;
-        let launch_desktop = Desktop::current_desktop()?;
+        let launch_desktop = match invocation {
+            Invocation::Summon => Desktop::current_desktop()?,
+            Invocation::Quit => None,
+        };
         let desktop = launch_desktop.unwrap_or(NO_DESKTOP);
 
         conn.grab_server()?
             .check()
             .context("lock X11 instance election")?;
-        let owner = (|| -> Result<Window> {
+        let claimed = (|| -> Result<bool> {
             let owner = conn
                 .get_selection_owner(summons)?
                 .reply()
                 .context("query Codex Wrangler instance")?
                 .owner;
-            if owner == NONE {
-                conn.set_selection_owner(anchor, summons, CURRENT_TIME)?
-                    .check()
-                    .context("claim Codex Wrangler instance")?;
-            } else {
-                summon(&conn, owner, summons, desktop)?;
+            match (owner, invocation) {
+                (NONE, Invocation::Summon) => {
+                    conn.set_selection_owner(anchor, summons, CURRENT_TIME)?
+                        .check()
+                        .context("claim Codex Wrangler instance")?;
+                    Ok(true)
+                }
+                (NONE, Invocation::Quit) => Ok(false),
+                (_, invocation) => {
+                    relay(&conn, owner, summons, desktop, invocation)?;
+                    Ok(false)
+                }
             }
-            Ok(owner)
         })();
         let unlocked = conn
             .ungrab_server()?
             .check()
             .context("unlock X11 instance election");
-        let owner = owner?;
+        let claimed = claimed?;
         unlocked?;
 
-        if owner == NONE {
+        if claimed {
             conn.flush().context("publish Codex Wrangler instance")?;
             Ok(Some(Self {
                 conn,
@@ -94,8 +120,18 @@ impl Incumbent {
     }
 }
 
-fn summon(conn: &RustConnection, owner: Window, summons: Atom, desktop: u32) -> Result<()> {
-    let message = ClientMessageEvent::new(32, owner, summons, [desktop, 0, 0, 0, 0]);
+fn relay(
+    conn: &RustConnection,
+    owner: Window,
+    summons: Atom,
+    desktop: u32,
+    invocation: Invocation,
+) -> Result<()> {
+    let request = match invocation {
+        Invocation::Summon => 0,
+        Invocation::Quit => QUIT_REQUEST,
+    };
+    let message = ClientMessageEvent::new(32, owner, summons, [desktop, request, 0, 0, 0]);
     conn.send_event(false, owner, EventMask::NO_EVENT, message)?
         .check()
         .context("signal the existing Codex Wrangler")

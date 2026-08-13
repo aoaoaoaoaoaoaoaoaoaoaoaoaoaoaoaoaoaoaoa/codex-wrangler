@@ -8,10 +8,9 @@ use std::{
 
 #[cfg(feature = "egui-test")]
 use crate::contract::{
-    CardKey, CardObservation, CardTarget, Flight, LogoTarget, Observation, UI_FINGERPRINT,
-    WorkspaceTarget,
+    CardKey, CardObservation, CardTarget, Flight, Observation, UI_FINGERPRINT, WorkspaceTarget,
 };
-use dwemer_poolrooms::{
+use brass_poolrooms::{
     chrome,
     water::{Domain, Floor, Frame as WaterFrame, Poke, Surface, Wetness},
 };
@@ -21,10 +20,9 @@ use eternalist_apps::{CloseDisposition, LivingWait, NativeApp, WindowSpec};
 use crate::{
     contract::{Harness, Work},
     instance::{Incumbent, NO_DESKTOP},
-    model::{Card, Census, Retention},
+    model::{Card, Census},
     posture::{Ledger, Posture},
     recon::{Intent, Nexus, Strike, spawn},
-    sigil,
     tray::{Signal as TraySignal, Tray},
 };
 
@@ -33,6 +31,7 @@ const TILE_HEIGHT: f32 = 185.0;
 const GAP: f32 = 12.0;
 const GREEN: Color32 = Color32::from_rgb(91, 218, 146);
 const VIOLET: Color32 = Color32::from_rgb(178, 115, 238);
+const ORANGE: Color32 = Color32::from_rgb(235, 158, 74);
 const RED: Color32 = Color32::from_rgb(236, 91, 91);
 const WHITE: Color32 = Color32::from_rgb(238, 234, 224);
 const ASH: Color32 = Color32::from_rgb(174, 172, 166);
@@ -41,6 +40,8 @@ const SUMMON_BARRAGE: u8 = 12;
 const TILE_AREA_PER_IMPULSE: f32 = 2_000.0;
 const TILE_IMPULSE_CEIL: f32 = 1.60;
 const TILE_SWEEP_EPSILON: f32 = 0.05;
+const FEAR_REACH: f32 = 720.0;
+const FEAR_FLEE: f32 = 2.25;
 
 type JoltLedger = HashMap<Harness, HashMap<String, Vec2>>;
 
@@ -214,9 +215,12 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let generation = u32::try_from(self.summon.load(Ordering::Acquire) >> 32)
             .expect("summon generation occupies 32 bits");
         if generation != self.summon_generation {
+            self.summon_generation = generation;
+            self.summon_attempts = Some(0);
             self.concealed = false;
             self.water.reset();
             self.water.set_wetness(Wetness::Wet);
+            self.sight_posture();
         }
     }
 
@@ -276,8 +280,6 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     thread: card.thread.clone(),
                     work: card.work,
                     workspace: card.workspace,
-                    open: card.window.is_some(),
-                    archived: card.retention == Retention::Archived,
                 })
                 .collect(),
         }
@@ -329,18 +331,19 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
                     .fill(Color32::from_rgba_unmultiplied(12, 11, 9, 232))
                     .inner_margin(22),
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let _header = ui.horizontal(|ui| {
                     let _title = ui.label(chrome::title("CODEX WRANGLER").size(18.0));
                     ui.add_space(8.0);
                     let _count = ui.label(chrome::muted(&self.census_label).size(13.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         legend(ui, "DONE", Work::Done);
-                        legend(ui, "SLEEP", Work::Sleeping);
-                        archive_legend(ui);
+                        legend(ui, "SLEEP", Work::Sleep);
+                        legend(ui, "CLOSED", Work::Closed);
                         legend(ui, "GOAL", Work::Goal);
                         legend(ui, "WORKING", Work::Turn);
                         legend(ui, "INPUT", Work::Input);
+                        legend(ui, "ERROR", Work::Error);
                     });
                 });
                 ui.add_space(16.0);
@@ -404,7 +407,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         if self.tray.as_ref().is_some_and(Tray::available) {
             self.sight_posture();
             self.quench();
-            CloseDisposition::Hide
+            CloseDisposition::HideOrExit
         } else {
             CloseDisposition::Exit
         }
@@ -424,13 +427,8 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
             self.first_frame_presented = true;
             true
         };
+        self.kindle_if_summoned();
         let packet = self.summon.load(Ordering::Acquire);
-        let generation = u32::try_from(packet >> 32).expect("summon generation occupies 32 bits");
-        if generation != self.summon_generation {
-            self.summon_generation = generation;
-            self.summon_attempts = Some(0);
-            self.sight_posture();
-        }
         let Some(attempts) = self.summon_attempts else {
             return first;
         };
@@ -544,19 +542,17 @@ fn card(
     hovered_card: &mut Option<usize>,
 ) -> Option<Strike> {
     let (id, rect) = ui.allocate_space(Vec2::new(width, TILE_HEIGHT));
-    let pointer_inside = ui.rect_contains_pointer(rect);
-    let offset = if physics.jiggling {
-        jolt(&card.thread, ui.input(|input| input.time))
-    } else {
-        Vec2::ZERO
-    };
+    let dismissible = dismissible(card.harness, card.work);
+    let fleeing = physics.jiggling && dismissible;
+    let offset = fear_offset(ui, &card.thread, rect, fleeing);
     let visual = rect.translate(offset);
+    let pointer_inside = ui.rect_contains_pointer(visual);
     if physics.jiggling || physics.recoiling {
         let travel = advance_jolt(
             physics.jolts,
             card.harness,
             &card.thread,
-            physics.jiggling.then_some(offset),
+            fleeing.then_some(offset),
         );
         displace_tile(physics.water, visual, travel);
     }
@@ -573,8 +569,45 @@ fn card(
     ui.painter().rect_filled(visual, 2, fill);
     ui.painter()
         .rect_stroke(visual, 2, stroke, StrokeKind::Inside);
-    let badge_width = paint_harness_badges(ui, visual, card.harness, &card.thread, card.workspace);
+    paint_card_contents(ui, visual, card);
 
+    // Final authority owns the whole tile after every inert child.
+    let response = ui
+        .interact(visual, id, Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    brass_poolrooms::poolroom_anchor!(
+        ui,
+        CardTarget(card.harness, &card.thread).to_string(),
+        response.rect
+    );
+    if response.hovered() {
+        *hovered_card = Some(index);
+        physics
+            .water
+            .hover((card.harness.slug(), &card.thread), visual);
+    }
+    if response.clicked() {
+        if physics.jiggling && !dismissible {
+            return None;
+        }
+        physics.water.click(visual);
+        let intent = if physics.jiggling {
+            Intent::Dismiss
+        } else {
+            Intent::Select
+        };
+        Some(Strike {
+            harness: card.harness,
+            thread: card.thread.clone(),
+            intent,
+        })
+    } else {
+        None
+    }
+}
+
+fn paint_card_contents(ui: &mut egui::Ui, visual: egui::Rect, card: &Card) {
+    let workspace_width = paint_workspace(ui, visual, card);
     let inner = visual.shrink2(Vec2::new(14.0, 11.0));
     let mut body = ui.new_child(
         egui::UiBuilder::new()
@@ -589,7 +622,7 @@ fn card(
         || RichText::new("anonymous").small().color(chrome::MUTED),
         |name| RichText::new(name).strong().color(chrome::TEXT),
     );
-    body.set_max_width((inner.width() - badge_width).max(80.0));
+    body.set_max_width((inner.width() - workspace_width).max(80.0));
     let _name = body.add(
         egui::Label::new(name_text)
             .truncate()
@@ -614,42 +647,46 @@ fn card(
             .show_tooltip_when_elided(false),
     );
     drop(body);
-    paint_card_state(ui.painter(), visual, card);
-
-    // This interaction is deliberately registered after every inert child.
-    // One final authority owns the entire rectangle, including text pixels.
-    let response = ui
-        .interact(rect, id, Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    dwemer_poolrooms::poolroom_anchor!(
-        ui,
-        CardTarget(card.harness, &card.thread).to_string(),
-        response.rect
-    );
-    if response.hovered() {
-        *hovered_card = Some(index);
-        physics
-            .water
-            .hover((card.harness.slug(), &card.thread), rect);
-    }
-    if response.clicked() {
-        physics.water.click(rect);
-        let intent = if physics.jiggling {
-            Intent::Archive
-        } else {
-            Intent::Open
-        };
-        Some(Strike {
-            harness: card.harness,
-            thread: card.thread.clone(),
-            intent,
-        })
-    } else {
-        None
-    }
+    paint_card_work(ui.painter(), visual, card.work);
 }
 
-fn jolt(thread: &str, time: f64) -> Vec2 {
+fn fear_offset(ui: &egui::Ui, thread: &str, bounds: egui::Rect, afraid: bool) -> Vec2 {
+    if !afraid {
+        return Vec2::ZERO;
+    }
+    let (clock, pointer) = ui.input(|input| (input.time, input.pointer.hover_pos()));
+    fear_pose(thread, clock, bounds, pointer)
+}
+
+fn fear_pose(thread: &str, clock: f64, bounds: egui::Rect, pointer: Option<egui::Pos2>) -> Vec2 {
+    let Some(pointer) = pointer else {
+        return Vec2::ZERO;
+    };
+    let away = bounds.center() - pointer;
+    let proximity = fear_proximity(away.length());
+    let direction = if away.length_sq() > f32::EPSILON {
+        away.normalized()
+    } else {
+        let fallback = tremor(thread, 0.0);
+        if fallback.length_sq() > f32::EPSILON {
+            fallback.normalized()
+        } else {
+            Vec2::X
+        }
+    };
+    tremor(thread, clock) * proximity + direction * (FEAR_FLEE * proximity)
+}
+
+const fn dismissible(harness: Harness, work: Work) -> bool {
+    matches!(harness, Harness::Codex) && matches!(work, Work::Done | Work::Sleep | Work::Closed)
+}
+
+fn fear_proximity(distance: f32) -> f32 {
+    let linear = (1.0 - distance / FEAR_REACH).clamp(0.0, 1.0);
+    linear * linear * (3.0 - 2.0 * linear)
+}
+
+fn tremor(thread: &str, time: f64) -> Vec2 {
     const AXIS: [f32; 9] = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0];
     let millis = std::time::Duration::from_secs_f64(time.max(0.0)).as_millis();
     let tick = u64::try_from(millis / 59).unwrap_or(u64::MAX);
@@ -711,15 +748,6 @@ fn displace_tile(water: &mut Surface, rect: egui::Rect, travel: Vec2) {
     }
 }
 
-fn paint_card_state(painter: &egui::Painter, tile: egui::Rect, card: &Card) {
-    let center = tile.right_bottom() - egui::vec2(13.0, 13.0);
-    if card.retention == Retention::Archived {
-        paint_archive(painter, center, 5.25);
-    } else {
-        paint_work(painter, center, 4.5, card.work);
-    }
-}
-
 fn legend(ui: &mut egui::Ui, label: &str, work: Work) {
     let _legend = ui.horizontal(|ui| {
         let (rect, _response) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
@@ -728,15 +756,16 @@ fn legend(ui: &mut egui::Ui, label: &str, work: Work) {
     });
 }
 
-fn archive_legend(ui: &mut egui::Ui) {
-    let _legend = ui.horizontal(|ui| {
-        let (rect, _response) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-        paint_archive(ui.painter(), rect.center(), 4.0);
-        let _label = ui.label(RichText::new("ARCHIVE").small().color(chrome::MUTED));
-    });
+fn paint_card_work(painter: &egui::Painter, tile: egui::Rect, work: Work) {
+    paint_work(
+        painter,
+        tile.right_bottom() - egui::vec2(13.0, 13.0),
+        4.5,
+        work,
+    );
 }
 
-fn paint_archive(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+fn paint_closed(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
     let points = vec![
         center + egui::vec2(0.0, -radius),
         center + egui::vec2(radius, radius),
@@ -750,88 +779,70 @@ fn paint_archive(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
 }
 
 fn paint_work(painter: &egui::Painter, center: egui::Pos2, radius: f32, work: Work) {
+    if work == Work::Closed {
+        paint_closed(painter, center, radius + 0.75);
+        return;
+    }
     let color = work_color(work);
     match work {
         Work::Goal | Work::Turn => {
             painter.circle_filled(center, radius, color);
         }
-        Work::Input | Work::Sleeping | Work::Done => {
+        Work::Error | Work::Input | Work::Sleep | Work::Done => {
             painter.rect_filled(
                 egui::Rect::from_center_size(center, Vec2::splat(radius * 2.0)),
                 0,
                 color,
             );
         }
+        Work::Closed => unreachable!("closed returns before square projection"),
     }
 }
 
-fn paint_harness_badges(
-    ui: &egui::Ui,
-    tile: egui::Rect,
-    harness: Harness,
-    thread: &str,
-    workspace: Option<u32>,
-) -> f32 {
-    #[cfg(not(feature = "instrumentation"))]
-    let _ = thread;
-    let galley = workspace.map(|workspace| {
-        ui.painter().layout_no_wrap(
-            workspace.to_string(),
-            egui::FontId::new(14.0, egui::FontFamily::Monospace),
-            chrome::TEXT,
-        )
-    });
-    let height = galley
-        .as_ref()
-        .map_or(25.0, |galley| (galley.size().y + 6.0).max(25.0));
-    let workspace_width = galley
-        .as_ref()
-        .map_or(0.0, |galley| (galley.size().x + 12.0).max(25.0));
+fn paint_workspace(ui: &egui::Ui, tile: egui::Rect, card: &Card) -> f32 {
+    let Some(workspace) = card.workspace else {
+        return 0.0;
+    };
+    let galley = ui.painter().layout_no_wrap(
+        workspace.to_string(),
+        egui::FontId::new(14.0, egui::FontFamily::Monospace),
+        chrome::TEXT,
+    );
+    let height = (galley.size().y + 6.0).max(25.0);
+    let width = (galley.size().x + 12.0).max(25.0);
     let edge = Stroke::new(1.0_f32, chrome::EDGE_STRONG);
-    if let Some(galley) = galley {
-        let rect = egui::Rect::from_min_size(
-            egui::pos2(tile.right() - workspace_width, tile.top()),
-            egui::vec2(workspace_width, height),
-        );
-        let radius = egui::CornerRadius {
-            nw: 0,
-            ne: 2,
-            sw: 0,
-            se: 0,
-        };
-        ui.painter().rect_filled(rect, radius, chrome::RAISED);
-        ui.painter()
-            .rect_stroke(rect, radius, edge, StrokeKind::Inside);
-        ui.painter()
-            .galley(rect.center() - galley.size() * 0.5, galley, chrome::TEXT);
-        dwemer_poolrooms::poolroom_anchor!(ui, WorkspaceTarget(harness, thread).to_string(), rect);
-    }
-    let logo_width = 28.0;
-    let logo = egui::Rect::from_min_size(
-        egui::pos2(tile.right() - workspace_width - logo_width, tile.top()),
-        egui::vec2(logo_width, height),
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(tile.right() - width, tile.top()),
+        egui::vec2(width, height),
     );
     let radius = egui::CornerRadius {
         nw: 2,
-        ne: u8::from(workspace.is_none()) * 2,
+        ne: 2,
         sw: 0,
         se: 0,
     };
-    ui.painter().rect_filled(logo, radius, chrome::RAISED);
+    ui.painter().rect_filled(rect, radius, chrome::RAISED);
     ui.painter()
-        .rect_stroke(logo, radius, edge, StrokeKind::Inside);
-    sigil::paint(ui.painter(), logo.shrink(2.0), harness);
-    dwemer_poolrooms::poolroom_anchor!(ui, LogoTarget(harness, thread).to_string(), logo);
-    logo_width + workspace_width
+        .rect_stroke(rect, radius, edge, StrokeKind::Inside);
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, chrome::TEXT);
+    brass_poolrooms::poolroom_anchor!(
+        ui,
+        WorkspaceTarget(card.harness, &card.thread).to_string(),
+        rect
+    );
+    width
 }
 
 const fn work_color(work: Work) -> Color32 {
     match work {
-        Work::Input => RED,
+        Work::Error => RED,
+        Work::Input => ORANGE,
         Work::Goal => VIOLET,
         Work::Turn => GREEN,
-        Work::Sleeping => ASH,
+        Work::Sleep => ASH,
         Work::Done => WHITE,
+        Work::Closed => Color32::BLACK,
     }
 }
 
@@ -878,8 +889,10 @@ mod tests {
     fn work_palette_is_exact() {
         assert_eq!(work_color(Work::Turn), GREEN);
         assert_eq!(work_color(Work::Goal), VIOLET);
-        assert_eq!(work_color(Work::Input), RED);
-        assert_eq!(work_color(Work::Sleeping), ASH);
+        assert_eq!(work_color(Work::Input), ORANGE);
+        assert_eq!(work_color(Work::Error), RED);
+        assert_eq!(work_color(Work::Sleep), ASH);
+        assert_eq!(work_color(Work::Closed), Color32::BLACK);
         assert_eq!(work_color(Work::Done), WHITE);
     }
 
@@ -902,16 +915,33 @@ mod tests {
     }
 
     #[test]
-    fn jiggle_is_bounded_and_alive() {
+    fn fear_is_near_loud_far_quiet_and_repulsed() {
+        let tile = egui::Rect::from_center_size(egui::pos2(500.0, 400.0), egui::vec2(300.0, 185.0));
+        let near_pointer = egui::pos2(490.0, 400.0);
+        let far_pointer = egui::pos2(-100.0, 400.0);
         let samples = (0..20)
-            .map(|tick| jolt("thread", f64::from(tick) / 17.0))
+            .map(|tick| fear_pose("thread", f64::from(tick) / 17.0, tile, Some(near_pointer)))
             .collect::<Vec<_>>();
-        assert!(
-            samples
-                .iter()
-                .all(|sample| sample.x.abs() <= 2.0 && sample.y.abs() <= 2.0)
-        );
+        let far = (0..20)
+            .map(|tick| fear_pose("thread", f64::from(tick) / 17.0, tile, Some(far_pointer)))
+            .collect::<Vec<_>>();
         assert!(samples.windows(2).any(|pair| pair[0] != pair[1]));
+        assert!(motion_span(&samples) > motion_span(&far));
+        assert!(samples.iter().all(|sample| sample.x > 0.0));
+        assert_eq!(fear_pose("thread", 0.0, tile, None), Vec2::ZERO);
+    }
+
+    #[test]
+    fn only_stopped_tiles_fear_management() {
+        assert!(dismissible(Harness::Codex, Work::Done));
+        assert!(dismissible(Harness::Codex, Work::Sleep));
+        assert!(dismissible(Harness::Codex, Work::Closed));
+        assert!(!dismissible(Harness::Codex, Work::Error));
+        assert!(!dismissible(Harness::Codex, Work::Input));
+        assert!(!dismissible(Harness::Codex, Work::Goal));
+        assert!(!dismissible(Harness::Codex, Work::Turn));
+        assert!(!dismissible(Harness::ClaudeCode, Work::Done));
+        assert!(!dismissible(Harness::PrimeAgent, Work::Sleep));
     }
 
     #[test]
@@ -923,5 +953,12 @@ mod tests {
         water.begin(Domain::basin(rect.expand(100.0)));
         let frame = water.frame(&ctx, 1.0, &[], None);
         assert!(frame.wants_repaint());
+    }
+
+    fn motion_span(samples: &[Vec2]) -> f32 {
+        samples
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).length())
+            .fold(0.0, f32::max)
     }
 }

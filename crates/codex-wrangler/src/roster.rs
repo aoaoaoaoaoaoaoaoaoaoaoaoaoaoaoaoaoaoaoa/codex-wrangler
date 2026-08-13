@@ -7,10 +7,10 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{model::Retention, state};
+use crate::state;
 
 const FILE: &str = "known-sessions.json";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const RESET_SLOP_SECS: i64 = 5;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -95,7 +95,6 @@ pub struct SeenSession {
     pub preview: String,
     pub updated_at_ms: i64,
     pub workspace: Option<u32>,
-    pub retention: Retention,
     #[serde(default, skip_serializing_if = "AccountMark::is_empty")]
     pub account: AccountMark,
 }
@@ -140,7 +139,6 @@ impl Roster {
             preview: sighting.preview.to_owned(),
             updated_at_ms: sighting.updated_at_ms,
             workspace: sighting.workspace,
-            retention: Retention::Active,
             account: sighting.account.unwrap_or_default(),
         };
         if let Some(session) = self.sessions.get_mut(sighting.thread) {
@@ -150,7 +148,6 @@ impl Roster {
             session.preview = candidate.preview;
             session.updated_at_ms = candidate.updated_at_ms;
             session.workspace = candidate.workspace.or(session.workspace);
-            session.retention = Retention::Active;
             session.account.absorb(candidate.account);
             self.dirty |= *session != prior;
         } else {
@@ -164,15 +161,6 @@ impl Roster {
             && session.account != account
         {
             session.account = account;
-            self.dirty = true;
-        }
-    }
-
-    pub fn set_retention(&mut self, thread: &str, retention: Retention) {
-        if let Some(session) = self.sessions.get_mut(thread)
-            && session.retention != retention
-        {
-            session.retention = retention;
             self.dirty = true;
         }
     }
@@ -205,24 +193,23 @@ impl Roster {
     }
 
     fn restore_from(path: PathBuf) -> Result<Self> {
-        let state = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<State>(&bytes)
-                .with_context(|| format!("decode `{}`", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => State {
-                version: VERSION,
-                sessions: BTreeMap::new(),
-            },
+        let (sessions, dirty) = match fs::read(&path) {
+            Ok(bytes) => {
+                let state = serde_json::from_slice::<State>(&bytes)
+                    .with_context(|| format!("decode `{}`", path.display()))?;
+                match state.version {
+                    VERSION => (state.sessions, false),
+                    1 => (BTreeMap::new(), true),
+                    version => anyhow::bail!("unsupported known-session state version {version}"),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), false),
             Err(error) => return Err(error).with_context(|| format!("read `{}`", path.display())),
         };
-        anyhow::ensure!(
-            state.version == VERSION,
-            "unsupported known-session state version {}",
-            state.version
-        );
         Ok(Self {
             path,
-            sessions: state.sessions,
-            dirty: false,
+            sessions,
+            dirty,
         })
     }
 }
@@ -264,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn known_sessions_are_private_atomic_state() {
+    fn v2_roundtrip_is_private_atomic_state() {
         let root = tempfile::tempdir().expect("state root");
         let path = root.path().join("codex-wrangler/known-sessions.json");
         let mut roster = Roster::restore_from(path.clone()).expect("empty roster");
@@ -286,17 +273,53 @@ mod tests {
                 & 0o777,
             0o600
         );
-        let restored = Roster::restore_from(path).expect("restore roster");
+        let restored = Roster::restore_from(path.clone()).expect("restore roster");
         assert_eq!(
             restored
                 .get("thread-1")
                 .and_then(|session| session.workspace),
             Some(4)
         );
+        let state = serde_json::from_slice::<State>(&fs::read(&path).expect("read state"))
+            .expect("decode state");
+        assert_eq!(state.version, VERSION);
+        assert!(!path.with_file_name(".known-sessions.json.tmp").exists());
     }
 
     #[test]
-    fn forgetting_an_archive_never_mutates_codex_storage() {
+    fn v1_membership_is_reset_and_committed_as_empty_v2() {
+        let root = tempfile::tempdir().expect("state root");
+        let path = root.path().join("known-sessions.json");
+        fs::write(
+            &path,
+            br#"{
+                "version": 1,
+                "sessions": {
+                    "ancient-thread": {
+                        "name": "CODER_EULER",
+                        "cwd": "/work/ancient",
+                        "preview": "lost provenance",
+                        "updated_at_ms": 1,
+                        "workspace": 9,
+                        "retention": "archived"
+                    }
+                }
+            }"#,
+        )
+        .expect("write v1 state");
+
+        let mut roster = Roster::restore_from(path.clone()).expect("quarantine v1 roster");
+        assert!(roster.sessions().next().is_none());
+        roster.commit().expect("seal empty v2 roster");
+
+        let state = serde_json::from_slice::<State>(&fs::read(path).expect("read v2 state"))
+            .expect("decode v2 state");
+        assert_eq!(state.version, VERSION);
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_closed_session_removes_only_roster_state() {
         let root = tempfile::tempdir().expect("state root");
         let path = root.path().join("known-sessions.json");
         let mut roster = Roster::restore_from(path.clone()).expect("empty roster");
@@ -309,8 +332,7 @@ mod tests {
             workspace: None,
             account: None,
         });
-        roster.set_retention("thread-1", Retention::Archived);
-        roster.commit().expect("seal archive");
+        roster.commit().expect("seal sighting");
         roster.forget("thread-1");
         roster.commit().expect("seal forgetting");
         assert!(roster.get("thread-1").is_none());

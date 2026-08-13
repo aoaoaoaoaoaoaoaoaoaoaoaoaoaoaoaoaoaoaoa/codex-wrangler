@@ -10,8 +10,8 @@ use std::{
 };
 
 use egui_tester::{
-    AppCommand, Application, Button, Condition, Error as TesterError, Key, ReactionBudget, Result,
-    Story, Testbed, TestbedBuilder, Window, WindowQuery, demand,
+    AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key,
+    ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery, demand,
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -21,8 +21,7 @@ mod terminal_fixture;
 #[path = "../../codex-wrangler/src/contract.rs"]
 mod contract;
 use contract::{
-    CardKey, CardTarget, Flight, Harness, LogoTarget, Observation, UI_FINGERPRINT, Work,
-    WorkspaceTarget,
+    CardKey, CardTarget, Flight, Harness, Observation, UI_FINGERPRINT, Work, WorkspaceTarget,
 };
 
 const GOAL: &str = "10000000-0000-7000-8000-000000000001";
@@ -35,6 +34,7 @@ const PERMISSION: &str = "70000000-0000-7000-8000-000000000007";
 const ROTATE: &str = "80000000-0000-7000-8000-000000000008";
 const DORMANT: &str = "90000000-0000-7000-8000-000000000009";
 const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
+const ERROR: &str = "b0000000-0000-7000-8000-00000000000b";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
 const FUNCTIONAL_ACCEPTANCE_ENV: &str = "CODEX_WRANGLER_FUNCTIONAL_ACCEPTANCE";
@@ -76,8 +76,8 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
     let app = testbed.launch(
         AppCommand::new(&fixture.wrapper)
             .borrow_read_only(binary)
+            .graphics(Graphics::Host)
             .private_env("CODEX_HOME", "home/.codex")
-            .private_env("CODEX_WRANGLER_TEST_TRAY_WINDOW", "1")
             .witness("probes/wrangler")
             .runtime(Duration::from_secs(90)),
     )?;
@@ -238,6 +238,7 @@ fn verify_residency(
     let x11 = testbed.x11()?;
     let wrangler_id = story.session().window().id();
     let tray = wait_named_window(testbed, app, "Codex Wrangler tray", Duration::from_secs(8))?;
+    let tray = verify_tray_recovery(testbed, app, fixture, tray.id())?;
     let _switched = story.session().key(Key::Function(2))?;
     app.wait_until(
         Duration::from_secs(8),
@@ -305,6 +306,26 @@ fn verify_residency(
         saved_posture(&fixture.state) == Some("tiled"),
         "tray quit did not preserve the final tiled posture in XDG state",
     )
+}
+
+fn verify_tray_recovery(
+    testbed: &Testbed,
+    app: &Application<'_>,
+    fixture: &Fixture,
+    tray: u32,
+) -> Result<Window> {
+    let eviction = testbed.launch(
+        AppCommand::new(&fixture.tray_evictor)
+            .arg(tray.to_string())
+            .runtime(Duration::from_secs(8)),
+    )?;
+    let exit = eviction.wait(Duration::from_secs(8))?;
+    demand(
+        exit.success(),
+        format!("Wrangler did not redock its evicted tray icon: {exit:?}"),
+    )?;
+    app.ensure_running("Wrangler to survive system-tray eviction")?;
+    wait_named_window(testbed, app, "Codex Wrangler tray", Duration::from_secs(8))
 }
 
 fn verify_switcher_present(
@@ -425,6 +446,10 @@ fn verify_session_lifecycle(
         sessions.contains_key(DORMANT) && !sessions.contains_key(UNSEEN),
         "Wrangler did not preserve its remembered session boundary",
     )?;
+    demand(
+        thread_archived(&fixture.index, DORMANT) == Some(true),
+        "fixture did not oppose Codex archive state to Wrangler closure",
+    )?;
 
     verify_management_veto(story, fixture)?;
 
@@ -448,25 +473,32 @@ fn verify_session_lifecycle(
         fs::read_to_string(&fixture.dormant_resume).is_ok_and(|proof| proof.trim() == "resume 6"),
         "resurrected session did not return to its remembered workspace",
     )?;
+    demand(
+        thread_archived(&fixture.index, DORMANT) == Some(true),
+        "reopening a closed session mutated Codex archive state",
+    )?;
 
     shift_click_card(story, DONE)?;
-    let archived = wait_card(story, DONE, |card| !card.open && card.archived)?;
+    let closed = wait_card(story, DONE, |card| card.work == Work::Closed)?;
     demand(
-        archived.work == Work::Done,
-        "archived session acquired a spurious work state",
+        closed.work == Work::Closed,
+        "closed session retained a live-terminal work state",
     )?;
     demand(
-        thread_archived(&fixture.index, DONE) == Some(true)
-            && fixture.archived_rollout.is_file()
-            && read_roster(&fixture.roster)?["sessions"][DONE]["retention"] == "archived",
-        "archive did not converge across Codex storage and Wrangler state",
+        thread_archived(&fixture.index, DONE) == Some(false)
+            && fixture.done_rollout.is_file()
+            && read_roster(&fixture.roster)?["sessions"][DONE].is_object()
+            && read_roster(&fixture.roster)?["sessions"][DONE]
+                .get("retention")
+                .is_none(),
+        "closing a session mutated Codex archive storage or lost remembered membership",
     )?;
 
     shift_click_card(story, DONE)?;
     let _gone = story.wait_stable(
         Duration::from_secs(8),
         Duration::from_millis(150),
-        "forgotten archive to leave the gallery",
+        "forgotten closed session to leave the gallery",
         |frame| {
             frame
                 .state
@@ -480,9 +512,8 @@ fn verify_session_lifecycle(
         read_roster(&fixture.roster)?["sessions"]
             .get(DONE)
             .is_none()
-            && thread_archived(&fixture.index, DONE) == Some(true)
-            && fixture.archived_rollout.is_file(),
-        "forgetting an archive mutated Codex storage or was not sealed immediately",
+            && thread_archived(&fixture.index, DONE) == Some(false),
+        "forgetting a closed session mutated Codex storage or was not sealed immediately",
     )?;
     Ok(())
 }
@@ -505,8 +536,8 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
             |state: &Observation| !state.jiggling,
         ))?;
 
-    for thread in [TURN, INPUT, PERMISSION] {
-        shift_click_card(story, thread)?;
+    for thread in [ERROR, GOAL, TURN, INPUT, PERMISSION] {
+        shift_click_ignored(story, thread)?;
         thread::sleep(Duration::from_millis(250));
         let frame = story.frame()?;
         demand(
@@ -514,15 +545,45 @@ fn verify_management_veto(story: &mut Story<'_, '_, Observation>, fixture: &Fixt
                 .state
                 .cards
                 .iter()
-                .any(|card| card.thread == thread && card.open && !card.archived),
+                .any(|card| card.thread == thread && card.work != Work::Closed),
             format!("Shift retired active Codex session {thread}"),
         )?;
         demand(
             thread_archived(&fixture.index, thread) == Some(false),
-            format!("Shift archived active Codex session {thread}"),
+            format!("Shift mutated Codex archive state for active session {thread}"),
         )?;
     }
     Ok(())
+}
+
+fn shift_click_ignored(story: &mut Story<'_, '_, Observation>, thread: &str) -> Result<()> {
+    story.session().focus()?;
+    let target = story.anchor(CardTarget(Harness::Codex, thread))?;
+    let (center_x, center_y) = target.center();
+    let x = center_x.saturating_sub(100);
+    let moved = story.session().move_to(x, center_y)?;
+    let sought = thread.to_owned();
+    let _hovered = story.reaction(moved).until(Condition::new(
+        "running management card to acquire the pointer",
+        move |state: &Observation| hovered(state, Harness::Codex, &sought),
+    ))?;
+    let shift_down = story.session().key_down(Key::Shift)?;
+    let _jiggling = story.reaction(shift_down).until(Condition::new(
+        "management mode to acquire Shift over running work",
+        |state: &Observation| state.jiggling,
+    ))?;
+    let _clicked = story.session().click(x, center_y, Button::Primary)?;
+    thread::sleep(Duration::from_millis(80));
+    demand(
+        story.frame()?.state.flight == Flight::Grounded,
+        "running management click entered an action flight",
+    )?;
+    let shift_up = story.session().key_up(Key::Shift)?;
+    let _stilled = story.reaction(shift_up).until(Condition::new(
+        "management mode to release Shift over running work",
+        |state: &Observation| !state.jiggling,
+    ))?;
+    park_pointer(story, "running management pointer to leave its card")
 }
 
 fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Result<()> {
@@ -722,9 +783,9 @@ fn verify_gallery(
     let frame = story.wait_stable(
         Duration::from_secs(30),
         Duration::from_millis(250),
-        "eight live terminals and one remembered Codex session",
+        "nine live terminals and one remembered Codex session",
         |frame| {
-            (frame.state.cards.len() == 9
+            (frame.state.cards.len() == 10
                 && frame.state.cards.iter().all(|card| {
                     card.workspace
                         == if card.thread == DORMANT {
@@ -737,9 +798,12 @@ fn verify_gallery(
         },
     )?;
     verify_census(&frame.state)?;
-    verify_badge_dovetail(story)?;
+    verify_permission_title_events(testbed, story)?;
+    verify_workspace_badges(story)?;
+    verify_fear_geometry(story)?;
     park_pointer(story, "pointer to leave the gallery before state mutation")?;
     verify_goal_truth(story, &fixture.goals)?;
+    verify_error_truth(story, &fixture.error_rollout)?;
     verify_hover_lock(story, &fixture.input_rollout)?;
 
     let turn = story.anchor(CardTarget(Harness::Codex, TURN))?;
@@ -795,20 +859,23 @@ fn verify_census(state: &Observation) -> Result<()> {
                 card.work,
                 card.name.as_deref(),
                 card.workspace,
-                card.open,
-                card.archived,
             )
         })
         .collect::<BTreeSet<_>>();
     let expected = BTreeSet::from([
         (
             Harness::Codex,
+            ERROR,
+            Work::Error,
+            Some("Broken circuit"),
+            Some(7),
+        ),
+        (
+            Harness::Codex,
             INPUT,
             Work::Input,
             Some("Awaiting verdict"),
             Some(7),
-            true,
-            false,
         ),
         (
             Harness::Codex,
@@ -816,45 +883,29 @@ fn verify_census(state: &Observation) -> Result<()> {
             Work::Goal,
             Some("Violet frontier"),
             Some(7),
-            true,
-            false,
         ),
-        (Harness::Codex, TURN, Work::Turn, None, Some(7), true, false),
+        (Harness::Codex, TURN, Work::Turn, None, Some(7)),
         (
             Harness::Codex,
             DONE,
             Work::Done,
             Some("Silent machine"),
             Some(7),
-            true,
-            false,
         ),
-        (
-            Harness::Codex,
-            PERMISSION,
-            Work::Input,
-            None,
-            Some(7),
-            true,
-            false,
-        ),
+        (Harness::Codex, PERMISSION, Work::Input, None, Some(7)),
         (
             Harness::Codex,
             ROTATE,
             Work::Done,
             Some("Old account"),
             Some(7),
-            true,
-            false,
         ),
         (
             Harness::Codex,
             DORMANT,
-            Work::Done,
+            Work::Closed,
             Some("Buried engine"),
             Some(6),
-            false,
-            false,
         ),
         (
             Harness::ClaudeCode,
@@ -862,8 +913,6 @@ fn verify_census(state: &Observation) -> Result<()> {
             Work::Done,
             Some("Copper invader"),
             Some(7),
-            true,
-            false,
         ),
         (
             Harness::PrimeAgent,
@@ -871,22 +920,20 @@ fn verify_census(state: &Observation) -> Result<()> {
             Work::Turn,
             Some("Butterfly engine"),
             Some(7),
-            true,
-            false,
         ),
     ]);
     demand(states == expected, format!("wrong card census: {states:?}"))
 }
 
-fn verify_badge_dovetail(story: &mut Story<'_, '_, Observation>) -> Result<()> {
+fn verify_workspace_badges(story: &mut Story<'_, '_, Observation>) -> Result<()> {
     for (harness, thread) in [
         (Harness::Codex, GOAL),
         (Harness::ClaudeCode, CLAUDE),
         (Harness::PrimeAgent, PRIME),
     ] {
-        let logo = story.anchor(LogoTarget(harness, thread))?;
+        let card = story.anchor(CardTarget(harness, thread))?;
         let workspace = story.anchor(WorkspaceTarget(harness, thread))?;
-        let [logo_left, logo_top, logo_right, logo_bottom] = logo.rect;
+        let [_card_left, card_top, card_right, _card_bottom] = card.rect;
         let [
             workspace_left,
             workspace_top,
@@ -894,17 +941,82 @@ fn verify_badge_dovetail(story: &mut Story<'_, '_, Observation>) -> Result<()> {
             workspace_bottom,
         ] = workspace.rect;
         demand(
-            (logo_right - workspace_left).abs() <= 0.5
-                && (logo_top - workspace_top).abs() <= 0.5
-                && (logo_bottom - workspace_bottom).abs() <= 0.5,
-            format!("{harness:?} logo does not dovetail immediately left of its workspace box"),
+            (workspace_right - card_right).abs() <= 0.5 && (workspace_top - card_top).abs() <= 0.5,
+            format!("{harness:?} workspace box escaped the card's top-right corner"),
         )?;
         demand(
-            logo_right - logo_left >= 27.0 && workspace_right > workspace_left,
-            format!("{harness:?} badge geometry collapsed"),
+            workspace_right - workspace_left >= 25.0 && workspace_bottom - workspace_top >= 25.0,
+            format!("{harness:?} workspace box geometry collapsed"),
         )?;
     }
     Ok(())
+}
+
+fn verify_fear_geometry(story: &mut Story<'_, '_, Observation>) -> Result<()> {
+    for thread in [ERROR, GOAL, TURN, INPUT, PERMISSION] {
+        let running = story.anchor(CardTarget(Harness::Codex, thread))?;
+        let _near = story
+            .session()
+            .move_to(running.center().0, running.center().1)?;
+        let rest = story.anchor(WorkspaceTarget(Harness::Codex, thread))?.rect;
+        let shift_down = story.session().key_down(Key::Shift)?;
+        let _armed = story.reaction(shift_down).until(Condition::new(
+            "management mode to arm beside running work",
+            |state: &Observation| state.jiggling,
+        ))?;
+        thread::sleep(Duration::from_millis(140));
+        let _frame = story.frame()?;
+        let pose = story.anchor(WorkspaceTarget(Harness::Codex, thread))?.rect;
+        demand(
+            rect_motion(rest, pose) <= 0.05,
+            format!("running tile {thread} was afraid of the management pointer"),
+        )?;
+        let shift_up = story.session().key_up(Key::Shift)?;
+        let _stilled = story.reaction(shift_up).until(Condition::new(
+            "management mode to release running work",
+            |state: &Observation| !state.jiggling,
+        ))?;
+    }
+
+    let done = story.anchor(CardTarget(Harness::Codex, DONE))?;
+    let _near_done = story.session().move_to(done.center().0, done.center().1)?;
+    let done_rest = story.anchor(WorkspaceTarget(Harness::Codex, DONE))?.rect;
+    let closed_rest = story.anchor(WorkspaceTarget(Harness::Codex, DORMANT))?.rect;
+    let shift_down = story.session().key_down(Key::Shift)?;
+    let _armed = story.reaction(shift_down).until(Condition::new(
+        "management mode to frighten a stopped tile",
+        |state: &Observation| state.jiggling,
+    ))?;
+    let mut near_motion = 0.0_f32;
+    let mut far_motion = 0.0_f32;
+    for _sample in 0..4 {
+        thread::sleep(Duration::from_millis(70));
+        let _frame = story.frame()?;
+        near_motion = near_motion.max(rect_motion(
+            done_rest,
+            story.anchor(WorkspaceTarget(Harness::Codex, DONE))?.rect,
+        ));
+        far_motion = far_motion.max(rect_motion(
+            closed_rest,
+            story.anchor(WorkspaceTarget(Harness::Codex, DORMANT))?.rect,
+        ));
+    }
+    let shift_up = story.session().key_up(Key::Shift)?;
+    let _stilled = story.reaction(shift_up).until(Condition::new(
+        "management mode to release the stopped tile",
+        |state: &Observation| !state.jiggling,
+    ))?;
+    demand(
+        near_motion > 0.1 && near_motion > far_motion,
+        format!("fear did not decay with pointer distance: near={near_motion}, far={far_motion}"),
+    )
+}
+
+fn rect_motion(rest: [f32; 4], pose: [f32; 4]) -> f32 {
+    rest.into_iter()
+        .zip(pose)
+        .map(|(rest, pose)| (pose - rest).abs())
+        .fold(0.0, f32::max)
 }
 
 fn hovered(state: &Observation, harness: Harness, thread: &str) -> bool {
@@ -940,6 +1052,79 @@ fn verify_goal_truth(story: &mut Story<'_, '_, Observation>, path: &Path) -> Res
         )
         .map_err(verdict("reactivate fixture goal"))?;
     wait_for_work(story, GOAL, Work::Goal, "active goal to turn violet")
+}
+
+fn verify_error_truth(story: &mut Story<'_, '_, Observation>, rollout: &Path) -> Result<()> {
+    append_rollout(
+        rollout,
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+    )?;
+    wait_for_work(
+        story,
+        ERROR,
+        Work::Turn,
+        "a new turn to clear the prior error",
+    )?;
+    append_rollout(
+        rollout,
+        r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":null,"error":{"message":"A future Codex halt.","codex_error_info":"future_halt"}}}"#,
+    )?;
+    wait_for_work(
+        story,
+        ERROR,
+        Work::Error,
+        "an unknown error code to fail closed as error",
+    )
+}
+
+fn verify_permission_title_events(
+    testbed: &Testbed,
+    story: &mut Story<'_, '_, Observation>,
+) -> Result<()> {
+    set_terminal_title(
+        testbed,
+        "[ ! ] Action Required | Permission Codex",
+        "[ * ] Working | Permission Codex",
+    )?;
+    wait_for_work(
+        story,
+        PERMISSION,
+        Work::Turn,
+        "working terminal title to clear the permission wait",
+    )?;
+    set_terminal_title(
+        testbed,
+        "[ ! ] Action Required | Permission Codex",
+        "[ ! ] Action Required | Permission Codex",
+    )?;
+    wait_for_work(
+        story,
+        PERMISSION,
+        Work::Input,
+        "action-required terminal title to demand input immediately",
+    )
+}
+
+fn set_terminal_title(testbed: &Testbed, selector: &str, title: &str) -> Result<()> {
+    let xprop = testbed.launch(
+        AppCommand::new("/usr/bin/xprop")
+            .args([
+                "-name",
+                selector,
+                "-format",
+                "_NET_WM_NAME",
+                "8s",
+                "-set",
+                "_NET_WM_NAME",
+                title,
+            ])
+            .runtime(Duration::from_secs(3)),
+    )?;
+    let exit = xprop.wait(Duration::from_secs(3))?;
+    demand(
+        exit.success(),
+        format!("could not set fixture terminal `{selector}` title to `{title}`: {exit:?}"),
+    )
 }
 
 fn verify_hover_lock(story: &mut Story<'_, '_, Observation>, rollout: &Path) -> Result<()> {
@@ -1042,8 +1227,11 @@ struct Fixture {
     focus_probe: PathBuf,
     desktop_recorder: PathBuf,
     posture_probe: PathBuf,
+    tray_evictor: PathBuf,
     goals: PathBuf,
+    done_rollout: PathBuf,
     input_rollout: PathBuf,
+    error_rollout: PathBuf,
     proof: PathBuf,
     workspace_proof: PathBuf,
     launch_workspace_proof: PathBuf,
@@ -1056,13 +1244,12 @@ struct Fixture {
     index: PathBuf,
     rotate_resume: PathBuf,
     dormant_resume: PathBuf,
-    archived_rollout: PathBuf,
 }
 
 impl Fixture {
     fn forge(testbed: &Testbed, binary: &Path) -> Result<Self> {
         let codex = testbed.create_private_dir("home/.codex/sessions/2026/08/03")?;
-        let [goal, turn, done, input, permission, rotate, _dormant] = seed_rollouts(&codex)?;
+        let [goal, turn, done, input, permission, rotate, _dormant, error] = seed_rollouts(&codex)?;
         let db_path = testbed.private_path("home/.codex/state_5.sqlite")?;
         seed_index(&db_path)?;
         let goals = testbed.private_path("home/.codex/goals_1.sqlite")?;
@@ -1072,29 +1259,14 @@ impl Fixture {
         let roster = seed_roster(testbed)?;
         let _rotate_work = testbed.create_private_dir("work/rotate")?;
         let _dormant_work = testbed.create_private_dir("work/dormant")?;
-        let _archive = testbed.create_private_dir("home/.codex/archived_sessions")?;
         let (claude, prime) = seed_foreign_transcripts(testbed)?;
 
-        let fake = testbed.write_private(
-            "fake-session.bash",
-            br#"rollout=$1
-proof=$2
-exec 9<"$rollout"
-xprop -id "$WINDOWID" -f _NET_WM_DESKTOP 32c -set _NET_WM_DESKTOP 0
-IFS= read -r -n 1 key
-printf '%s\n' "$key" > "$proof"
-sleep 90
-"#,
-        )?;
+        let fake = forge_fake_harness(testbed)?;
         let fake_cli = forge_fake_cli(testbed)?;
-        let fake_terminal = forge_fake_terminal(testbed)?;
+        let replaceable_alacritty = forge_replaceable_alacritty(testbed)?;
         let proof = testbed.private_path("focus-proof")?;
         let rotate_resume = testbed.private_path(format!("resume-proof-{ROTATE}"))?;
         let dormant_resume = testbed.private_path(format!("resume-proof-{DORMANT}"))?;
-        let archived_rollout = testbed.private_path(format!(
-            "home/.codex/archived_sessions/{}",
-            done.file_name().unwrap_or_default().to_string_lossy()
-        ))?;
         let workspace_proof = testbed.private_path("workspace-proof")?;
         let launch_workspace_proof = testbed.private_path("launch-workspace-proof")?;
         let tiled_proof = testbed.private_path("tiled-proof")?;
@@ -1102,6 +1274,7 @@ sleep 90
         let tiled_home_proof = testbed.private_path("tiled-home-proof")?;
         let floating_proof = testbed.private_path("floating-proof")?;
         let (focus_probe, desktop_recorder, posture_probe) = forge_desktop_probes(testbed)?;
+        let tray_evictor = forge_tray_evictor(testbed)?;
         let i3 = testbed.write_private(
             "i3.config",
             "font pango:monospace 8\n\
@@ -1113,7 +1286,12 @@ sleep 90
              bindsym F5 floating disable, exec --no-startup-id touch /test/tiled-proof\n\
              bindsym F6 workspace number 8, exec --no-startup-id touch /test/tiled-away-proof\n\
              bindsym F7 workspace number 9, exec --no-startup-id touch /test/tiled-home-proof\n\
-             bindsym F8 floating enable, exec --no-startup-id touch /test/floating-proof\n",
+             bindsym F8 floating enable, exec --no-startup-id touch /test/floating-proof\n\
+             bar {\n\
+               mode dock\n\
+               position bottom\n\
+               tray_output screen\n\
+             }\n",
         )?;
         let wrapper = forge_wrapper(
             testbed,
@@ -1127,23 +1305,31 @@ sleep 90
                 &rotate,
                 &claude,
                 &prime,
+                &error,
             ],
         )?;
         arm_executable(&wrapper, "make fixture wrapper executable")?;
         arm_executable(&fake_cli, "make fake Codex CLI executable")?;
-        arm_executable(&fake_terminal, "make fake Alacritty executable")?;
         arm_executable(&focus_probe, "make focus probe executable")?;
         arm_executable(&desktop_recorder, "make desktop recorder executable")?;
         arm_executable(&posture_probe, "make posture probe executable")?;
+        arm_executable(&tray_evictor, "make tray evictor executable")?;
         demand(fake.is_file(), "fake Codex script was not created")?;
+        demand(
+            replaceable_alacritty.is_file(),
+            "replaceable Alacritty fixture was not created",
+        )?;
         demand(i3.is_file(), "private i3 config was not created")?;
         Ok(Self {
             wrapper,
             focus_probe,
             desktop_recorder,
             posture_probe,
+            tray_evictor,
             goals,
+            done_rollout: done,
             input_rollout: input,
+            error_rollout: error,
             proof,
             workspace_proof,
             launch_workspace_proof,
@@ -1156,49 +1342,133 @@ sleep 90
             index: db_path,
             rotate_resume,
             dormant_resume,
-            archived_rollout,
         })
     }
 }
 
-fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 8]) -> Result<PathBuf> {
+fn forge_tray_evictor(testbed: &Testbed) -> Result<PathBuf> {
+    testbed.write_private(
+        "tray-evictor",
+        br#"#!/bin/sh
+set -eu
+icon=$1
+root=$(xwininfo -root | sed -n 's/^xwininfo: Window id: \([^ ]*\).*/\1/p')
+parent() {
+  xwininfo -id "$1" -children 2>/dev/null | sed -n 's/^  Parent window id: \([^ ]*\).*/\1/p'
+}
+original=$(parent "$icon")
+[ -n "$root" ] && [ -n "$original" ] && [ "$original" != "$root" ] || exit 70
+xdotool windowreparent "$icon" "$root"
+for attempt in $(seq 1 200); do
+  for candidate in $(xdotool search --name '^Codex Wrangler tray$' 2>/dev/null || true); do
+    [ "$(parent "$candidate")" = "$original" ] && exit 0
+  done
+  sleep 0.02
+done
+printf 'no Wrangler tray icon redocked beneath manager %s\n' "$original" >&2
+exit 71
+"#,
+    )
+}
+
+fn forge_fake_harness(testbed: &Testbed) -> Result<PathBuf> {
+    testbed.write_private(
+        "fake-session.bash",
+        br#"rollout=$1
+proof=$2
+exec 9>>"$rollout"
+case $(xprop -id "$WINDOWID" WM_CLASS) in
+  *NeutralTerminal*) ;;
+  *) exit 72 ;;
+esac
+xprop -id "$WINDOWID" -f _NET_WM_DESKTOP 32c -set _NET_WM_DESKTOP 0
+IFS= read -r -n 1 key
+[ -z "$key" ] || printf '%s\n' "$key" > "$proof"
+sleep 90
+"#,
+    )
+}
+
+fn forge_replaceable_alacritty(testbed: &Testbed) -> Result<PathBuf> {
+    let source = env::current_exe().map_err(io_verdict("locate terminal fixture executable"))?;
+    let terminal = testbed.private_path("bin/alacritty-0.16.1-x11-ime")?;
+    let replacement = testbed.private_path("bin/alacritty-0.16.1-x11-ime.next")?;
+    for destination in [&terminal, &replacement] {
+        let _bytes = fs::copy(&source, destination)
+            .map_err(io_verdict("copy replaceable terminal fixture"))?;
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700))
+            .map_err(io_verdict("make replaceable terminal fixture executable"))?;
+    }
+    Ok(terminal)
+}
+
+fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 9]) -> Result<PathBuf> {
     let names = logs.map(|path| path.file_name().unwrap_or_default().to_string_lossy());
     let wrapper = format!(
         "#!/bin/sh\n\
          export PATH=/test/bin:/usr/bin\n\
+         terminal=/test/bin/alacritty-0.16.1-x11-ime\n\
+         terminal_pids=\n\
          i3 -c /test/i3.config &\n\
          for attempt in $(seq 1 {I3_READINESS_POLLS}); do\n\
            i3-msg -t get_workspaces >/dev/null 2>&1 && break\n\
            sleep 0.{FIXTURE_POLL_INTERVAL_MILLIS:03}\n\
          done\n\
          i3-msg 'workspace number 7' >/dev/null\n\
-         alacritty --title 'Goal Codex' -o 'window.position={{x=1500,y=0}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+         \"$terminal\" --class NeutralTerminal --title 'Goal Codex' -o 'window.position={{x=1500,y=0}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof' &\n\
-         alacritty --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof' &\n\
-         alacritty --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
-         alacritty --title 'Input Codex' -o 'window.position={{x=1500,y=600}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title 'Input Codex' -o 'window.position={{x=1500,y=600}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/input-proof' &\n\
-         alacritty --title '[ ! ] Action Required | Permission Codex' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title '[ ! ] Action Required | Permission Codex' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/permission-proof' &\n\
-         alacritty --title 'Old Account Codex' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title 'Old Account Codex' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/rotate-proof' &\n\
-         alacritty --title 'Claude Code' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title 'Claude Code' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a claude bash /test/fake-session.bash /test/home/.claude/projects/-work-claude/{} /test/claude-proof' &\n\
-         alacritty --title 'Prime Agent' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title 'Prime Agent' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a prime-agent bash /test/fake-session.bash /test/home/.prime/agent/sessions/{} /test/prime-proof' &\n\
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title 'Error Codex' -o 'window.position={{x=1500,y=1200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/error-proof' &\n\
+         terminal_pids=\"$terminal_pids $!\"\n\
          fixture_windows=0\n\
+         ready=0\n\
          for attempt in $(seq 1 {TERMINAL_READINESS_POLLS}); do\n\
            fixture_windows=$(i3-msg -t get_tree 2>/dev/null | jq '[.. | .window? | select(. != null)] | length')\n\
-           [ \"$fixture_windows\" -ge 8 ] && break\n\
+           ready=1\n\
+           [ \"$fixture_windows\" -ge 9 ] || ready=0\n\
+           for pid in $terminal_pids; do\n\
+             case $(readlink \"/proc/$pid/exe\" 2>/dev/null) in\n\
+               */alacritty-0.16.1-x11-ime) ;;\n\
+               *) ready=0; break ;;\n\
+             esac\n\
+           done\n\
+           [ \"$ready\" = 1 ] && break\n\
            sleep 0.{FIXTURE_POLL_INTERVAL_MILLIS:03}\n\
          done\n\
-         if [ \"$fixture_windows\" -lt 8 ]; then\n\
-           printf 'fixture mapped %s of 8 terminal windows\\n' \"$fixture_windows\" >&2\n\
+         if [ \"$ready\" != 1 ]; then\n\
+           printf 'fixture mapped %s of 9 terminal windows\\n' \"$fixture_windows\" >&2\n\
            i3-msg -t get_tree | jq -c '[.. | objects | select(.window? != null) | .name]' >&2\n\
-           exit 1\n\
+           exit 70\n\
          fi\n\
+         mv -f \"$terminal.next\" \"$terminal\"\n\
+         for pid in $terminal_pids; do\n\
+           case $(readlink \"/proc/$pid/exe\" 2>/dev/null) in\n\
+             *' (deleted)') ;;\n\
+             *) exit 71 ;;\n\
+           esac\n\
+         done\n\
          exec {}\n",
         names[0],
         names[1],
@@ -1208,6 +1478,7 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 8]) -> Result<P
         names[5],
         names[6],
         names[7],
+        names[8],
         binary.display(),
     );
     testbed.write_private("launch-wrangler", wrapper)
@@ -1262,17 +1533,10 @@ fi
 workspace=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused).num')
 printf '%s\n' "$operation $workspace" > "/test/${{operation}}-proof-${{thread}}"
 rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
-exec -a codex bash -c 'exec 9<"$1"; sleep 90; :' wrangler-resume "$rollout"
+exec -a codex bash -c 'exec 9>>"$1"; sleep 90; :' wrangler-resume "$rollout"
 "#,
         ),
     )
-}
-
-fn forge_fake_terminal(testbed: &Testbed) -> Result<PathBuf> {
-    let source = env::current_exe().map_err(io_verdict("locate terminal fixture executable"))?;
-    let terminal = testbed.private_path("bin/alacritty")?;
-    fs::copy(source, &terminal).map_err(io_verdict("forge fake Alacritty"))?;
-    Ok(terminal)
 }
 
 fn arm_executable(path: &Path, operation: &'static str) -> Result<()> {
@@ -1397,12 +1661,11 @@ fn seed_goals(path: &Path) -> Result<()> {
         (DONE, "complete"),
         (INPUT, "complete"),
     ] {
-        let _inserted = db
-            .execute(
-                "INSERT INTO thread_goals (thread_id, status) VALUES (?1, ?2)",
-                params![thread, status],
-            )
-            .map_err(verdict("seed fixture goal"))?;
+        db.execute(
+            "INSERT INTO thread_goals (thread_id, status) VALUES (?1, ?2)",
+            params![thread, status],
+        )
+        .map_err(verdict("seed fixture goal"))?;
     }
     Ok(())
 }
@@ -1476,6 +1739,14 @@ fn seed_index(path: &Path) -> Result<()> {
             rollout_test_path(DORMANT, "dormant"),
         ),
         (
+            ERROR,
+            "Prompt-derived error title",
+            Some("Broken circuit"),
+            "/work/error",
+            60,
+            rollout_test_path(ERROR, "error"),
+        ),
+        (
             UNSEEN,
             "Forbidden historical thread",
             Some("Never enumerate me"),
@@ -1494,12 +1765,17 @@ fn seed_index(path: &Path) -> Result<()> {
             )
             .map_err(verdict("seed fixture thread"))?;
     }
+    db.execute(
+        "UPDATE threads SET archived = 1 WHERE id = ?1",
+        params![DORMANT],
+    )
+    .map_err(verdict("oppose Codex archive state to Wrangler closure"))?;
     Ok(())
 }
 
 fn seed_roster(testbed: &Testbed) -> Result<PathBuf> {
     let state = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "sessions": {
             DORMANT: {
                 "name": "Buried engine",
@@ -1507,7 +1783,6 @@ fn seed_roster(testbed: &Testbed) -> Result<PathBuf> {
                 "preview": "Waiting below.",
                 "updated_at_ms": 8,
                 "workspace": 6,
-                "retention": "active",
                 "account": {
                     "quotas": [{
                         "limit": "codex",
@@ -1540,7 +1815,7 @@ fn seed_names(testbed: &Testbed) -> Result<()> {
     demand(index.is_file(), "session-name index was not created")
 }
 
-fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 7]> {
+fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 8]> {
     let goal = rollout(directory, GOAL, "goal");
     let turn = rollout(directory, TURN, "turn");
     let done = rollout(directory, DONE, "done");
@@ -1548,6 +1823,7 @@ fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 7]> {
     let permission = rollout(directory, PERMISSION, "permission");
     let rotate = rollout(directory, ROTATE, "rotate");
     let dormant = rollout(directory, DORMANT, "dormant");
+    let error = rollout(directory, ERROR, "error");
     fs::write(
         &goal,
         concat!(
@@ -1560,7 +1836,8 @@ fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 7]> {
     fs::write(
         &turn,
         concat!(
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Cut the ordinary task through a deliberately immense preview which must remain imprisoned inside the card. It keeps going through several clauses, several sentences, and enough visual matter to expose any label whose clip rectangle is merely aspirational rather than real. None of this text may trespass into the next row, however narrow the window becomes.\"}}\n",
+            r#"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"00000000-0000-0000-0000-000000000002","turn_id":"turn-fixture","item":{"type":"UserMessage","id":"user-fixture","content":[{"type":"text","text":"Cut the ordinary task through a deliberately immense preview which must remain imprisoned inside the card. It keeps going through several clauses, several sentences, and enough visual matter to expose any label whose clip rectangle is merely aspirational rather than real. None of this text may trespass into the next row, however narrow the window becomes.","text_elements":[]}]},"started_at_ms":1,"completed_at_ms":1}}"#,
+            "\n",
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"status\":\"active\"}}}\n",
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
         ),
@@ -1627,7 +1904,16 @@ fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 7]> {
         ),
     )
     .map_err(io_verdict("write dormant rollout"))?;
-    Ok([goal, turn, done, input, permission, rotate, dormant])
+    fs::write(
+        &error,
+        concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Test an unknown failure.\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":null,\"error\":{\"message\":\"A future Codex halt.\",\"codex_error_info\":\"future_halt\"}}}\n"
+        ),
+    )
+    .map_err(io_verdict("write error rollout"))?;
+    Ok([goal, turn, done, input, permission, rotate, dormant, error])
 }
 
 fn rollout(directory: &Path, id: &str, stamp: &str) -> PathBuf {

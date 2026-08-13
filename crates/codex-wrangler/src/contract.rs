@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "egui-test")]
-pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/11";
+pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/14";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -29,11 +29,13 @@ impl Harness {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Work {
+    Error,
     Input,
     Goal,
     Turn,
-    Sleeping,
+    Sleep,
     Done,
+    Closed,
 }
 
 #[cfg(feature = "egui-test")]
@@ -52,8 +54,6 @@ pub struct CardObservation {
     pub thread: String,
     pub work: Work,
     pub workspace: Option<u32>,
-    pub open: bool,
-    pub archived: bool,
 }
 
 #[cfg(feature = "egui-test")]
@@ -79,22 +79,12 @@ pub struct CardKey {
 pub struct CardTarget<'a>(pub Harness, pub &'a str);
 
 #[cfg(feature = "egui-test")]
-pub struct LogoTarget<'a>(pub Harness, pub &'a str);
-
-#[cfg(feature = "egui-test")]
 pub struct WorkspaceTarget<'a>(pub Harness, pub &'a str);
 
 #[cfg(feature = "egui-test")]
 impl fmt::Display for CardTarget<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}/{}/activate", self.0.slug(), self.1)
-    }
-}
-
-#[cfg(feature = "egui-test")]
-impl fmt::Display for LogoTarget<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/{}/logo", self.0.slug(), self.1)
     }
 }
 

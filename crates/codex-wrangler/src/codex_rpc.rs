@@ -98,11 +98,6 @@ impl CodexRpc {
         Ok(AccountMark::current(digest, quotas))
     }
 
-    pub fn archive(&mut self, thread: &str) -> Result<()> {
-        let _archived = self.request("thread/archive", &json!({ "threadId": thread }))?;
-        Ok(())
-    }
-
     fn request(&mut self, method: &str, params: &Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);

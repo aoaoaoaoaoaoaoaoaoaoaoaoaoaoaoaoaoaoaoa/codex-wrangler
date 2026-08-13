@@ -9,7 +9,6 @@ mod posture;
 mod recon;
 mod rollout;
 mod roster;
-mod sigil;
 mod stasis;
 mod state;
 mod transcript;
@@ -21,20 +20,21 @@ use egui_tester_witness as _;
 
 use anyhow::Result;
 use eternalist_apps::TraceGuard;
-use instance::Incumbent;
+use instance::{Incumbent, Invocation};
 use posture::Ledger;
 
 fn main() -> Result<()> {
     if stasis::thawguard_requested() {
         return stasis::run_thawguard();
     }
+    let invocation = Invocation::read()?;
     let trace = TraceGuard::arm()?;
-    let Some(incumbent) = Incumbent::seize()? else {
+    let Some(incumbent) = Incumbent::seize(invocation)? else {
         trace.flush();
         return Ok(());
     };
     let ctx = egui::Context::default();
-    dwemer_poolrooms::chrome::install(&ctx);
+    brass_poolrooms::chrome::install(&ctx);
     let (ledger, posture) = Ledger::restore();
     let result = app::launch(&ctx, incumbent, ledger, posture);
     trace.flush();

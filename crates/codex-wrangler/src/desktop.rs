@@ -168,7 +168,7 @@ impl Desktop {
         Ok(signals)
     }
 
-    pub fn windows_by_pid(&self) -> Result<HashMap<u32, Window>> {
+    pub fn windows_by_pid(&self) -> Result<HashMap<u32, Vec<Window>>> {
         let clients = self
             .conn
             .get_property(
@@ -192,7 +192,7 @@ impl Desktop {
         let mut windows = HashMap::new();
         for window in clients {
             if let Some(pid) = self.window_pid(window)? {
-                let _old = windows.insert(pid, window);
+                windows.entry(pid).or_insert_with(Vec::new).push(window);
             }
         }
         Ok(windows)
@@ -327,7 +327,11 @@ impl Desktop {
     }
 
     pub fn window_by_pid(&self, pid: u32) -> Result<Option<Window>> {
-        if let Some(window) = self.windows_by_pid()?.get(&pid) {
+        if let Some(window) = self
+            .windows_by_pid()?
+            .get(&pid)
+            .and_then(|windows| windows.first())
+        {
             return Ok(Some(*window));
         }
         for window in self.descendants()? {

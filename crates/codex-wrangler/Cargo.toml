@@ -16,12 +16,12 @@ egui-test = [
   "instrumentation",
   "eternalist-apps/egui-test",
 ]
-instrumentation = ["dwemer_poolrooms/instrumentation"]
+instrumentation = ["brass_poolrooms/instrumentation"]
 
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
-dwemer_poolrooms.workspace = true
+brass_poolrooms.workspace = true
 egui.workspace = true
 egui-tester-witness = { workspace = true, optional = true, features = ["egui"] }
 egui-wgpu.workspace = true

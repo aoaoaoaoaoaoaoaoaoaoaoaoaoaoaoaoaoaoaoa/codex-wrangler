@@ -1,6 +1,6 @@
 use std::{
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::File,
     io::Write as _,
     path::PathBuf,
@@ -24,13 +24,15 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-const TERMINAL_NAME: &str = "alacritty";
+const TERMINAL_NAMES: [&str; 2] = ["alacritty", "alacritty-0.16.1-x11-ime"];
 const KEY_X: u32 = 0x78;
 const KEY_X_UPPER: u32 = 0x58;
 
 pub fn invoked() -> Result<bool> {
     let executable = env::current_exe().map_err(fault("locate fixture invocation"))?;
-    Ok(executable.file_name() == Some(OsStr::new(TERMINAL_NAME)))
+    Ok(executable
+        .file_name()
+        .is_some_and(|name| TERMINAL_NAMES.iter().any(|candidate| name == *candidate)))
 }
 
 pub fn serve() -> Result<()> {
@@ -60,7 +62,7 @@ pub fn serve() -> Result<()> {
     .check()
     .map_err(fault("create fake Alacritty window"))?;
     let atoms = Atoms::raise(&conn)?;
-    classify(&conn, window, &atoms, &invocation.title)?;
+    classify(&conn, window, &atoms, &invocation.title, &invocation.class)?;
     let (mut child, mut input) = invocation.spawn(window)?;
     conn.map_window(window)
         .map_err(fault("issue fake Alacritty window mapping"))?
@@ -143,6 +145,7 @@ impl Atoms {
 
 struct Invocation {
     title: String,
+    class: String,
     directory: Option<PathBuf>,
     command: Vec<OsString>,
 }
@@ -150,6 +153,7 @@ struct Invocation {
 impl Invocation {
     fn parse() -> Result<Self> {
         let mut title = "Alacritty".to_owned();
+        let mut class = "Alacritty".to_owned();
         let mut directory = None;
         let mut command = Vec::new();
         let mut args = env::args_os().skip(1);
@@ -167,6 +171,16 @@ impl Invocation {
                 }
                 Some("--working-directory") => {
                     directory = Some(PathBuf::from(required(&mut args, "--working-directory")?));
+                }
+                Some("--class") => {
+                    class = required(&mut args, "--class")?
+                        .into_string()
+                        .map_err(|value| Error::Verdict {
+                            detail: format!(
+                                "fake terminal class is not UTF-8: {}",
+                                value.to_string_lossy()
+                            ),
+                        })?;
                 }
                 Some("-o") => {
                     let _ignored = required(&mut args, "-o")?;
@@ -188,6 +202,7 @@ impl Invocation {
         demand(!command.is_empty(), "fake Alacritty command is absent")?;
         Ok(Self {
             title,
+            class,
             directory,
             command,
         })
@@ -229,7 +244,14 @@ fn required(args: &mut impl Iterator<Item = OsString>, option: &'static str) -> 
     })
 }
 
-fn classify(conn: &RustConnection, window: Window, atoms: &Atoms, title: &str) -> Result<()> {
+fn classify(
+    conn: &RustConnection,
+    window: Window,
+    atoms: &Atoms,
+    title: &str,
+    class: &str,
+) -> Result<()> {
+    let class = format!("{}\0{class}\0", class.to_ascii_lowercase());
     conn.change_property8(
         PropMode::REPLACE,
         window,
@@ -255,7 +277,7 @@ fn classify(conn: &RustConnection, window: Window, atoms: &Atoms, title: &str) -
         window,
         AtomEnum::WM_CLASS,
         AtomEnum::STRING,
-        b"alacritty\0Alacritty\0",
+        class.as_bytes(),
     )
     .map_err(fault("issue fake Alacritty class"))?
     .check()

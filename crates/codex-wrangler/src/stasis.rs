@@ -169,7 +169,7 @@ impl<D: Glacier> Dominion<D> {
         }
 
         for quarry in quarry {
-            let runnable = running(quarry.work) || active == Some(quarry.window);
+            let wakeful = freeze_veto(quarry.work) || active == Some(quarry.window);
             {
                 let captive = self.captives.entry(quarry.process).or_insert(Captive {
                     window: quarry.window,
@@ -183,7 +183,7 @@ impl<D: Glacier> Dominion<D> {
                 captive.window = quarry.window;
                 captive.work = quarry.work;
             }
-            if runnable {
+            if wakeful {
                 let _awakened = self.awaken(quarry.process, now);
             } else if self.focus_sound
                 && let Some(captive) = self.captives.get_mut(&quarry.process)
@@ -208,7 +208,7 @@ impl<D: Glacier> Dominion<D> {
             } else if self
                 .captives
                 .get(&process)
-                .is_some_and(|captive| !running(captive.work) && captive.idle_since.is_none())
+                .is_some_and(|captive| !freeze_veto(captive.work) && captive.idle_since.is_none())
                 && let Some(captive) = self.captives.get_mut(&process)
             {
                 captive.idle_since = Some(now);
@@ -249,7 +249,7 @@ impl<D: Glacier> Dominion<D> {
                     .values()
                     .filter(|captive| {
                         !captive.frozen
-                            && !running(captive.work)
+                            && !freeze_veto(captive.work)
                             && self.active != Some(captive.window)
                     })
                     .filter_map(|captive| {
@@ -292,7 +292,7 @@ impl<D: Glacier> Dominion<D> {
             .iter()
             .filter(|(_, captive)| {
                 !captive.frozen
-                    && !running(captive.work)
+                    && !freeze_veto(captive.work)
                     && self.active != Some(captive.window)
                     && captive
                         .idle_since
@@ -321,11 +321,9 @@ impl<D: Glacier> Dominion<D> {
                     }
                 },
             };
-            if self
-                .captives
-                .get(&process)
-                .is_none_or(|captive| self.active == Some(captive.window) || running(captive.work))
-            {
+            if self.captives.get(&process).is_none_or(|captive| {
+                self.active == Some(captive.window) || freeze_veto(captive.work)
+            }) {
                 continue;
             }
             match self.glacier.freeze(&unit) {
@@ -407,8 +405,8 @@ impl<D: Glacier> Drop for Dominion<D> {
     }
 }
 
-const fn running(work: Work) -> bool {
-    matches!(work, Work::Goal | Work::Turn)
+const fn freeze_veto(work: Work) -> bool {
+    matches!(work, Work::Error | Work::Input | Work::Goal | Work::Turn)
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -941,10 +939,21 @@ mod tests {
     }
 
     #[test]
+    fn every_active_or_attention_state_is_an_absolute_freeze_veto() {
+        let epoch = Instant::now();
+        for work in [Work::Error, Work::Input, Work::Goal, Work::Turn] {
+            let mut dominion = Dominion::new(Mock::default());
+            dominion.observe(epoch, None, &quarry(work));
+            dominion.freeze_due(epoch + IDLE_GRACE);
+            assert!(dominion.glacier.actions.is_empty(), "froze {work:?}");
+        }
+    }
+
+    #[test]
     fn focus_is_an_absolute_veto_and_thaws_existing_stasis() {
         let epoch = Instant::now();
         let mut dominion = Dominion::new(Mock::default());
-        dominion.observe(epoch, None, &quarry(Work::Input));
+        dominion.observe(epoch, None, &quarry(Work::Done));
         dominion.freeze_due(epoch + IDLE_GRACE);
         dominion.focus(epoch + IDLE_GRACE, Some(WINDOW));
         assert_eq!(
