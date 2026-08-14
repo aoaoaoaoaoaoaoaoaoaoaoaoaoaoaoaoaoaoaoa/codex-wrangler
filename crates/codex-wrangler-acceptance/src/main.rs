@@ -48,6 +48,7 @@ const APPLICATION_APPEARANCE_CEILING: Duration = Duration::from_millis(
     FIXTURE_POLL_INTERVAL_MILLIS * (I3_READINESS_POLLS + TERMINAL_READINESS_POLLS)
         + APPLICATION_STARTUP_ALLOWANCE_MILLIS,
 );
+const RETAINED_FAILURE_ARTIFACTS: usize = 3;
 
 fn main() -> Result<()> {
     if terminal_fixture::invoked()? {
@@ -64,15 +65,60 @@ fn failure_artifact_directory() -> Result<PathBuf> {
     if let Some(root) = env::var_os("FOUNDRY_EVIDENCE_DIR") {
         return Ok(PathBuf::from(root).join("acceptance-failure"));
     }
-    if let Some(root) = env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(root)
+    let root = if let Some(root) = env::var_os("XDG_STATE_HOME") {
+        PathBuf::from(root)
             .join("codex-wrangler")
-            .join("acceptance-failure"));
+            .join("acceptance-failure")
+    } else {
+        let home = env::var_os("HOME").ok_or_else(|| TesterError::Verdict {
+            detail: "acceptance failure artifacts require HOME or XDG_STATE_HOME".to_owned(),
+        })?;
+        PathBuf::from(home).join(".local/state/codex-wrangler/acceptance-failure")
+    };
+    fs::create_dir_all(&root)
+        .map_err(|error| artifact_io("create acceptance-failure directory", &error))?;
+    prune_failure_artifacts(&root)?;
+    Ok(root)
+}
+
+fn prune_failure_artifacts(root: &Path) -> Result<()> {
+    let mut dead = fs::read_dir(root)
+        .map_err(|error| artifact_io("read acceptance-failure directory", &error))?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.split_once('-'))
+                .and_then(|(pid, _)| pid.parse::<u32>().ok())
+                .is_none_or(|pid| !Path::new("/proc").join(pid.to_string()).exists())
+        })
+        .filter_map(|entry| {
+            entry
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()
+                .map(|modified| (modified, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    dead.sort_unstable_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in dead.into_iter().skip(RETAINED_FAILURE_ARTIFACTS) {
+        fs::remove_dir_all(&path).map_err(|error| {
+            artifact_io(
+                format!("remove stale failure artifact `{}`", path.display()).as_str(),
+                &error,
+            )
+        })?;
     }
-    let home = env::var_os("HOME").ok_or_else(|| TesterError::Verdict {
-        detail: "acceptance failure artifacts require HOME or XDG_STATE_HOME".to_owned(),
-    })?;
-    Ok(PathBuf::from(home).join(".local/state/codex-wrangler/acceptance-failure"))
+    Ok(())
+}
+
+fn artifact_io(operation: &str, error: &std::io::Error) -> TesterError {
+    TesterError::Verdict {
+        detail: format!("{operation}: {error}"),
+    }
 }
 
 fn input_reaction_budget() -> ReactionBudget {
