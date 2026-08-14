@@ -583,7 +583,7 @@ fn shift_click_ignored(story: &mut Story<'_, '_, Observation>, thread: &str) -> 
         "management mode to release Shift over running work",
         |state: &Observation| !state.jiggling,
     ))?;
-    evict_pointer(story, "running management pointer to leave its card")
+    vacate_gallery(story, "running management pointer to vacate its card")
 }
 
 fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Result<()> {
@@ -608,7 +608,7 @@ fn shift_click_card(story: &mut Story<'_, '_, Observation>, thread: &str) -> Res
         "management click to leave flight",
         |state: &Observation| state.flight == Flight::Grounded,
     ))?;
-    evict_pointer(
+    vacate_gallery(
         story,
         "management pointer to release gallery reconciliation",
     )?;
@@ -664,7 +664,7 @@ fn seize_card(
     let mut attempt = 1;
 
     loop {
-        evict_pointer(
+        vacate_gallery(
             story,
             "pointer to vacate the gallery before card acquisition",
         )?;
@@ -782,9 +782,9 @@ fn verify_gallery(
     story: &mut Story<'_, '_, Observation>,
     fixture: &Fixture,
 ) -> Result<()> {
-    evict_pointer(
+    vacate_gallery(
         story,
-        "pointer to leave the gallery before the initial census",
+        "pointer to vacate the gallery before the initial census",
     )?;
     let frame = story.wait_stable(
         Duration::from_secs(30),
@@ -807,7 +807,7 @@ fn verify_gallery(
     verify_permission_title_events(testbed, story)?;
     verify_workspace_badges(story)?;
     verify_fear_geometry(story)?;
-    evict_pointer(story, "pointer to leave the gallery before state mutation")?;
+    vacate_gallery(story, "pointer to vacate the gallery before state mutation")?;
     verify_goal_truth(story, &fixture.goals)?;
     verify_error_truth(story, &fixture.error_rollout)?;
     verify_hover_lock(story, &fixture.input_rollout)?;
@@ -832,7 +832,7 @@ fn verify_gallery(
             ))?;
     }
 
-    evict_pointer(story, "pointer to leave every tile before capture")?;
+    vacate_gallery(story, "pointer to vacate every tile before capture")?;
     let _calm = story.wait_stable(
         Duration::from_secs(4),
         Duration::from_millis(500),
@@ -1155,7 +1155,7 @@ fn verify_hover_lock(story: &mut Story<'_, '_, Observation>, rollout: &Path) -> 
         },
     )?;
 
-    evict_pointer(story, "pointer departure to release the census")?;
+    vacate_gallery(story, "pointer to vacate its tile and release the census")?;
     wait_for_work(
         story,
         INPUT,
@@ -1183,9 +1183,34 @@ fn append_rollout(path: &Path, line: &str) -> Result<()> {
     writeln!(file, "{line}").map_err(io_verdict("append fixture rollout event"))
 }
 
-fn evict_pointer(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
-    let receipt = story.session().leave()?;
-    let _parked = story
+fn vacate_gallery(story: &mut Story<'_, '_, Observation>, description: &'static str) -> Result<()> {
+    let frame = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::ZERO,
+        "gallery to expose a live card before pointer vacancy",
+        |frame| {
+            frame
+                .anchors
+                .iter()
+                .any(|anchor| anchor.name.ends_with("/activate"))
+                .then_some(())
+        },
+    )?;
+    let card = frame
+        .anchors
+        .iter()
+        .filter(|anchor| anchor.name.ends_with("/activate"))
+        .min_by(|left, right| left.rect[1].total_cmp(&right.rect[1]))
+        .ok_or_else(|| TesterError::Verdict {
+            detail: "gallery vacancy requires a live card anchor".to_owned(),
+        })?;
+    let (x, _) = card.center();
+    // Witness rectangles already inhabit X11's i16 coordinate space; this
+    // midpoint remains between the client edge and the first live card.
+    #[allow(clippy::cast_possible_truncation)]
+    let y = (card.rect[1] / 2.0).round() as i16;
+    let receipt = story.session().move_to(x, y)?;
+    let _vacated = story
         .reaction(receipt)
         .until(Condition::new(description, |state: &Observation| {
             state.hovered.is_none()
