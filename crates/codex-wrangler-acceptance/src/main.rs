@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     env, fs,
     io::Write as _,
-    os::unix::fs::PermissionsExt as _,
+    os::unix::fs::{PermissionsExt as _, symlink},
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -499,22 +499,31 @@ fn verify_session_lifecycle(
 
     verify_management_veto(story, fixture)?;
 
-    select_and_return(testbed, story, app, ROTATE, &fixture.rotate_resume)?;
+    select_and_return(
+        testbed,
+        story,
+        app,
+        ROTATE,
+        &fixture.rotate_resume,
+        &fixture.roster,
+    )?;
     demand(
         fs::read_to_string(&fixture.rotate_resume).is_ok_and(|proof| proof.trim() == "resume 7"),
         "rolled session did not resume on its terminal workspace",
-    )?;
-    app.wait_until(
-        Duration::from_secs(8),
-        "rolled session to bind the current Codex account",
-        || Ok(read_roster(&fixture.roster)?["sessions"][ROTATE]["account"]["account"].is_string()),
     )?;
     demand(
         read_roster(&fixture.roster)?["sessions"][ROTATE]["account"]["account"].is_string(),
         "rolled session was not rebound to the current Codex account",
     )?;
 
-    select_and_return(testbed, story, app, DORMANT, &fixture.dormant_resume)?;
+    select_and_return(
+        testbed,
+        story,
+        app,
+        DORMANT,
+        &fixture.dormant_resume,
+        &fixture.roster,
+    )?;
     demand(
         fs::read_to_string(&fixture.dormant_resume).is_ok_and(|proof| proof.trim() == "resume 6"),
         "resurrected session did not return to its remembered workspace",
@@ -674,6 +683,7 @@ fn select_and_return(
     app: &Application<'_>,
     thread: &str,
     proof: &Path,
+    roster: &Path,
 ) -> Result<()> {
     story.session().focus()?;
     let (strike_x, strike_y) = seize_card(story, thread, "resume")?;
@@ -691,6 +701,11 @@ fn select_and_return(
         Duration::from_secs(8),
         "Wrangler to conceal itself after resuming a Codex session",
         || Ok(wrangler_count(testbed)? == Some(0)),
+    )?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "resumed Codex session to finish its account binding",
+        || Ok(read_roster(roster)?["sessions"][thread]["account"]["account"].is_string()),
     )?;
     let _returned = story.session().key(Key::Function(7))?;
     app.wait_until(
@@ -1444,12 +1459,15 @@ fn forge_replaceable_alacritty(testbed: &Testbed) -> Result<PathBuf> {
     let source = env::current_exe().map_err(io_verdict("locate terminal fixture executable"))?;
     let terminal = testbed.private_path("bin/alacritty-0.16.1-x11-ime")?;
     let replacement = testbed.private_path("bin/alacritty-0.16.1-x11-ime.next")?;
+    let launcher = testbed.private_path("bin/alacritty")?;
     for destination in [&terminal, &replacement] {
         let _bytes = fs::copy(&source, destination)
             .map_err(io_verdict("copy replaceable terminal fixture"))?;
         fs::set_permissions(destination, fs::Permissions::from_mode(0o700))
             .map_err(io_verdict("make replaceable terminal fixture executable"))?;
     }
+    symlink("alacritty-0.16.1-x11-ime", launcher)
+        .map_err(io_verdict("link canonical fake Alacritty executable"))?;
     Ok(terminal)
 }
 
