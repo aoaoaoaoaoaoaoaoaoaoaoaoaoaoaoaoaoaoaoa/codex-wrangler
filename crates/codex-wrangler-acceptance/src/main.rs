@@ -10,7 +10,7 @@ use std::{
 };
 
 use egui_tester::{
-    AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key, Motion,
+    AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key,
     ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery, demand,
 };
 use rusqlite::{Connection, params};
@@ -1255,17 +1255,21 @@ fn vacate_gallery(story: &mut Story<'_, '_, Observation>, description: &'static 
     // midpoint remains between the client edge and the first live card.
     #[allow(clippy::cast_possible_truncation)]
     let y = (card.rect[1] / 2.0).round() as i16;
-    let _motion = story.session().motion((x, y), Motion::default())?;
+    let receipt = story.session().move_to(x, y)?;
     demand(
         story.session().pointer()? == (x, y),
         format!("gallery vacancy motion did not reach ({x}, {y})"),
     )?;
-    let _vacated = story.wait_stable(
-        Duration::from_secs(10),
-        Duration::ZERO,
+    let _vacated = story.reaction(receipt).until(Condition::diagnostic(
         description,
-        |frame| frame.state.hovered.is_none().then_some(()),
-    )?;
+        move |state: &Observation| {
+            state.hovered.as_ref().map_or(Ok(()), |hovered| {
+                Err(format!(
+                    "pointer at ({x}, {y}) retained card hover {hovered:?}"
+                ))
+            })
+        },
+    ))?;
     Ok(())
 }
 
