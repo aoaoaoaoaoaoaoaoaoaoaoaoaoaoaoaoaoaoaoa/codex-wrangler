@@ -54,13 +54,25 @@ fn main() -> Result<()> {
         return terminal_fixture::serve();
     }
     let binary = sibling_binary()?;
-    let failure_artifacts = env::var_os("FOUNDRY_EVIDENCE_DIR").map_or_else(
-        || PathBuf::from("/tmp/codex-wrangler-acceptance-failure"),
-        |root| PathBuf::from(root).join("acceptance-failure"),
-    );
+    let failure_artifacts = failure_artifact_directory()?;
     TestbedBuilder::default()
         .failure_artifacts(failure_artifacts)
         .run(|testbed| story(testbed, &binary))
+}
+
+fn failure_artifact_directory() -> Result<PathBuf> {
+    if let Some(root) = env::var_os("FOUNDRY_EVIDENCE_DIR") {
+        return Ok(PathBuf::from(root).join("acceptance-failure"));
+    }
+    if let Some(root) = env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(root)
+            .join("codex-wrangler")
+            .join("acceptance-failure"));
+    }
+    let home = env::var_os("HOME").ok_or_else(|| TesterError::Verdict {
+        detail: "acceptance failure artifacts require HOME or XDG_STATE_HOME".to_owned(),
+    })?;
+    Ok(PathBuf::from(home).join(".local/state/codex-wrangler/acceptance-failure"))
 }
 
 fn input_reaction_budget() -> ReactionBudget {
@@ -1265,7 +1277,7 @@ impl Fixture {
              bindsym F5 floating disable, exec --no-startup-id touch /test/tiled-proof\n\
              bindsym F6 workspace number 8, exec --no-startup-id touch /test/tiled-away-proof\n\
              bindsym F7 workspace number 9, exec --no-startup-id touch /test/tiled-home-proof\n\
-             bindsym F8 floating enable, exec --no-startup-id touch /test/floating-proof\n\
+             bindsym F8 floating enable, move position 0 0, exec --no-startup-id touch /test/floating-proof\n\
              bar {\n\
                mode dock\n\
                position bottom\n\
