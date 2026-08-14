@@ -1,0 +1,133 @@
+{
+  "sessions": [
+    {
+      "id": "11000000-0000-7000-8000-000000000001",
+      "slug": "compression-boundary",
+      "name": "Compression boundary",
+      "cwd": "/work/libgrid/semantic-lift",
+      "updated_at_ms": 60,
+      "workspace": 2,
+      "state": "input",
+      "rollout": [
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "user_message",
+            "message": "Choose whether empty inline witnesses should contract before section normalization."
+          }
+        },
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started"
+          }
+        },
+        {
+          "type": "response_item",
+          "payload": {
+            "type": "function_call",
+            "name": "request_user_input",
+            "call_id": "call-showcase-boundary"
+          }
+        }
+      ]
+    },
+    {
+      "id": "22000000-0000-7000-8000-000000000002",
+      "slug": "matrix-mortality",
+      "name": "Matrix mortality",
+      "cwd": "/work/math/matrix-mortality",
+      "updated_at_ms": 50,
+      "workspace": 3,
+      "state": "goal",
+      "rollout": [
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "user_message",
+            "message": "Prove the 4 × 4 binary mortality family reduces to the paired compression invariant."
+          }
+        },
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started"
+          }
+        }
+      ]
+    },
+    {
+      "id": "33000000-0000-7000-8000-000000000003",
+      "slug": "semantic-lift",
+      "name": "Semantic lift",
+      "cwd": "/work/libgrid/semantic-lift",
+      "updated_at_ms": 40,
+      "workspace": 4,
+      "state": "working",
+      "rollout": [
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "user_message",
+            "message": "Trace section ownership through inline nodes, block projections, and the canonical splice boundary."
+          }
+        },
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started"
+          }
+        }
+      ]
+    },
+    {
+      "id": "55000000-0000-7000-8000-000000000005",
+      "slug": "return-guard-compiler",
+      "name": "Return-guard compiler",
+      "cwd": "/work/math/return-guard",
+      "updated_at_ms": 20,
+      "workspace": 6,
+      "state": "done",
+      "rollout": [
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "user_message",
+            "message": "Compile the return-guard normal form and audit every generated witness."
+          }
+        },
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started"
+          }
+        },
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "last_agent_message": "Established the return-guard normal form and sealed the generated witness corpus."
+          }
+        }
+      ]
+    },
+    {
+      "id": "66000000-0000-7000-8000-000000000006",
+      "slug": "renderer-census",
+      "name": "Renderer census",
+      "cwd": "/work/dwemer-poolrooms/web-assets",
+      "updated_at_ms": 10,
+      "workspace": 1,
+      "state": "closed",
+      "rollout": [
+        {
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "last_agent_message": "Reconciled tile projection, interaction frames, and the canonical browser asset boundary."
+          }
+        }
+      ]
+    }
+  ]
+}

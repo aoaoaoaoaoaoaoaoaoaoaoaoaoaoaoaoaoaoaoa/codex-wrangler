@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: scripts/showcase capture.png" >&2
+  exit 64
+fi
+
+export CODEX_WRANGLER_SHOWCASE_CAPTURE=$1
+if [ -z "${CODEX_WRANGLER_ACCEPTANCE_BINARY:-}" ]; then
+  cargo build --release --locked --features egui-test --bin codex-wrangler
+fi
+cargo run --release --locked -p codex-wrangler-acceptance

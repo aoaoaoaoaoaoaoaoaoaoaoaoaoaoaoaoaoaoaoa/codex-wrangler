@@ -16,6 +16,7 @@ use egui_tester::{
 use rusqlite::{Connection, params};
 use serde_json::Value;
 
+mod showcase;
 mod terminal_fixture;
 
 #[path = "../../codex-wrangler/src/contract.rs"]
@@ -56,9 +57,13 @@ fn main() -> Result<()> {
     }
     let binary = sibling_binary()?;
     let failure_artifacts = failure_artifact_directory()?;
+    let showcase = env::var_os("CODEX_WRANGLER_SHOWCASE_CAPTURE");
     TestbedBuilder::default()
         .failure_artifacts(failure_artifacts)
-        .run(|testbed| story(testbed, &binary))
+        .run(|testbed| match &showcase {
+            Some(destination) => showcase::story(testbed, &binary, Path::new(destination)),
+            None => story(testbed, &binary),
+        })
 }
 
 fn failure_artifact_directory() -> Result<PathBuf> {
