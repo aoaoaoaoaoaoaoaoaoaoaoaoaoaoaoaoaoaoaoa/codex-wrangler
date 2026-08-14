@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler-acceptance"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "egui-tester",
  "nix",

@@ -618,11 +618,18 @@ fn shift_click_ignored(story: &mut Story<'_, '_, Observation>, thread: &str) -> 
         "management mode to acquire Shift over running work",
         |state: &Observation| state.jiggling,
     ))?;
-    let _clicked = story.session().click(x, center_y, Button::Primary)?;
-    thread::sleep(Duration::from_millis(80));
-    demand(
-        story.frame()?.state.flight == Flight::Grounded,
-        "running management click entered an action flight",
+    let clicked = story.session().click(x, center_y, Button::Primary)?;
+    let click_completed = clicked.completed_ns();
+    let _vetoed = story.wait_stable(
+        input_reaction_budget().functional_timeout(),
+        Duration::ZERO,
+        "held Shift management click to settle without flight",
+        |frame| {
+            (frame.begun_ns >= click_completed
+                && frame.state.jiggling
+                && frame.state.flight == Flight::Grounded)
+                .then_some(())
+        },
     )?;
     let shift_up = story.session().key_up(Key::Shift)?;
     let _stilled = story.reaction(shift_up).until(Condition::new(
