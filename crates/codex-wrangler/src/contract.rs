@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "egui-test")]
-pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/17";
+pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/18";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -81,6 +81,14 @@ pub enum DeleteGuard {
 }
 
 #[cfg(feature = "egui-test")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClosePreference {
+    Exit,
+    Minimize,
+}
+
+#[cfg(feature = "egui-test")]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CardObservation {
     pub harness: Harness,
@@ -103,6 +111,7 @@ pub struct Observation {
     pub guide: GuideVisibility,
     pub tab: Tab,
     pub delete_guard: DeleteGuard,
+    pub close_preference: ClosePreference,
     pub delete_prompt: Option<String>,
     pub visible: Vec<CardKey>,
     pub cards: Vec<CardObservation>,
@@ -171,6 +180,9 @@ pub enum SearchTarget {
 pub struct HistorySortTarget(pub HistoryColumn);
 
 #[cfg(feature = "egui-test")]
+pub struct PreferenceTarget(pub &'static str);
+
+#[cfg(feature = "egui-test")]
 pub struct HistoryTarget<'a>(pub &'a str, pub &'static str);
 
 #[cfg(feature = "egui-test")]
@@ -226,6 +238,13 @@ impl fmt::Display for HistorySortTarget {
                 HistoryColumn::State => "state",
             }
         )
+    }
+}
+
+#[cfg(feature = "egui-test")]
+impl fmt::Display for PreferenceTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "preferences/{}", self.0)
     }
 }
 

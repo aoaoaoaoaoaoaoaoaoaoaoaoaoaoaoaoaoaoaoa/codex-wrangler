@@ -9,11 +9,14 @@ const VERSION: u8 = 1;
 struct State {
     version: u8,
     confirm_deletion: bool,
+    #[serde(default)]
+    minimize_on_close: bool,
 }
 
 pub struct Preferences {
     path: Option<PathBuf>,
     confirm_deletion: bool,
+    minimize_on_close: bool,
 }
 
 impl Preferences {
@@ -25,6 +28,7 @@ impl Preferences {
                 return Self {
                     path: None,
                     confirm_deletion: true,
+                    minimize_on_close: false,
                 };
             }
         };
@@ -44,6 +48,7 @@ impl Preferences {
         Self {
             path: Some(path),
             confirm_deletion: restored.is_none_or(|state| state.confirm_deletion),
+            minimize_on_close: restored.is_some_and(|state| state.minimize_on_close),
         }
     }
 
@@ -56,12 +61,29 @@ impl Preferences {
             return;
         }
         self.confirm_deletion = confirm;
+        self.persist();
+    }
+
+    pub const fn minimize_on_close(&self) -> bool {
+        self.minimize_on_close
+    }
+
+    pub fn set_minimize_on_close(&mut self, minimize: bool) {
+        if self.minimize_on_close == minimize {
+            return;
+        }
+        self.minimize_on_close = minimize;
+        self.persist();
+    }
+
+    fn persist(&self) {
         let Some(path) = &self.path else {
             return;
         };
         let state = State {
             version: VERSION,
-            confirm_deletion: confirm,
+            confirm_deletion: self.confirm_deletion,
+            minimize_on_close: self.minimize_on_close,
         };
         let result = serde_json::to_vec(&state)
             .map_err(anyhow::Error::from)

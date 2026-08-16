@@ -8,9 +8,10 @@ use std::{
 
 #[cfg(feature = "egui-test")]
 use crate::contract::{
-    CardKey, CardObservation, CardTarget, DeleteGuard, Flight, GuideVisibility, HistoryObservation,
-    HistorySortObservation, HistorySortTarget, HistoryTarget, Observation, SearchObservation,
-    SearchTarget, Tab, TabTarget, UI_FINGERPRINT, WorkspaceTarget,
+    CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, GuideVisibility,
+    HistoryObservation, HistorySortObservation, HistorySortTarget, HistoryTarget, Observation,
+    PreferenceTarget, SearchObservation, SearchTarget, Tab, TabTarget, UI_FINGERPRINT,
+    WorkspaceTarget,
 };
 use brass_poolrooms::{
     chrome,
@@ -483,6 +484,23 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         }
     }
 
+    fn close_preference(&mut self, ui: &mut egui::Ui) {
+        let mut minimize = self.preferences.minimize_on_close();
+        let latch = chrome::Checkbox::new(&mut minimize, "MINIMIZE ON CLOSE")
+            .label_side(chrome::LabelSide::Left)
+            .size(MechanismSize::Small)
+            .show(ui);
+        brass_poolrooms::poolroom_anchor!(
+            ui,
+            PreferenceTarget("minimize-on-close").to_string(),
+            latch.rect
+        );
+        self.water.checkbox(&latch);
+        if latch.changed() {
+            self.preferences.set_minimize_on_close(minimize);
+        }
+    }
+
     fn header(&mut self, ui: &mut egui::Ui) {
         let _heading = ui.horizontal(|ui| {
             let _title = ui.label(chrome::title("CODEX WRANGLER").size(18.0));
@@ -500,6 +518,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             ui.add_space(8.0);
             let _help = ui.label(chrome::muted("? TO OPEN HELP").size(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.close_preference(ui);
+                ui.add_space(8.0);
                 if self.page == Page::Live {
                     legend(ui, "DONE", Work::Done);
                     legend(ui, "SLEEP", Work::Sleep);
@@ -963,6 +983,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             } else {
                 DeleteGuard::Bypassed
             },
+            close_preference: if self.preferences.minimize_on_close() {
+                ClosePreference::Minimize
+            } else {
+                ClosePreference::Exit
+            },
             delete_prompt: self.delete_target.clone(),
             visible: self
                 .census
@@ -1113,7 +1138,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
     }
 
     fn close_requested(&mut self) -> CloseDisposition {
-        if self.tray.as_ref().is_some_and(Tray::available) {
+        if self.preferences.minimize_on_close() && self.tray.as_ref().is_some_and(Tray::available) {
             self.sight_posture();
             self.quench();
             CloseDisposition::HideOrExit

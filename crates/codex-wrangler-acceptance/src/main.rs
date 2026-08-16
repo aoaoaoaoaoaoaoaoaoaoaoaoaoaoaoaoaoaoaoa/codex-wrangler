@@ -22,9 +22,9 @@ mod terminal_fixture;
 #[path = "../../codex-wrangler/src/contract.rs"]
 mod contract;
 use contract::{
-    CardKey, CardTarget, DeleteGuard, Flight, GuideVisibility, Harness, HistoryColumn,
-    HistorySortTarget, HistoryTarget, Observation, SearchTarget, SortDirection, Tab, TabTarget,
-    UI_FINGERPRINT, Work, WorkspaceTarget,
+    CardKey, CardTarget, ClosePreference, DeleteGuard, Flight, GuideVisibility, Harness,
+    HistoryColumn, HistorySortTarget, HistoryTarget, Observation, PreferenceTarget, SearchTarget,
+    SortDirection, Tab, TabTarget, UI_FINGERPRINT, Work, WorkspaceTarget,
 };
 
 const GOAL: &str = "10000000-0000-7000-8000-000000000001";
@@ -881,6 +881,7 @@ fn verify_gallery(
         },
     )?;
     verify_census(&frame.state)?;
+    enable_minimize_on_close(story, &fixture.preferences)?;
     verify_search_and_help(story)?;
     verify_history(testbed, story, &fixture.index)?;
     verify_permission_title_events(testbed, story)?;
@@ -942,6 +943,10 @@ fn verify_census(state: &Observation) -> Result<()> {
             && state.guide == GuideVisibility::Closed
             && state.visible.len() == state.cards.len(),
         "settled gallery did not begin with an unfiltered, unfocused search",
+    )?;
+    demand(
+        state.close_preference == ClosePreference::Exit,
+        "minimize-on-close did not begin disabled",
     )?;
     let states = state
         .cards
@@ -1024,6 +1029,30 @@ fn verify_census(state: &Observation) -> Result<()> {
         ),
     ]);
     demand(states == expected, format!("wrong card census: {states:?}"))
+}
+
+fn enable_minimize_on_close(
+    story: &mut Story<'_, '_, Observation>,
+    preferences: &Path,
+) -> Result<()> {
+    let _enabled = story
+        .tap(
+            PreferenceTarget("minimize-on-close"),
+            Button::Primary,
+            Motion::default(),
+        )?
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "minimize-on-close latch to arm",
+            |state: &Observation| state.close_preference == ClosePreference::Minimize,
+        ))?;
+    demand(
+        serde_json::from_slice::<Value>(
+            &fs::read(preferences).map_err(io_verdict("read close preference"))?,
+        )
+        .is_ok_and(|state| state["minimize_on_close"] == true),
+        "minimize-on-close did not seal its XDG preference",
+    )
 }
 
 fn verify_search_and_help(story: &mut Story<'_, '_, Observation>) -> Result<()> {
@@ -1719,6 +1748,7 @@ struct Fixture {
     floating_proof: PathBuf,
     state: PathBuf,
     roster: PathBuf,
+    preferences: PathBuf,
     index: PathBuf,
     rotate_resume: PathBuf,
     dormant_resume: PathBuf,
@@ -1739,6 +1769,7 @@ impl Fixture {
         seed_names(testbed)?;
         let state = testbed.write_private("xdg/state/codex-wrangler/window-mode", b"tiled\n")?;
         let roster = seed_roster(testbed)?;
+        let preferences = testbed.private_path("xdg/state/codex-wrangler/preferences.json")?;
         let _rotate_work = testbed.create_private_dir("work/rotate")?;
         let _dormant_work = testbed.create_private_dir("work/dormant")?;
         let (claude, prime) = seed_foreign_transcripts(testbed)?;
@@ -1820,6 +1851,7 @@ impl Fixture {
             floating_proof,
             state,
             roster,
+            preferences,
             index: db_path,
             rotate_resume,
             dormant_resume,
