@@ -39,6 +39,7 @@ const DORMANT: &str = "90000000-0000-7000-8000-000000000009";
 const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
 const ERROR: &str = "b0000000-0000-7000-8000-00000000000b";
 const COLD: &str = "c0000000-0000-7000-8000-00000000000c";
+const FRESH: &str = "d0000000-0000-7000-8000-00000000000d";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
 const FUNCTIONAL_ACCEPTANCE_ENV: &str = "CODEX_WRANGLER_FUNCTIONAL_ACCEPTANCE";
@@ -865,9 +866,9 @@ fn verify_gallery(
     let frame = story.wait_stable(
         Duration::from_secs(30),
         Duration::from_millis(250),
-        "nine live terminals and one remembered Codex session",
+        "ten live terminals and one remembered Codex session",
         |frame| {
-            (frame.state.cards.len() == 10
+            (frame.state.cards.len() == 11
                 && frame.state.cards.iter().all(|card| {
                     card.workspace
                         == if card.thread == DORMANT {
@@ -991,6 +992,13 @@ fn verify_census(state: &Observation) -> Result<()> {
             ROTATE,
             Work::Done,
             Some("Old account"),
+            Some(7),
+        ),
+        (
+            Harness::Codex,
+            FRESH,
+            Work::Done,
+            Some("Empty vessel"),
             Some(7),
         ),
         (
@@ -1719,7 +1727,9 @@ struct Fixture {
 impl Fixture {
     fn forge(testbed: &Testbed, binary: &Path) -> Result<Self> {
         let codex = testbed.create_private_dir("home/.codex/sessions/2026/08/03")?;
-        let [goal, turn, done, input, permission, rotate, _dormant, error] = seed_rollouts(&codex)?;
+        let [goal, turn, done, input, permission, rotate, dormant, error] = seed_rollouts(&codex)?;
+        let fresh = rollout(&codex, FRESH, "fresh");
+        let _writer_locks = testbed.create_private_dir("home/.codex/thread-writer-locks")?;
         let archive = testbed.create_private_dir("home/.codex/archived_sessions")?;
         seed_historical(&codex, &archive)?;
         let db_path = testbed.private_path("home/.codex/state_5.sqlite")?;
@@ -1777,6 +1787,8 @@ impl Fixture {
                 &claude,
                 &prime,
                 &error,
+                &dormant,
+                &fresh,
             ],
         )?;
         arm_executable(&wrapper, "make fixture wrapper executable")?;
@@ -1820,7 +1832,14 @@ fn forge_fake_harness(testbed: &Testbed) -> Result<PathBuf> {
         "fake-session.bash",
         br#"rollout=$1
 proof=$2
-exec 9>>"$rollout"
+claim=${3:-$rollout}
+if [ "$claim" = legacy ]; then
+  claim=$rollout
+fi
+exec 9>>"$claim"
+if [ -n "${4:-}" ]; then
+  exec 8>>"$4"
+fi
 case $(xprop -id "$WINDOWID" WM_CLASS) in
   *NeutralTerminal*) ;;
   *) exit 72 ;;
@@ -1849,7 +1868,7 @@ fn forge_replaceable_alacritty(testbed: &Testbed) -> Result<PathBuf> {
     Ok(terminal)
 }
 
-fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 9]) -> Result<PathBuf> {
+fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<PathBuf> {
     let names = logs.map(|path| path.file_name().unwrap_or_default().to_string_lossy());
     let wrapper = format!(
         "#!/bin/sh\n\
@@ -1863,10 +1882,13 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 9]) -> Result<P
          done\n\
          i3-msg 'workspace number 7' >/dev/null\n\
          \"$terminal\" --class NeutralTerminal --title 'Goal Codex' -o 'window.position={{x=1500,y=0}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof legacy /test/home/.codex/sessions/2026/08/03/{}' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof /test/home/.codex/thread-writer-locks/{TURN}.lock' &\n\
+         terminal_pids=\"$terminal_pids $!\"\n\
+         \"$terminal\" --class NeutralTerminal --title 'Fresh Codex' -o 'window.position={{x=1500,y=300}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/fresh-proof /test/home/.codex/thread-writer-locks/{FRESH}.lock' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
@@ -1894,7 +1916,7 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 9]) -> Result<P
          for attempt in $(seq 1 {TERMINAL_READINESS_POLLS}); do\n\
            fixture_windows=$(i3-msg -t get_tree 2>/dev/null | jq '[.. | .window? | select(. != null)] | length')\n\
            ready=1\n\
-           [ \"$fixture_windows\" -ge 9 ] || ready=0\n\
+           [ \"$fixture_windows\" -ge 10 ] || ready=0\n\
            for pid in $terminal_pids; do\n\
              case $(readlink \"/proc/$pid/exe\" 2>/dev/null) in\n\
                */alacritty-0.16.1-x11-ime) ;;\n\
@@ -1905,7 +1927,7 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 9]) -> Result<P
            sleep 0.{FIXTURE_POLL_INTERVAL_MILLIS:03}\n\
          done\n\
          if [ \"$ready\" != 1 ]; then\n\
-           printf 'fixture mapped %s of 9 terminal windows\\n' \"$fixture_windows\" >&2\n\
+           printf 'fixture mapped %s of 10 terminal windows\\n' \"$fixture_windows\" >&2\n\
            i3-msg -t get_tree | jq -c '[.. | objects | select(.window? != null) | .name]' >&2\n\
            exit 70\n\
          fi\n\
@@ -1918,7 +1940,9 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 9]) -> Result<P
          done\n\
          exec {}\n",
         names[0],
+        names[9],
         names[1],
+        names[10],
         names[2],
         names[3],
         names[4],
@@ -2229,6 +2253,14 @@ fn seed_thread_rows(db: &Connection) -> Result<()> {
             rollout_test_path(ERROR, "error"),
         ),
         (
+            FRESH,
+            "Fresh thread",
+            Some("Empty vessel"),
+            "/work/fresh",
+            70,
+            rollout_test_path(FRESH, "fresh"),
+        ),
+        (
             UNSEEN,
             "Historical thread",
             Some("Dust ledger"),
@@ -2247,16 +2279,23 @@ fn seed_thread_rows(db: &Connection) -> Result<()> {
             ),
         ),
     ] {
-        let _inserted = db
-            .execute(
-                "INSERT INTO threads
-                 (id, title, name, cwd, updated_at_ms, thread_source, source, agent_role,
-                  rollout_path, archived)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'user', 'cli', NULL, ?6, 0)",
-                params![row.0, row.1, row.2, row.3, row.4, row.5],
-            )
-            .map_err(verdict("seed fixture thread"))?;
+        seed_thread(db, &row)?;
     }
+    Ok(())
+}
+
+type ThreadSeed<'a> = (&'a str, &'a str, Option<&'a str>, &'a str, i64, String);
+
+fn seed_thread(db: &Connection, row: &ThreadSeed<'_>) -> Result<()> {
+    let _inserted = db
+        .execute(
+            "INSERT INTO threads
+             (id, title, name, cwd, updated_at_ms, thread_source, source, agent_role,
+              rollout_path, archived)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'user', 'cli', NULL, ?6, 0)",
+            params![row.0, row.1, row.2, row.3, row.4, row.5],
+        )
+        .map_err(verdict("seed fixture thread"))?;
     Ok(())
 }
 

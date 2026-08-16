@@ -188,6 +188,20 @@ pub struct RolloutSummary {
     pub account: Option<AccountMark>,
 }
 
+impl RolloutSummary {
+    /// Codex 0.147 creates the authoritative thread row and writer lock before
+    /// materializing a rollout. Until the first turn, that is a lawful stopped
+    /// session rather than a failed read.
+    pub fn quiescent() -> Self {
+        Self {
+            preview: String::new(),
+            state: TurnState::Done,
+            waiting_for_input: false,
+            account: None,
+        }
+    }
+}
+
 impl Rollouts {
     pub fn read(&mut self, path: &Path) -> std::io::Result<RolloutSummary> {
         let length = fs::metadata(path)?.len();

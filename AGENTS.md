@@ -8,5 +8,9 @@ Use `eternalist-apps` as the native host and Brass Poolrooms as the visual and
 physical language. Keep Codex discovery, X11 activation, tray behavior, and the
 acceptance fixtures product-owned.
 
+`docs/codex-compatibility.md` is the support-policy source of truth. Runtime
+detects capabilities; each supported Codex line retains a named removal seam
+and an acceptance fixture.
+
 Run `scripts/check` after meaningful edits and `scripts/accept` after native UI
 changes. Install with `scripts/install-local` only after both pass.
