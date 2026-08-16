@@ -10,7 +10,7 @@ use std::{
 };
 
 use egui_tester::{
-    AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key,
+    AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key, Motion,
     ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery, demand,
 };
 use rusqlite::{Connection, params};
@@ -1241,12 +1241,12 @@ fn click_history(
     thread: &str,
     action: &'static str,
 ) -> Result<()> {
-    let target = story.anchor(HistoryTarget(thread, action))?;
-    let clicked = story
-        .session()
-        .click(target.center().0, target.center().1, Button::Primary)?;
     let _witnessed = story
-        .reaction(clicked)
+        .tap(
+            HistoryTarget(thread, action),
+            Button::Primary,
+            Motion::default(),
+        )?
         .within(input_reaction_budget())
         .until(Condition::new(
             "historical control click to reach the application",
