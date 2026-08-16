@@ -22,8 +22,9 @@ mod terminal_fixture;
 #[path = "../../codex-wrangler/src/contract.rs"]
 mod contract;
 use contract::{
-    CardKey, CardTarget, DeleteGuard, Flight, GuideVisibility, Harness, HistoryTarget, Observation,
-    Tab, TabTarget, UI_FINGERPRINT, Work, WorkspaceTarget,
+    CardKey, CardTarget, DeleteGuard, Flight, GuideVisibility, Harness, HistoryColumn,
+    HistorySortTarget, HistoryTarget, Observation, SearchTarget, SortDirection, Tab, TabTarget,
+    UI_FINGERPRINT, Work, WorkspaceTarget,
 };
 
 const GOAL: &str = "10000000-0000-7000-8000-000000000001";
@@ -936,6 +937,7 @@ fn verify_census(state: &Observation) -> Result<()> {
         state.search.query.is_empty()
             && state.search.valid
             && !state.search.focused
+            && !state.search.editing
             && state.guide == GuideVisibility::Closed
             && state.visible.len() == state.cards.len(),
         "settled gallery did not begin with an unfiltered, unfocused search",
@@ -1017,7 +1019,7 @@ fn verify_census(state: &Observation) -> Result<()> {
 }
 
 fn verify_search_and_help(story: &mut Story<'_, '_, Observation>) -> Result<()> {
-    const QUERY: &str = "Awaiting verdict|^/work/turn$";
+    const QUERY: &str = "awaiting verdict|^/WORK/TURN$";
 
     story.session().focus()?;
     let slash = story.session().key(Key::Character('/'))?;
@@ -1026,8 +1028,11 @@ fn verify_search_and_help(story: &mut Story<'_, '_, Observation>) -> Result<()> 
         .within(input_reaction_budget())
         .until(Condition::new(
             "slash to focus title search without entering itself",
-            |state: &Observation| state.search.focused && state.search.query.is_empty(),
+            |state: &Observation| {
+                state.search.editing && state.search.focused && state.search.query.is_empty()
+            },
         ))?;
+    let _editor = story.anchor(SearchTarget::Editor)?;
 
     let _filtered = story
         .type_text(QUERY)?
@@ -1042,8 +1047,33 @@ fn verify_search_and_help(story: &mut Story<'_, '_, Observation>) -> Result<()> 
                     .collect::<BTreeSet<_>>();
                 state.search.query == QUERY
                     && state.search.valid
+                    && state.search.editing
                     && visible == BTreeSet::from([(Harness::Codex, INPUT), (Harness::Codex, TURN)])
             },
+        ))?;
+
+    let enter = story.session().key(Key::Return)?;
+    let _compacted = story
+        .reaction(enter)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "Enter to collapse the editor while preserving its filter",
+            |state: &Observation| {
+                state.search.query == QUERY
+                    && state.search.valid
+                    && !state.search.editing
+                    && !state.search.focused
+            },
+        ))?;
+    let _filter = story.anchor(SearchTarget::Filter)?;
+
+    let slash = story.session().key(Key::Character('/'))?;
+    let _refocused = story
+        .reaction(slash)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "slash to reopen the active filter for editing",
+            |state: &Observation| state.search.editing && state.search.focused,
         ))?;
 
     let _fail_open = story
@@ -1064,6 +1094,7 @@ fn verify_search_and_help(story: &mut Story<'_, '_, Observation>) -> Result<()> 
                 state.search.query.is_empty()
                     && state.search.valid
                     && !state.search.focused
+                    && !state.search.editing
                     && state.visible.len() == state.cards.len()
             },
         ))?;
@@ -1130,6 +1161,7 @@ fn verify_history(
             .then_some(())
         },
     )?;
+    verify_history_sorting(story)?;
     let capture = testbed.private_path("captures/wrangler-history.png")?;
     story.capture()?.save_png(&capture)?;
     testbed.retain_on_failure("captures/wrangler-history.png")?;
@@ -1147,6 +1179,86 @@ fn verify_history(
         "Live tab to return",
         |state: &Observation| state.tab == Tab::Live,
     ))?;
+    Ok(())
+}
+
+fn verify_history_sorting(story: &mut Story<'_, '_, Observation>) -> Result<()> {
+    sort_history(
+        story,
+        HistoryColumn::SessionId,
+        vec![(HistoryColumn::SessionId, SortDirection::Ascending)],
+        vec![UNSEEN, COLD],
+        "session sort to ascend",
+    )?;
+    sort_history(
+        story,
+        HistoryColumn::SessionId,
+        vec![(HistoryColumn::SessionId, SortDirection::Descending)],
+        vec![COLD, UNSEEN],
+        "session sort to descend",
+    )?;
+    sort_history(
+        story,
+        HistoryColumn::Turns,
+        vec![
+            (HistoryColumn::SessionId, SortDirection::Descending),
+            (HistoryColumn::Turns, SortDirection::Ascending),
+        ],
+        vec![COLD, UNSEEN],
+        "later stable sort to preserve the prior order within equal-turn runs",
+    )?;
+    sort_history(
+        story,
+        HistoryColumn::Turns,
+        vec![
+            (HistoryColumn::SessionId, SortDirection::Descending),
+            (HistoryColumn::Turns, SortDirection::Descending),
+        ],
+        vec![COLD, UNSEEN],
+        "turn sort to descend",
+    )?;
+    sort_history(
+        story,
+        HistoryColumn::Turns,
+        vec![(HistoryColumn::SessionId, SortDirection::Descending)],
+        vec![COLD, UNSEEN],
+        "turn sort to switch off without disturbing the remaining key",
+    )?;
+    sort_history(
+        story,
+        HistoryColumn::SessionId,
+        Vec::new(),
+        vec![UNSEEN, COLD],
+        "final sort to switch off and restore census order",
+    )
+}
+
+fn sort_history(
+    story: &mut Story<'_, '_, Observation>,
+    column: HistoryColumn,
+    sorts: Vec<(HistoryColumn, SortDirection)>,
+    order: Vec<&'static str>,
+    description: &'static str,
+) -> Result<()> {
+    let target = story.anchor(HistorySortTarget(column))?;
+    let click = story
+        .session()
+        .click(target.center().0, target.center().1, Button::Primary)?;
+    let _sorted = story
+        .reaction(click)
+        .within(input_reaction_budget())
+        .until(Condition::new(description, move |state: &Observation| {
+            state
+                .history_sorts
+                .iter()
+                .map(|sort| (sort.column, sort.direction))
+                .eq(sorts.iter().copied())
+                && state
+                    .history_order
+                    .iter()
+                    .map(String::as_str)
+                    .eq(order.iter().copied())
+        }))?;
     Ok(())
 }
 

@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "egui-test")]
-pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/16";
+pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/17";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -36,6 +36,24 @@ pub enum Work {
     Sleep,
     Done,
     Closed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoryColumn {
+    SessionId,
+    Name,
+    LastTurn,
+    Turns,
+    Size,
+    State,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SortDirection {
+    Ascending,
+    Descending,
 }
 
 #[cfg(feature = "egui-test")]
@@ -89,6 +107,8 @@ pub struct Observation {
     pub visible: Vec<CardKey>,
     pub cards: Vec<CardObservation>,
     pub history: Vec<HistoryObservation>,
+    pub history_order: Vec<String>,
+    pub history_sorts: Vec<HistorySortObservation>,
 }
 
 #[cfg(feature = "egui-test")]
@@ -107,6 +127,14 @@ pub struct SearchObservation {
     pub query: String,
     pub valid: bool,
     pub focused: bool,
+    pub editing: bool,
+}
+
+#[cfg(feature = "egui-test")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistorySortObservation {
+    pub column: HistoryColumn,
+    pub direction: SortDirection,
 }
 
 #[cfg(feature = "egui-test")]
@@ -134,6 +162,15 @@ pub struct WorkspaceTarget<'a>(pub Harness, pub &'a str);
 pub struct TabTarget(pub Tab);
 
 #[cfg(feature = "egui-test")]
+pub enum SearchTarget {
+    Editor,
+    Filter,
+}
+
+#[cfg(feature = "egui-test")]
+pub struct HistorySortTarget(pub HistoryColumn);
+
+#[cfg(feature = "egui-test")]
 pub struct HistoryTarget<'a>(pub &'a str, pub &'static str);
 
 #[cfg(feature = "egui-test")]
@@ -159,6 +196,34 @@ impl fmt::Display for TabTarget {
             match self.0 {
                 Tab::Live => "live",
                 Tab::Historical => "historical",
+            }
+        )
+    }
+}
+
+#[cfg(feature = "egui-test")]
+impl fmt::Display for SearchTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Editor => "search/editor",
+            Self::Filter => "search/filter",
+        })
+    }
+}
+
+#[cfg(feature = "egui-test")]
+impl fmt::Display for HistorySortTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "history/sort/{}",
+            match self.0 {
+                HistoryColumn::SessionId => "session-id",
+                HistoryColumn::Name => "name",
+                HistoryColumn::LastTurn => "last-turn",
+                HistoryColumn::Turns => "turns",
+                HistoryColumn::Size => "size",
+                HistoryColumn::State => "state",
             }
         )
     }

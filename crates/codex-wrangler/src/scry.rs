@@ -1,8 +1,12 @@
-use std::{collections::HashSet, ops::Range};
+use std::{cmp::Ordering, collections::HashSet, ops::Range};
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
-use crate::{history::Session, model::Card};
+use crate::{
+    contract::{HistoryColumn, SortDirection},
+    history::Session,
+    model::Card,
+};
 
 #[derive(Debug)]
 pub struct Hit {
@@ -62,16 +66,7 @@ impl Scry {
     }
 
     pub fn revise(&mut self, cards: &[Card]) {
-        if self.query.is_empty() {
-            self.matcher = None;
-            self.valid = true;
-        } else if let Ok(matcher) = Regex::new(&self.query) {
-            self.matcher = Some(matcher);
-            self.valid = true;
-        } else {
-            self.matcher = None;
-            self.valid = false;
-        }
+        (self.matcher, self.valid) = compile(&self.query);
         self.reconcile(cards);
     }
 
@@ -148,7 +143,14 @@ pub struct HistoryScry {
     matcher: Option<Regex>,
     valid: bool,
     hits: Vec<HistoryHit>,
+    sorts: Vec<HistorySort>,
     label: String,
+}
+
+#[derive(Clone, Copy)]
+struct HistorySort {
+    column: HistoryColumn,
+    direction: SortDirection,
 }
 
 impl Default for HistoryScry {
@@ -158,6 +160,7 @@ impl Default for HistoryScry {
             matcher: None,
             valid: true,
             hits: Vec::new(),
+            sorts: Vec::new(),
             label: "0 HISTORICAL SESSIONS".to_owned(),
         }
     }
@@ -184,17 +187,37 @@ impl HistoryScry {
         &self.label
     }
 
-    pub fn revise(&mut self, sessions: &[Session], live: &HashSet<String>) {
-        if self.query.is_empty() {
-            self.matcher = None;
-            self.valid = true;
-        } else if let Ok(matcher) = Regex::new(&self.query) {
-            self.matcher = Some(matcher);
-            self.valid = true;
-        } else {
-            self.matcher = None;
-            self.valid = false;
+    pub fn direction(&self, column: HistoryColumn) -> Option<SortDirection> {
+        self.sorts
+            .iter()
+            .find(|sort| sort.column == column)
+            .map(|sort| sort.direction)
+    }
+
+    #[cfg(feature = "egui-test")]
+    pub fn sorts(&self) -> impl Iterator<Item = (HistoryColumn, SortDirection)> + '_ {
+        self.sorts.iter().map(|sort| (sort.column, sort.direction))
+    }
+
+    pub fn cycle(&mut self, column: HistoryColumn, sessions: &[Session]) {
+        let direction = self.direction(column);
+        self.sorts.retain(|sort| sort.column != column);
+        match direction {
+            None => self.sorts.push(HistorySort {
+                column,
+                direction: SortDirection::Ascending,
+            }),
+            Some(SortDirection::Ascending) => self.sorts.push(HistorySort {
+                column,
+                direction: SortDirection::Descending,
+            }),
+            Some(SortDirection::Descending) => {}
         }
+        self.order(sessions);
+    }
+
+    pub fn revise(&mut self, sessions: &[Session], live: &HashSet<String>) {
+        (self.matcher, self.valid) = compile(&self.query);
         self.reconcile(sessions, live);
     }
 
@@ -228,6 +251,7 @@ impl HistoryScry {
             } else {
                 "INVALID REGEXP".to_owned()
             };
+            self.order(sessions);
             return;
         };
 
@@ -255,6 +279,16 @@ impl HistoryScry {
             });
         }
         self.label = format!("{} OF {} HISTORICAL SESSIONS", self.hits.len(), total);
+        self.order(sessions);
+    }
+
+    fn order(&mut self, sessions: &[Session]) {
+        self.hits.sort_by_key(HistoryHit::session);
+        for sort in &self.sorts {
+            self.hits.sort_by(|left, right| {
+                compare(&sessions[left.session], &sessions[right.session], *sort)
+            });
+        }
     }
 }
 
@@ -269,4 +303,62 @@ fn spans(matcher: &Regex, text: &str) -> Vec<Range<usize>> {
 fn history_label(count: usize) -> String {
     let noun = if count == 1 { "SESSION" } else { "SESSIONS" };
     format!("{count} HISTORICAL {noun}")
+}
+
+fn compile(query: &str) -> (Option<Regex>, bool) {
+    if query.is_empty() {
+        return (None, true);
+    }
+    match RegexBuilder::new(query).case_insensitive(true).build() {
+        Ok(matcher) => (Some(matcher), true),
+        Err(_) => (None, false),
+    }
+}
+
+fn compare(left: &Session, right: &Session, sort: HistorySort) -> Ordering {
+    let order = match sort.column {
+        HistoryColumn::SessionId => left.thread.cmp(&right.thread),
+        HistoryColumn::Name => {
+            return optional(
+                left.name.as_deref(),
+                right.name.as_deref(),
+                sort.direction,
+                folded,
+            );
+        }
+        HistoryColumn::LastTurn => left.updated_at_ms.cmp(&right.updated_at_ms),
+        HistoryColumn::Turns => {
+            return optional(left.turns, right.turns, sort.direction, Ord::cmp);
+        }
+        HistoryColumn::Size => left.bytes.cmp(&right.bytes),
+        HistoryColumn::State => left.archived.cmp(&right.archived),
+    };
+    directed(order, sort.direction)
+}
+
+fn optional<T>(
+    left: Option<T>,
+    right: Option<T>,
+    direction: SortDirection,
+    compare: impl FnOnce(&T, &T) -> Ordering,
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => directed(compare(&left, &right), direction),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn directed(order: Ordering, direction: SortDirection) -> Ordering {
+    match direction {
+        SortDirection::Ascending => order,
+        SortDirection::Descending => order.reverse(),
+    }
+}
+
+fn folded(left: &&str, right: &&str) -> Ordering {
+    left.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
 }

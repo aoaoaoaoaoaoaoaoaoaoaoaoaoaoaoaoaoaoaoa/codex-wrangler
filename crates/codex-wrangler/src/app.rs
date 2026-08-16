@@ -9,7 +9,8 @@ use std::{
 #[cfg(feature = "egui-test")]
 use crate::contract::{
     CardKey, CardObservation, CardTarget, DeleteGuard, Flight, GuideVisibility, HistoryObservation,
-    HistoryTarget, Observation, SearchObservation, Tab, TabTarget, UI_FINGERPRINT, WorkspaceTarget,
+    HistorySortObservation, HistorySortTarget, HistoryTarget, Observation, SearchObservation,
+    SearchTarget, Tab, TabTarget, UI_FINGERPRINT, WorkspaceTarget,
 };
 use brass_poolrooms::{
     chrome,
@@ -28,7 +29,7 @@ use eternalist_apps::{
 
 use crate::{
     commands::{Edict, Realm, SCRY_IDIOMS, canon},
-    contract::{Harness, Work},
+    contract::{Harness, HistoryColumn, SortDirection, Work},
     history::{
         Census as HistoryCensus, Nexus as HistoryNexus, Operation as HistoryOperation,
         Order as HistoryOrder, Session as HistorySession, spawn as spawn_history,
@@ -121,6 +122,10 @@ struct HistoryGesture {
 impl SearchFocus {
     const fn held(self) -> bool {
         matches!(self, Self::Held)
+    }
+
+    const fn editing(self) -> bool {
+        matches!(self, Self::Seeking | Self::Held)
     }
 }
 
@@ -405,10 +410,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let response = ui.add(
             egui::TextEdit::singleline(self.scry.edit())
                 .id(id)
-                .hint_text("/ SEARCH TITLES · REGEXP · NAMELESS USE PATH")
+                .hint_text("CASE-INSENSITIVE REGEXP · TITLES OR NAMELESS PATHS")
                 .text_color(color)
                 .desired_width(ui.available_width()),
         );
+        brass_poolrooms::poolroom_anchor!(ui, SearchTarget::Editor.to_string(), response.rect);
         if self.search_focus == SearchFocus::Seeking {
             response.request_focus();
         }
@@ -417,6 +423,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         } else {
             SearchFocus::Idle
         };
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            ui.ctx().request_discard("Search editor submitted");
+        }
         if response.changed() {
             let cards = self
                 .census
@@ -442,10 +451,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let response = ui.add(
             egui::TextEdit::singleline(self.history_scry.edit())
                 .id(id)
-                .hint_text("/ SEARCH SESSION NAMES OR IDS · REGEXP")
+                .hint_text("CASE-INSENSITIVE REGEXP · SESSION NAMES OR IDS")
                 .text_color(color)
                 .desired_width(ui.available_width()),
         );
+        brass_poolrooms::poolroom_anchor!(ui, SearchTarget::Editor.to_string(), response.rect);
         if self.search_focus == SearchFocus::Seeking {
             response.request_focus();
         }
@@ -454,6 +464,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         } else {
             SearchFocus::Idle
         };
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            ui.ctx().request_discard("Search editor submitted");
+        }
         if response.changed() {
             if let Some(live) = live_codex_threads(self.census.as_ref()) {
                 let sessions = self
@@ -533,6 +546,33 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     ui.ctx().request_discard("Wrangler tab changed");
                 }
             }
+            let (query, valid) = match self.page {
+                Page::Live => (self.scry.query(), self.scry.valid()),
+                Page::Historical => (self.history_scry.query(), self.history_scry.valid()),
+            };
+            if !self.search_focus.editing() && !query.is_empty() {
+                ui.add_space(10.0);
+                let filter = format!("FILTER · {query}");
+                let text = if valid {
+                    chrome::muted(filter).size(12.0)
+                } else {
+                    RichText::new(filter).size(12.0).color(RED)
+                };
+                let filter_rect = ui
+                    .add(
+                        egui::Label::new(text)
+                            .truncate()
+                            .show_tooltip_when_elided(false),
+                    )
+                    .rect;
+                brass_poolrooms::poolroom_anchor!(
+                    ui,
+                    SearchTarget::Filter.to_string(),
+                    filter_rect
+                );
+                #[cfg(not(feature = "egui-test"))]
+                let _ = filter_rect;
+            }
         });
     }
 
@@ -552,8 +592,10 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             )
             .show(ui, |ui| {
                 self.header(ui);
-                ui.add_space(7.0);
-                self.search_field(ui, search_id);
+                if self.search_focus.editing() {
+                    ui.add_space(7.0);
+                    self.search_field(ui, search_id);
+                }
                 ui.add_space(16.0);
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt("codex-gallery")
@@ -618,8 +660,10 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             )
             .show(ui, |ui| {
                 self.header(ui);
-                ui.add_space(7.0);
-                self.search_field(ui, search_id);
+                if self.search_focus.editing() {
+                    ui.add_space(7.0);
+                    self.search_field(ui, search_id);
+                }
                 if let Some(error) = &self.history_error {
                     ui.add_space(7.0);
                     let _error = ui.add(
@@ -644,7 +688,13 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 }
                 let width = ui.available_width();
                 let columns = HistoryColumns::fit(width);
-                history_header(ui, columns);
+                if let Some(column) =
+                    history_header(ui, columns, &self.history_scry, &mut self.water)
+                {
+                    let sessions = &self.history.as_ref().expect("history exists").sessions;
+                    self.history_scry.cycle(column, sessions);
+                    ui.ctx().request_discard("Historical order changed");
+                }
                 ui.add_space(4.0);
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt("codex-history")
@@ -844,6 +894,20 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     #[cfg(feature = "egui-test")]
+    fn search_observation(&self) -> SearchObservation {
+        let (query, valid) = match self.page {
+            Page::Live => (self.scry.query(), self.scry.valid()),
+            Page::Historical => (self.history_scry.query(), self.history_scry.valid()),
+        };
+        SearchObservation {
+            query: query.to_owned(),
+            valid,
+            focused: self.search_focus.held(),
+            editing: self.search_focus.editing(),
+        }
+    }
+
+    #[cfg(feature = "egui-test")]
     fn observation(&self) -> Observation {
         let live = live_codex_threads(self.census.as_ref());
         let history = live.as_ref().map_or_else(Vec::new, |live| {
@@ -858,6 +922,14 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     bytes: session.bytes,
                     archived: session.archived,
                 })
+                .collect()
+        });
+        let history_order = self.history.as_ref().map_or_else(Vec::new, |history| {
+            self.history_scry
+                .hits()
+                .iter()
+                .filter_map(|hit| history.sessions.get(hit.session()))
+                .map(|session| session.thread.clone())
                 .collect()
         });
         Observation {
@@ -879,11 +951,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             } else {
                 Flight::Grounded
             },
-            search: SearchObservation {
-                query: self.scry.query().to_owned(),
-                valid: self.scry.valid(),
-                focused: self.search_focus.held(),
-            },
+            search: self.search_observation(),
             guide: if self.guide.is_open() {
                 GuideVisibility::Open
             } else {
@@ -923,6 +991,12 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 })
                 .collect(),
             history,
+            history_order,
+            history_sorts: self
+                .history_scry
+                .sorts()
+                .map(|(column, direction)| HistorySortObservation { column, direction })
+                .collect(),
         }
     }
 }
@@ -1207,7 +1281,12 @@ struct HistoryRows {
     inspect: Vec<String>,
 }
 
-fn history_header(ui: &mut egui::Ui, columns: HistoryColumns) {
+fn history_header(
+    ui: &mut egui::Ui,
+    columns: HistoryColumns,
+    scry: &HistoryScry,
+    water: &mut Surface,
+) -> Option<HistoryColumn> {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), HISTORY_ROW), Sense::hover());
     let mut row = ui.new_child(
@@ -1217,24 +1296,70 @@ fn history_header(ui: &mut egui::Ui, columns: HistoryColumns) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     row.spacing_mut().item_spacing.x = 0.0;
-    for (width, label) in [
-        (columns.id, "SESSION ID"),
-        (columns.name, "NAME"),
-        (columns.date, "LAST TURN"),
-        (columns.turns, "TURNS"),
-        (columns.size, "SIZE"),
-        (columns.state, "STATE"),
-        (columns.action, ""),
-        (columns.delete, ""),
+    let mut selected = None;
+    for (width, label, column) in [
+        (columns.id, "SESSION ID", HistoryColumn::SessionId),
+        (columns.name, "NAME", HistoryColumn::Name),
+        (columns.date, "LAST TURN", HistoryColumn::LastTurn),
+        (columns.turns, "TURNS", HistoryColumn::Turns),
+        (columns.size, "SIZE", HistoryColumn::Size),
+        (columns.state, "STATE", HistoryColumn::State),
     ] {
-        history_cell(&mut row, width, |ui| {
-            let _label = ui.label(chrome::eyebrow(label).size(11.0));
-        });
+        if history_sort_cell(
+            &mut row,
+            width,
+            label,
+            column,
+            scry.direction(column),
+            water,
+        ) {
+            selected = Some(column);
+        }
+    }
+    for width in [columns.action, columns.delete] {
+        history_cell(&mut row, width, |_| {});
     }
     ui.painter().line_segment(
         [rect.left_bottom(), rect.right_bottom()],
         Stroke::new(1.0, chrome::EDGE_STRONG),
     );
+    selected
+}
+
+fn history_sort_cell(
+    row: &mut egui::Ui,
+    width: f32,
+    label: &'static str,
+    column: HistoryColumn,
+    direction: Option<SortDirection>,
+    water: &mut Surface,
+) -> bool {
+    let mut clicked = false;
+    history_cell(row, width, |ui| {
+        let label = match direction {
+            Some(SortDirection::Ascending) => format!("{label} ↑"),
+            Some(SortDirection::Descending) => format!("{label} ↓"),
+            None => label.to_owned(),
+        };
+        let mut text = chrome::eyebrow(label).size(11.0);
+        if direction.is_some() {
+            text = text.color(chrome::HOT);
+        }
+        let response = ui.add_sized(
+            [ui.available_width(), ui.available_height()],
+            egui::Label::new(text).sense(Sense::click()),
+        );
+        chrome::shallow_tension(ui, &response);
+        brass_poolrooms::poolroom_anchor!(ui, HistorySortTarget(column).to_string(), response.rect);
+        if response.hovered() {
+            water.hover(("history-sort", column), response.rect);
+        }
+        clicked = response.clicked();
+        if clicked {
+            water.click(response.rect);
+        }
+    });
+    clicked
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -31,7 +31,9 @@ const EDICTS: [CommandSpec<Edict, Realm>; 1] = [CommandSpec::new(
     "Search current tab",
     CommandScope::Context(Realm::Gallery),
 )
-.with_detail("Live searches names or nameless paths; Historical searches names and session IDs.")
+.with_detail(
+    "Case-insensitive regexp. Live searches names or nameless paths; Historical searches names and session IDs.",
+)
 .with_default_shortcuts(&SCRY_KEYS)];
 
 pub fn canon() -> &'static CommandCanon<Edict, Realm> {
