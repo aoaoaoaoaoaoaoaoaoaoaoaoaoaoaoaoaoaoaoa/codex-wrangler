@@ -1179,14 +1179,10 @@ fn verify_history(
     story: &mut Story<'_, '_, Observation>,
     index: &Path,
 ) -> Result<()> {
-    let historical = story.anchor(TabTarget(Tab::Historical))?;
-    let opened = story.session().click(
-        historical.center().0,
-        historical.center().1,
-        Button::Primary,
-    )?;
+    story.session().focus()?;
+    let opened = story.session().key(Key::Tab)?;
     let _opened = story.reaction(opened).until(Condition::new(
-        "historical tab to open",
+        "physical Tab to open Historical",
         |state: &Observation| state.tab == Tab::Historical,
     ))?;
     let _indexed = story.wait_stable(
@@ -1225,12 +1221,9 @@ fn verify_history(
     verify_history_archive_roundtrip(story, index)?;
     verify_history_deletion(story, index)?;
 
-    let live = story.anchor(TabTarget(Tab::Live))?;
-    let returned = story
-        .session()
-        .click(live.center().0, live.center().1, Button::Primary)?;
+    let returned = story.session().key(Key::Tab)?;
     let _returned = story.reaction(returned).until(Condition::new(
-        "Live tab to return",
+        "physical Tab to return to Live",
         |state: &Observation| state.tab == Tab::Live,
     ))?;
     Ok(())

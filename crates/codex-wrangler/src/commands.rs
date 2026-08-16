@@ -16,13 +16,20 @@ pub enum Realm {
 }
 
 const SCRY_KEYS: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Slash)];
+const TAB: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Tab)];
 const ESCAPE: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Escape)];
+const NAVIGATION_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
+    "Switch tab",
+    "Cycles Live and Historical.",
+    &TAB,
+)];
 const SCRY_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
     "Clear search",
     "Clears the current tab's filter without hiding Wrangler.",
     &ESCAPE,
 )];
 
+pub const NAVIGATION_IDIOMS: GuideSection = GuideSection::new("NAVIGATION", &NAVIGATION_GESTURES);
 pub const SCRY_IDIOMS: GuideSection = GuideSection::new("SEARCH", &SCRY_GESTURES);
 
 const EDICTS: [CommandSpec<Edict, Realm>; 1] = [CommandSpec::new(

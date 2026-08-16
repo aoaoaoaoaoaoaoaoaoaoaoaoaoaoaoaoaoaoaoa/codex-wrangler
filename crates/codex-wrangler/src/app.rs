@@ -15,7 +15,7 @@ use crate::contract::{
 };
 use brass_poolrooms::{
     chrome,
-    chrome::MechanismSize,
+    chrome::{MechanismSize, SortDetent, SortToggle},
     water::{Domain, Floor, Frame as WaterFrame, Poke, Surface, Wetness},
 };
 use egui::{
@@ -29,7 +29,7 @@ use eternalist_apps::{
 };
 
 use crate::{
-    commands::{Edict, Realm, SCRY_IDIOMS, canon},
+    commands::{Edict, NAVIGATION_IDIOMS, Realm, SCRY_IDIOMS, canon},
     contract::{Harness, HistoryColumn, SortDirection, Work},
     history::{
         Census as HistoryCensus, Nexus as HistoryNexus, Operation as HistoryOperation,
@@ -111,6 +111,13 @@ impl Page {
         match self {
             Self::Live => "LIVE",
             Self::Historical => "HISTORICAL",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Live => Self::Historical,
+            Self::Historical => Self::Live,
         }
     }
 }
@@ -398,6 +405,41 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         self.search_focus = SearchFocus::Releasing;
     }
 
+    fn select_page(&mut self, page: Page, ctx: &egui::Context) {
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+        self.search_focus = SearchFocus::Releasing;
+        ctx.request_discard("Wrangler tab changed");
+    }
+
+    fn seize_shortcuts(&mut self, ui: &mut egui::Ui, search_id: egui::Id, modal_open: bool) {
+        let help_invoked = !modal_open && self.guide.take_shortcuts(ui.ctx());
+        if !modal_open
+            && !help_invoked
+            && !self.guide.is_open()
+            && let Some(CommandDispatch::Invoke(Edict::Scry)) =
+                canon().route(ui.ctx(), &[Realm::Gallery], |_| CommandStatus::Enabled)
+        {
+            self.search_focus = SearchFocus::Seeking;
+        }
+        if !modal_open
+            && !help_invoked
+            && !self.guide.is_open()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            self.select_page(self.page.next(), ui.ctx());
+        }
+        if !modal_open
+            && !self.guide.is_open()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.clear_search();
+            ui.memory_mut(|memory| memory.surrender_focus(search_id));
+        }
+    }
+
     fn search_field(&mut self, ui: &mut egui::Ui, id: egui::Id) {
         match self.page {
             Page::Live => self.live_search_field(ui, id),
@@ -561,9 +603,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 }
                 if response.clicked() && self.page != page {
                     self.water.click(response.rect);
-                    self.page = page;
-                    self.search_focus = SearchFocus::Releasing;
-                    ui.ctx().request_discard("Wrangler tab changed");
+                    self.select_page(page, ui.ctx());
                 }
             }
             let (query, valid) = match self.page {
@@ -1055,22 +1095,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
             self.search_focus = SearchFocus::Idle;
         }
         let modal_open = self.delete_target.is_some();
-        let help_invoked = !modal_open && self.guide.take_shortcuts(ui.ctx());
-        if !modal_open
-            && !help_invoked
-            && !self.guide.is_open()
-            && let Some(CommandDispatch::Invoke(Edict::Scry)) =
-                canon().route(ui.ctx(), &[Realm::Gallery], |_| CommandStatus::Enabled)
-        {
-            self.search_focus = SearchFocus::Seeking;
-        }
-        if !modal_open
-            && !self.guide.is_open()
-            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-        {
-            self.clear_search();
-            ui.memory_mut(|memory| memory.surrender_focus(search_id));
-        }
+        self.seize_shortcuts(ui, search_id, modal_open);
         let basin = ui.max_rect();
         let jiggling = !modal_open
             && self.page == Page::Live
@@ -1121,7 +1146,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
                 Page::Historical => "HISTORICAL",
             },
             |_| CommandStatus::Enabled,
-            &[SCRY_IDIOMS],
+            &[NAVIGATION_IDIOMS, SCRY_IDIOMS],
         );
         let stable_pointer = match self.page {
             Page::Live => self.hovered.is_none(),
@@ -1359,32 +1384,42 @@ fn history_sort_cell(
     direction: Option<SortDirection>,
     water: &mut Surface,
 ) -> bool {
-    let mut clicked = false;
+    let mut changed = false;
     history_cell(row, width, |ui| {
-        let label = match direction {
-            Some(SortDirection::Ascending) => format!("{label} ↑"),
-            Some(SortDirection::Descending) => format!("{label} ↓"),
-            None => label.to_owned(),
+        let mut detent = match direction {
+            Some(SortDirection::Ascending) => SortDetent::Ascending,
+            Some(SortDirection::Descending) => SortDetent::Descending,
+            None => SortDetent::Off,
         };
         let mut text = chrome::eyebrow(label).size(11.0);
         if direction.is_some() {
             text = text.color(chrome::HOT);
         }
-        let response = ui.add_sized(
-            [ui.available_width(), ui.available_height()],
-            egui::Label::new(text).sense(Sense::click()),
-        );
-        chrome::shallow_tension(ui, &response);
+        let side = MechanismSize::Small.side();
+        let gap = 4.0;
+        let label_width = (ui.available_width() - side - gap).max(0.0);
+        let response = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                let _label = ui.add_sized(
+                    [label_width, side],
+                    egui::Label::new(text)
+                        .truncate()
+                        .show_tooltip_when_elided(false),
+                );
+                SortToggle::new(&mut detent)
+                    .size(MechanismSize::Small)
+                    .show(ui)
+            })
+            .inner;
         brass_poolrooms::poolroom_anchor!(ui, HistorySortTarget(column).to_string(), response.rect);
         if response.hovered() {
             water.hover(("history-sort", column), response.rect);
         }
-        clicked = response.clicked();
-        if clicked {
-            water.click(response.rect);
-        }
+        water.sort_toggle(&response);
+        changed = response.changed();
     });
-    clicked
+    changed
 }
 
 #[allow(clippy::too_many_arguments)]
