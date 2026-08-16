@@ -67,9 +67,8 @@ const fn rank(work: Work) -> u8 {
         Work::Input => 1,
         Work::Goal => 2,
         Work::Turn => 3,
-        Work::Sleep => 4,
-        Work::Done => 5,
-        Work::Closed => 6,
+        Work::Sleep | Work::Done => 4,
+        Work::Closed => 5,
     }
 }
 
@@ -86,5 +85,30 @@ mod tests {
     #[test]
     fn preview_contraction_is_unicode_safe_and_whitespace_canonical() {
         assert_eq!(snip("  alpha\n βeta   gamma ", 8), "alpha βe…");
+    }
+
+    #[test]
+    fn stopped_live_sessions_share_recency_while_closed_remains_last() {
+        let card = |thread: &str, work, updated_at_ms| Card {
+            harness: Harness::Codex,
+            thread: thread.to_owned(),
+            name: None,
+            cwd: "/work".to_owned(),
+            tile_preview: String::new(),
+            work,
+            window: (work != Work::Closed).then_some(1),
+            workspace: None,
+            updated_at_ms,
+        };
+        let mut cards = [
+            card("old-sleep", Work::Sleep, 10),
+            card("new-done", Work::Done, 20),
+            card("newest-closed", Work::Closed, 30),
+        ];
+        cards.sort();
+        assert_eq!(
+            cards.map(|card| card.thread),
+            ["new-done", "old-sleep", "newest-closed"]
+        );
     }
 }

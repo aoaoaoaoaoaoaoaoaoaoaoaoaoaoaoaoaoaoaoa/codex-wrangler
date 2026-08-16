@@ -22,7 +22,8 @@ mod terminal_fixture;
 #[path = "../../codex-wrangler/src/contract.rs"]
 mod contract;
 use contract::{
-    CardKey, CardTarget, Flight, Harness, Observation, UI_FINGERPRINT, Work, WorkspaceTarget,
+    CardKey, CardTarget, DeleteGuard, Flight, GuideVisibility, Harness, HistoryTarget, Observation,
+    Tab, TabTarget, UI_FINGERPRINT, Work, WorkspaceTarget,
 };
 
 const GOAL: &str = "10000000-0000-7000-8000-000000000001";
@@ -36,6 +37,7 @@ const ROTATE: &str = "80000000-0000-7000-8000-000000000008";
 const DORMANT: &str = "90000000-0000-7000-8000-000000000009";
 const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
 const ERROR: &str = "b0000000-0000-7000-8000-00000000000b";
+const COLD: &str = "c0000000-0000-7000-8000-00000000000c";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
 const FUNCTIONAL_ACCEPTANCE_ENV: &str = "CODEX_WRANGLER_FUNCTIONAL_ACCEPTANCE";
@@ -877,6 +879,8 @@ fn verify_gallery(
         },
     )?;
     verify_census(&frame.state)?;
+    verify_search_and_help(story)?;
+    verify_history(testbed, story, &fixture.index)?;
     verify_permission_title_events(testbed, story)?;
     verify_workspace_badges(story)?;
     verify_fear_geometry(story)?;
@@ -928,6 +932,14 @@ fn verify_census(state: &Observation) -> Result<()> {
         "Codex Wrangler witness fingerprint drifted",
     )?;
     demand(!state.loading, "settled census still reports loading")?;
+    demand(
+        state.search.query.is_empty()
+            && state.search.valid
+            && !state.search.focused
+            && state.guide == GuideVisibility::Closed
+            && state.visible.len() == state.cards.len(),
+        "settled gallery did not begin with an unfiltered, unfocused search",
+    )?;
     let states = state
         .cards
         .iter()
@@ -1002,6 +1014,253 @@ fn verify_census(state: &Observation) -> Result<()> {
         ),
     ]);
     demand(states == expected, format!("wrong card census: {states:?}"))
+}
+
+fn verify_search_and_help(story: &mut Story<'_, '_, Observation>) -> Result<()> {
+    const QUERY: &str = "Awaiting verdict|^/work/turn$";
+
+    story.session().focus()?;
+    let slash = story.session().key(Key::Character('/'))?;
+    let _focused = story
+        .reaction(slash)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "slash to focus title search without entering itself",
+            |state: &Observation| state.search.focused && state.search.query.is_empty(),
+        ))?;
+
+    let _filtered = story
+        .type_text(QUERY)?
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "regexp to match a named title and one anonymous path",
+            |state: &Observation| {
+                let visible = state
+                    .visible
+                    .iter()
+                    .map(|card| (card.harness, card.thread.as_str()))
+                    .collect::<BTreeSet<_>>();
+                state.search.query == QUERY
+                    && state.search.valid
+                    && visible == BTreeSet::from([(Harness::Codex, INPUT), (Harness::Codex, TURN)])
+            },
+        ))?;
+
+    let _fail_open = story
+        .replace_focused_text("[")?
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "invalid regexp to remain explicit without erasing the roster",
+            |state: &Observation| !state.search.valid && state.visible.len() == state.cards.len(),
+        ))?;
+
+    let escape = story.session().key(Key::Escape)?;
+    let _cleared = story
+        .reaction(escape)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "Escape to clear search without concealing Wrangler",
+            |state: &Observation| {
+                state.search.query.is_empty()
+                    && state.search.valid
+                    && !state.search.focused
+                    && state.visible.len() == state.cards.len()
+            },
+        ))?;
+
+    let question = story.session().key(Key::Character('?'))?;
+    let _opened = story
+        .reaction(question)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "question mark to open generated command help",
+            |state: &Observation| state.guide == GuideVisibility::Open,
+        ))?;
+    let close = story.session().key(Key::Escape)?;
+    let _closed = story
+        .reaction(close)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "Escape to close generated command help without concealing Wrangler",
+            |state: &Observation| {
+                state.guide == GuideVisibility::Closed && state.search.query.is_empty()
+            },
+        ))?;
+    Ok(())
+}
+
+fn verify_history(
+    testbed: &Testbed,
+    story: &mut Story<'_, '_, Observation>,
+    index: &Path,
+) -> Result<()> {
+    let historical = story.anchor(TabTarget(Tab::Historical))?;
+    let opened = story.session().click(
+        historical.center().0,
+        historical.center().1,
+        Button::Primary,
+    )?;
+    let _opened = story.reaction(opened).until(Condition::new(
+        "historical tab to open",
+        |state: &Observation| state.tab == Tab::Historical,
+    ))?;
+    let _indexed = story.wait_stable(
+        Duration::from_secs(12),
+        Duration::from_millis(250),
+        "disk history to be counted and partitioned from Live",
+        |frame| {
+            let ids = frame
+                .state
+                .history
+                .iter()
+                .map(|session| session.thread.as_str())
+                .collect::<BTreeSet<_>>();
+            (ids == BTreeSet::from([UNSEEN, COLD])
+                && frame
+                    .state
+                    .history
+                    .iter()
+                    .all(|session| session.turns == Some(2) && session.bytes > 0)
+                && frame
+                    .state
+                    .history
+                    .iter()
+                    .find(|session| session.thread == COLD)
+                    .is_some_and(|session| session.archived))
+            .then_some(())
+        },
+    )?;
+    let capture = testbed.private_path("captures/wrangler-history.png")?;
+    story.capture()?.save_png(&capture)?;
+    testbed.retain_on_failure("captures/wrangler-history.png")?;
+    if let Some(destination) = env::var_os("CODEX_WRANGLER_HISTORY_CAPTURE") {
+        fs::copy(&capture, destination).map_err(io_verdict("export history capture"))?;
+    }
+    verify_history_archive_roundtrip(story, index)?;
+    verify_history_deletion(story, index)?;
+
+    let live = story.anchor(TabTarget(Tab::Live))?;
+    let returned = story
+        .session()
+        .click(live.center().0, live.center().1, Button::Primary)?;
+    let _returned = story.reaction(returned).until(Condition::new(
+        "Live tab to return",
+        |state: &Observation| state.tab == Tab::Live,
+    ))?;
+    Ok(())
+}
+
+fn verify_history_archive_roundtrip(
+    story: &mut Story<'_, '_, Observation>,
+    index: &Path,
+) -> Result<()> {
+    click_history(story, UNSEEN, "archive")?;
+    vacate_history(story)?;
+    let _archived = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(150),
+        "historical session to archive and compress",
+        |frame| {
+            (thread_archived(index, UNSEEN) == Some(true)
+                && frame
+                    .state
+                    .history
+                    .iter()
+                    .find(|session| session.thread == UNSEEN)
+                    .is_some_and(|session| session.archived))
+            .then_some(())
+        },
+    )?;
+    click_history(story, UNSEEN, "unarchive")?;
+    vacate_history(story)?;
+    let _unarchived = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(150),
+        "historical session to unarchive from compressed storage",
+        |frame| {
+            (thread_archived(index, UNSEEN) == Some(false)
+                && frame
+                    .state
+                    .history
+                    .iter()
+                    .find(|session| session.thread == UNSEEN)
+                    .is_some_and(|session| !session.archived))
+            .then_some(())
+        },
+    )?;
+    Ok(())
+}
+
+fn verify_history_deletion(story: &mut Story<'_, '_, Observation>, index: &Path) -> Result<()> {
+    click_history(story, COLD, "delete")?;
+    let _prompt = story.wait(Condition::new(
+        "historical deletion to demand confirmation",
+        |state: &Observation| state.delete_prompt.as_deref() == Some(COLD),
+    ))?;
+    let _settled = story.wait_stable(
+        Duration::from_secs(2),
+        Duration::from_millis(120),
+        "deletion confirmation geometry to settle",
+        |frame| (frame.state.delete_prompt.as_deref() == Some(COLD)).then_some(()),
+    )?;
+    click_history(story, COLD, "confirm-future")?;
+    let _unguarded = story.wait(Condition::new(
+        "future deletion confirmation to be disabled",
+        |state: &Observation| state.delete_guard == DeleteGuard::Bypassed,
+    ))?;
+    let enter = story.session().key(Key::Return)?;
+    let _confirmed = story.reaction(enter).until(Condition::new(
+        "Enter to confirm permanent deletion",
+        |state: &Observation| state.delete_prompt.is_none(),
+    ))?;
+    vacate_history(story)?;
+    let _deleted = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(150),
+        "deleted session to leave disk history",
+        |frame| {
+            (!frame
+                .state
+                .history
+                .iter()
+                .any(|session| session.thread == COLD)
+                && thread_archived(index, COLD).is_none())
+            .then_some(())
+        },
+    )?;
+    click_history(story, "preferences", "confirm-delete")?;
+    let _reguarded = story.wait(Condition::new(
+        "delete confirmation to remain reversibly configurable",
+        |state: &Observation| state.delete_guard == DeleteGuard::Armed,
+    ))?;
+    Ok(())
+}
+
+fn click_history(
+    story: &mut Story<'_, '_, Observation>,
+    thread: &str,
+    action: &'static str,
+) -> Result<()> {
+    let target = story.anchor(HistoryTarget(thread, action))?;
+    let clicked = story
+        .session()
+        .click(target.center().0, target.center().1, Button::Primary)?;
+    let _witnessed = story
+        .reaction(clicked)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "historical control click to reach the application",
+            |state: &Observation| state.tab == Tab::Historical,
+        ))?;
+    Ok(())
+}
+
+fn vacate_history(story: &mut Story<'_, '_, Observation>) -> Result<()> {
+    let target = story.anchor(TabTarget(Tab::Historical))?;
+    let _moved = story
+        .session()
+        .move_to(target.center().0, target.center().1)?;
+    Ok(())
 }
 
 fn verify_workspace_badges(story: &mut Story<'_, '_, Observation>) -> Result<()> {
@@ -1349,6 +1608,8 @@ impl Fixture {
     fn forge(testbed: &Testbed, binary: &Path) -> Result<Self> {
         let codex = testbed.create_private_dir("home/.codex/sessions/2026/08/03")?;
         let [goal, turn, done, input, permission, rotate, _dormant, error] = seed_rollouts(&codex)?;
+        let archive = testbed.create_private_dir("home/.codex/archived_sessions")?;
+        seed_historical(&codex, &archive)?;
         let db_path = testbed.private_path("home/.codex/state_5.sqlite")?;
         seed_index(&db_path)?;
         let goals = testbed.private_path("home/.codex/goals_1.sqlite")?;
@@ -1598,12 +1859,32 @@ fi
 
 operation=$1
 thread=$2
-if [ "$operation" = unarchive ]; then
-  rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
-  destination=/test/home/.codex/sessions/2026/08/03/${{rollout##*/}}
-  mv "$rollout" "$destination"
-  sqlite3 "$db" "UPDATE threads SET archived = 0, rollout_path = '$destination' WHERE id = '$thread'"
-fi
+case $operation in
+  archive)
+    rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+    destination=/test/home/.codex/archived_sessions/${{rollout##*/}}
+    mv "$rollout" "$destination"
+    sqlite3 "$db" "UPDATE threads SET archived = 1, rollout_path = '$destination' WHERE id = '$thread'"
+    printf '%s\n' "$operation" > "/test/${{operation}}-proof-${{thread}}"
+    exit 0
+    ;;
+  unarchive)
+    rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+    destination=/test/home/.codex/sessions/2026/08/03/${{rollout##*/}}
+    mv "$rollout" "$destination"
+    sqlite3 "$db" "UPDATE threads SET archived = 0, rollout_path = '$destination' WHERE id = '$thread'"
+    printf '%s\n' "$operation" > "/test/${{operation}}-proof-${{thread}}"
+    exit 0
+    ;;
+  delete)
+    thread=$3
+    rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+    rm -f "$rollout"
+    sqlite3 "$db" "DELETE FROM threads WHERE id = '$thread'"
+    printf '%s\n' "$operation" > "/test/${{operation}}-proof-${{thread}}"
+    exit 0
+    ;;
+esac
 workspace=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused).num')
 printf '%s\n' "$operation $workspace" > "/test/${{operation}}-proof-${{thread}}"
 rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
@@ -1755,6 +2036,21 @@ fn seed_index(path: &Path) -> Result<()> {
          );",
     )
     .map_err(verdict("declare fixture thread index"))?;
+    seed_thread_rows(&db)?;
+    db.execute(
+        "UPDATE threads SET archived = 1 WHERE id = ?1",
+        params![DORMANT],
+    )
+    .map_err(verdict("oppose Codex archive state to Wrangler closure"))?;
+    db.execute(
+        "UPDATE threads SET archived = 1 WHERE id = ?1",
+        params![COLD],
+    )
+    .map_err(verdict("archive cold historical session"))?;
+    Ok(())
+}
+
+fn seed_thread_rows(db: &Connection) -> Result<()> {
     for row in [
         (
             GOAL,
@@ -1822,11 +2118,21 @@ fn seed_index(path: &Path) -> Result<()> {
         ),
         (
             UNSEEN,
-            "Forbidden historical thread",
-            Some("Never enumerate me"),
-            "/test/work/dormant",
+            "Historical thread",
+            Some("Dust ledger"),
+            "/test/work/history",
             7,
             rollout_test_path(UNSEEN, "unseen"),
+        ),
+        (
+            COLD,
+            "Cold historical thread",
+            None,
+            "/test/work/history",
+            6,
+            format!(
+                "/test/home/.codex/archived_sessions/rollout-2026-08-03T00-00-00-cold-{COLD}.jsonl"
+            ),
         ),
     ] {
         let _inserted = db
@@ -1839,11 +2145,31 @@ fn seed_index(path: &Path) -> Result<()> {
             )
             .map_err(verdict("seed fixture thread"))?;
     }
-    db.execute(
-        "UPDATE threads SET archived = 1 WHERE id = ?1",
-        params![DORMANT],
-    )
-    .map_err(verdict("oppose Codex archive state to Wrangler closure"))?;
+    Ok(())
+}
+
+fn seed_historical(sessions: &Path, archive: &Path) -> Result<()> {
+    for (path, first, second) in [
+        (
+            rollout(sessions, UNSEEN, "unseen"),
+            "task_started",
+            "turn_started",
+        ),
+        (
+            archive.join(format!("rollout-2026-08-03T00-00-00-cold-{COLD}.jsonl")),
+            "task_started",
+            "task_started",
+        ),
+    ] {
+        fs::write(
+            path,
+            format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"{first}\"}}}}\n\
+                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"{second}\"}}}}\n"
+            ),
+        )
+        .map_err(io_verdict("write historical rollout"))?;
+    }
     Ok(())
 }
 
