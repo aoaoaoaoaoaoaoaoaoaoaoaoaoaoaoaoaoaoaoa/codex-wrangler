@@ -22,6 +22,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use eternalist_apps::NativeWake;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
+use semver::Version;
 
 use crate::{
     codex_rpc::CodexRpc,
@@ -582,27 +583,37 @@ impl Recon {
     fn select_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
         if card.work == Work::Closed {
             let active = self.active_account("bind resumed Codex login");
-            return self.summon_codex(&card.thread, card.workspace, active);
+            let version = inspect_codex_version("inspect installed Codex version");
+            return self.summon_codex(&card.thread, card.workspace, active, version);
         }
         let window = card.window.expect("live Codex card owns a window");
         if card.work == Work::Done {
             let codex = self.codex.as_mut().context("Codex adapter is absent")?;
             let home = codex.home.clone();
             let active = inspect_account(&home, "inspect current Codex login");
+            let version = inspect_codex_version("inspect installed Codex version");
             let rotated = active.as_ref().is_some_and(|active| {
                 codex
                     .roster
                     .get(&card.thread)
                     .is_some_and(|session| session.account.rotated_to(active))
             });
-            if rotated {
+            let superseded = version.as_ref().is_some_and(|installed| {
+                codex
+                    .roster
+                    .get(&card.thread)
+                    .and_then(|session| session.cli_version.as_deref())
+                    .and_then(|session| Version::parse(session).ok())
+                    .is_some_and(|session| session < *installed)
+            });
+            if rotated || superseded {
                 let seat = self
                     .codex_seats
                     .get(&card.thread)
                     .copied()
                     .context("live Codex card has no process seat")?;
                 self.retire(seat, now)?;
-                return self.summon_codex(&card.thread, card.workspace, active);
+                return self.summon_codex(&card.thread, card.workspace, active, version);
             }
         }
         self.activate(window, now)
@@ -658,6 +669,7 @@ impl Recon {
         thread_id: &str,
         workspace: Option<u32>,
         active: Option<AccountMark>,
+        version: Option<Version>,
     ) -> Result<bool> {
         let codex = self.codex.as_mut().context("Codex adapter is absent")?;
         let session = codex
@@ -711,6 +723,9 @@ impl Recon {
         if let Some(active) = active {
             codex.roster.bind(thread_id, active);
         }
+        if let Some(version) = version {
+            codex.roster.bind_version(thread_id, &version.to_string());
+        }
         codex.commit()?;
         Ok(true)
     }
@@ -726,6 +741,29 @@ fn inspect_account(home: &Path, operation: &str) -> Option<AccountMark> {
         .and_then(|mut rpc| rpc.account())
         .map_err(|error| eprintln!("codex-wrangler could not {operation}: {error:#}"))
         .ok()
+}
+
+fn inspect_codex_version(operation: &str) -> Option<Version> {
+    installed_codex_version()
+        .map_err(|error| eprintln!("codex-wrangler could not {operation}: {error:#}"))
+        .ok()
+}
+
+fn installed_codex_version() -> Result<Version> {
+    let output = Command::new("codex")
+        .arg("--version")
+        .output()
+        .context("run `codex --version`")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`codex --version` exited with {}",
+        output.status
+    );
+    let output = std::str::from_utf8(&output.stdout).context("decode `codex --version`")?;
+    output
+        .split_ascii_whitespace()
+        .find_map(|word| Version::parse(word.trim_start_matches('v')).ok())
+        .context("find semantic version in `codex --version`")
 }
 
 fn wait_dead(process: ProcessKey, timeout: Duration) -> bool {
@@ -842,6 +880,7 @@ impl Codex {
             preview: &preview,
             updated_at_ms: thread.updated_at_ms,
             workspace,
+            cli_version: thread.cli_version.as_deref(),
             account: summary.account,
         });
         Ok(Some((
@@ -963,7 +1002,7 @@ impl Codex {
             .db
             .query_row(
                 "SELECT id, NULLIF(TRIM(name), ''), cwd, updated_at_ms, \
-                 thread_source, source, agent_role, rollout_path \
+                 thread_source, source, agent_role, rollout_path, cli_version \
                  FROM threads WHERE id = ?1",
                 params![id],
                 |row| {
@@ -976,13 +1015,23 @@ impl Codex {
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         PathBuf::from(row.get::<_, String>(7)?),
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
             .optional()
             .with_context(|| format!("query Codex thread `{id}`"))?;
-        let Some((id, name, cwd, updated_at_ms, thread_source, source, agent_role, rollout)) =
-            thread
+        let Some((
+            id,
+            name,
+            cwd,
+            updated_at_ms,
+            thread_source,
+            source,
+            agent_role,
+            rollout,
+            cli_version,
+        )) = thread
         else {
             return Ok(None);
         };
@@ -995,6 +1044,7 @@ impl Codex {
             cwd,
             updated_at_ms,
             rollout,
+            cli_version: (!cli_version.trim().is_empty()).then_some(cli_version),
         }))
     }
 }
@@ -1069,6 +1119,7 @@ struct Thread {
     cwd: PathBuf,
     updated_at_ms: i64,
     rollout: PathBuf,
+    cli_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

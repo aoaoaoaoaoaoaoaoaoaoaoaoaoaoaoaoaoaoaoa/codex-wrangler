@@ -95,6 +95,8 @@ pub struct SeenSession {
     pub preview: String,
     pub updated_at_ms: i64,
     pub workspace: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
     #[serde(default, skip_serializing_if = "AccountMark::is_empty")]
     pub account: AccountMark,
 }
@@ -112,6 +114,7 @@ pub struct Sighting<'a> {
     pub preview: &'a str,
     pub updated_at_ms: i64,
     pub workspace: Option<u32>,
+    pub cli_version: Option<&'a str>,
     pub account: Option<AccountMark>,
 }
 
@@ -139,6 +142,7 @@ impl Roster {
             preview: sighting.preview.to_owned(),
             updated_at_ms: sighting.updated_at_ms,
             workspace: sighting.workspace,
+            cli_version: sighting.cli_version.map(str::to_owned),
             account: sighting.account.unwrap_or_default(),
         };
         if let Some(session) = self.sessions.get_mut(sighting.thread) {
@@ -148,6 +152,9 @@ impl Roster {
             session.preview = candidate.preview;
             session.updated_at_ms = candidate.updated_at_ms;
             session.workspace = candidate.workspace.or(session.workspace);
+            if session.cli_version.is_none() {
+                session.cli_version = candidate.cli_version;
+            }
             session.account.absorb(candidate.account);
             self.dirty |= *session != prior;
         } else {
@@ -161,6 +168,15 @@ impl Roster {
             && session.account != account
         {
             session.account = account;
+            self.dirty = true;
+        }
+    }
+
+    pub fn bind_version(&mut self, thread: &str, version: &str) {
+        if let Some(session) = self.sessions.get_mut(thread)
+            && session.cli_version.as_deref() != Some(version)
+        {
+            session.cli_version = Some(version.to_owned());
             self.dirty = true;
         }
     }
@@ -262,6 +278,7 @@ mod tests {
             preview: "Still.",
             updated_at_ms: 7,
             workspace: Some(4),
+            cli_version: Some("0.147.0"),
             account: Some(quota(1_000_000)),
         });
         roster.commit().expect("seal roster");
@@ -330,6 +347,7 @@ mod tests {
             preview: "",
             updated_at_ms: 0,
             workspace: None,
+            cli_version: None,
             account: None,
         });
         roster.commit().expect("seal sighting");

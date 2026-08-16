@@ -542,6 +542,23 @@ fn verify_session_lifecycle(
         "reopening a closed session mutated Codex archive state",
     )?;
 
+    select_and_return(
+        testbed,
+        story,
+        app,
+        DONE,
+        &fixture.version_resume,
+        &fixture.roster,
+    )?;
+    demand(
+        fs::read_to_string(&fixture.version_resume).is_ok_and(|proof| proof.trim() == "resume 7"),
+        "superseded Codex session did not roll onto the installed version",
+    )?;
+    demand(
+        read_roster(&fixture.roster)?["sessions"][DONE]["cli_version"] == "0.147.0",
+        "rolled session did not bind its launched Codex version",
+    )?;
+
     shift_click_card(story, DONE)?;
     let closed = wait_card(story, DONE, |card| card.work == Work::Closed)?;
     demand(
@@ -1751,6 +1768,7 @@ struct Fixture {
     preferences: PathBuf,
     index: PathBuf,
     rotate_resume: PathBuf,
+    version_resume: PathBuf,
     dormant_resume: PathBuf,
 }
 
@@ -1769,9 +1787,9 @@ impl Fixture {
         seed_names(testbed)?;
         let state = testbed.write_private("xdg/state/codex-wrangler/window-mode", b"tiled\n")?;
         let roster = seed_roster(testbed)?;
-        let preferences = testbed.private_path("xdg/state/codex-wrangler/preferences.json")?;
-        let _rotate_work = testbed.create_private_dir("work/rotate")?;
-        let _dormant_work = testbed.create_private_dir("work/dormant")?;
+        for work in ["rotate", "dormant", "done"] {
+            let _work = testbed.create_private_dir(format!("work/{work}"))?;
+        }
         let (claude, prime) = seed_foreign_transcripts(testbed)?;
 
         let fake = forge_fake_harness(testbed)?;
@@ -1851,9 +1869,10 @@ impl Fixture {
             floating_proof,
             state,
             roster,
-            preferences,
+            preferences: testbed.private_path("xdg/state/codex-wrangler/preferences.json")?,
             index: db_path,
             rotate_resume,
+            version_resume: testbed.private_path(format!("resume-proof-{DONE}"))?,
             dormant_resume,
         })
     }
@@ -1994,6 +2013,10 @@ fn forge_fake_cli(testbed: &Testbed) -> Result<PathBuf> {
         format!(
             r#"#!/bin/bash
 db=/test/home/.codex/state_5.sqlite
+if [ "${{1:-}}" = --version ]; then
+  printf '%s\n' 'codex-cli 0.147.0'
+  exit 0
+fi
 if [ "${{1:-}}" = app-server ]; then
   while IFS= read -r request; do
     id=$(printf '%s\n' "$request" | jq -r '.id // empty')
@@ -2200,11 +2223,17 @@ fn seed_index(path: &Path) -> Result<()> {
            id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT, cwd TEXT NOT NULL,
            updated_at_ms INTEGER NOT NULL, thread_source TEXT, source TEXT NOT NULL,
            agent_role TEXT, rollout_path TEXT NOT NULL,
+           cli_version TEXT NOT NULL DEFAULT '0.147.0',
            archived INTEGER NOT NULL DEFAULT 0
          );",
     )
     .map_err(verdict("declare fixture thread index"))?;
     seed_thread_rows(&db)?;
+    db.execute(
+        "UPDATE threads SET cli_version = '0.146.0' WHERE id = ?1",
+        params![DONE],
+    )
+    .map_err(verdict("seed superseded Codex version"))?;
     db.execute(
         "UPDATE threads SET archived = 1 WHERE id = ?1",
         params![DORMANT],
@@ -2240,7 +2269,7 @@ fn seed_thread_rows(db: &Connection) -> Result<()> {
             DONE,
             "Prompt-derived done title",
             None,
-            "/work/done",
+            "/test/work/done",
             10,
             rollout_test_path(DONE, "done"),
         ),
