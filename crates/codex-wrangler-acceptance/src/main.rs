@@ -40,6 +40,7 @@ const UNSEEN: &str = "a0000000-0000-7000-8000-00000000000a";
 const ERROR: &str = "b0000000-0000-7000-8000-00000000000b";
 const COLD: &str = "c0000000-0000-7000-8000-00000000000c";
 const FRESH: &str = "d0000000-0000-7000-8000-00000000000d";
+const RENAMED_HISTORY: &str = "Copper archive";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
 const FUNCTIONAL_ACCEPTANCE_ENV: &str = "CODEX_WRANGLER_FUNCTIONAL_ACCEPTANCE";
@@ -889,6 +890,32 @@ fn thread_archived(index: &Path, thread: &str) -> Option<bool> {
         .ok()
 }
 
+fn thread_name(index: &Path, thread: &str) -> Option<String> {
+    Connection::open(index)
+        .ok()?
+        .query_row(
+            "SELECT name FROM threads WHERE id = ?1",
+            params![thread],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+fn legacy_thread_name(index: &Path, thread: &str) -> Option<String> {
+    fs::read_to_string(index.parent()?.join("session_index.jsonl"))
+        .ok()?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record.get("id").and_then(Value::as_str) == Some(thread))
+        .filter_map(|record| {
+            record
+                .get("thread_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .next_back()
+}
+
 fn wrangler_count(testbed: &Testbed) -> Result<Option<usize>> {
     match testbed
         .x11()?
@@ -1263,6 +1290,7 @@ fn verify_history(
             .then_some(())
         },
     )?;
+    verify_history_rename(story, index)?;
     verify_history_sorting(story)?;
     let capture = testbed.private_path("captures/wrangler-history.png")?;
     story.capture()?.save_png(&capture)?;
@@ -1279,6 +1307,94 @@ fn verify_history(
         |state: &Observation| state.tab == Tab::Live,
     ))?;
     Ok(())
+}
+
+fn verify_history_rename(story: &mut Story<'_, '_, Observation>, index: &Path) -> Result<()> {
+    let _opened = story
+        .tap(
+            HistoryTarget(UNSEEN, "rename"),
+            Button::Primary,
+            Motion::default(),
+        )?
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "historical pencil to arm its in-situ name editor",
+            |state: &Observation| {
+                state.history_rename.as_ref().is_some_and(|rename| {
+                    rename.thread == UNSEEN && rename.draft == "Dust ledger" && rename.focused
+                })
+            },
+        ))?;
+    let cancelled = story.session().key(Key::Escape)?;
+    let _cancelled = story
+        .reaction(cancelled)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "Escape to cancel the historical name editor",
+            |state: &Observation| state.history_rename.is_none(),
+        ))?;
+    let _reopened = story
+        .tap(
+            HistoryTarget(UNSEEN, "rename"),
+            Button::Primary,
+            Motion::default(),
+        )?
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "historical pencil to restore the cancelled editor",
+            |state: &Observation| {
+                state
+                    .history_rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.thread == UNSEEN && rename.focused)
+            },
+        ))?;
+    let _typed = story
+        .replace_text(
+            HistoryTarget(UNSEEN, "rename-field"),
+            RENAMED_HISTORY,
+            Condition::new(
+                "historical name editor to retain focus",
+                |state: &Observation| {
+                    state
+                        .history_rename
+                        .as_ref()
+                        .is_some_and(|rename| rename.thread == UNSEEN && rename.focused)
+                },
+            ),
+        )?
+        .next_frame()?;
+    let committed = story.session().key(Key::Return)?;
+    let _committed = story
+        .reaction(committed)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "Enter to submit the historical session name",
+            |state: &Observation| state.history_rename.is_none(),
+        ))?;
+    vacate_history(story)?;
+    let _renamed = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(120),
+        "Codex metadata rename to return through the historical index",
+        |frame| {
+            frame
+                .state
+                .history
+                .iter()
+                .find(|session| session.thread == UNSEEN)
+                .filter(|session| session.name.as_deref() == Some(RENAMED_HISTORY))
+                .map(|_| ())
+        },
+    )?;
+    demand(
+        thread_name(index, UNSEEN).as_deref() == Some(RENAMED_HISTORY),
+        "rename witness advanced before canonical Codex metadata",
+    )?;
+    demand(
+        legacy_thread_name(index, UNSEEN).as_deref() == Some(RENAMED_HISTORY),
+        "Codex rename omitted its legacy session-name projection",
+    )
 }
 
 fn verify_history_sorting(story: &mut Story<'_, '_, Observation>) -> Result<()> {
@@ -2178,6 +2294,18 @@ if [ "${{1:-}}" = app-server ]; then
         ;;
       account/rateLimits/read)
         printf '%s\n' '{{"id":'$id',"result":{{"rateLimits":{{"limitId":"codex","primary":{{"usedPercent":1,"windowDurationMins":10080,"resetsAt":{NEW_RESET}}}}},"rateLimitsByLimitId":{{}}}}}}'
+        ;;
+      thread/name/set)
+        thread=$(printf '%s\n' "$request" | jq -r '.params.threadId')
+        name=$(printf '%s\n' "$request" | jq -r '.params.name')
+        quoted=$(printf '%s' "$name" | sed "s/'/''/g")
+        changed=$(sqlite3 "$db" "UPDATE threads SET name = '$quoted' WHERE id = '$thread' AND archived = 0; SELECT changes();")
+        if [ "$changed" = 1 ]; then
+          jq -nc --arg id "$thread" --arg name "$name" '{{id:$id,thread_name:$name}}' >> /test/home/.codex/session_index.jsonl
+          printf '%s\n' '{{"id":'$id',"result":{{}}}}'
+        else
+          printf '%s\n' '{{"id":'$id',"error":{{"code":-32602,"message":"thread cannot be renamed"}}}}'
+        fi
         ;;
       thread/archive)
         thread=$(printf '%s\n' "$request" | jq -r '.params.threadId')

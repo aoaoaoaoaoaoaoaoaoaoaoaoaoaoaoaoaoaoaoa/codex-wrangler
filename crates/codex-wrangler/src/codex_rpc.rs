@@ -98,6 +98,14 @@ impl CodexRpc {
         Ok(AccountMark::current(digest, quotas))
     }
 
+    pub fn rename_thread(&mut self, thread: &str, name: &str) -> Result<()> {
+        let _renamed = self.request(
+            "thread/name/set",
+            &json!({ "threadId": thread, "name": name }),
+        )?;
+        Ok(())
+    }
+
     fn request(&mut self, method: &str, params: &Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);

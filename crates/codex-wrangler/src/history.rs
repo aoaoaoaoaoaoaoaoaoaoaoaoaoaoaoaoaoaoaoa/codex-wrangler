@@ -25,7 +25,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{names::NameIndex, state, watchfire::Watchfire};
+use crate::{codex_rpc::CodexRpc, names::NameIndex, state, watchfire::Watchfire};
 
 const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 const LEDGER_SETTLE: Duration = Duration::from_secs(2);
@@ -71,6 +71,7 @@ pub enum Operation {
     Archive,
     Unarchive,
     Delete,
+    Rename,
 }
 
 impl Operation {
@@ -79,14 +80,50 @@ impl Operation {
             Self::Archive => "ARCHIVING…",
             Self::Unarchive => "UNARCHIVING…",
             Self::Delete => "DELETING…",
+            Self::Rename => "RENAMING…",
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Order {
-    pub thread: String,
-    pub operation: Operation,
+pub enum Order {
+    Archive(String),
+    Unarchive(String),
+    Delete(String),
+    Rename { thread: String, name: String },
+}
+
+impl Order {
+    pub fn operate(thread: String, operation: Operation) -> Self {
+        match operation {
+            Operation::Archive => Self::Archive(thread),
+            Operation::Unarchive => Self::Unarchive(thread),
+            Operation::Delete => Self::Delete(thread),
+            Operation::Rename => unreachable!("rename orders require a name"),
+        }
+    }
+
+    pub const fn rename(thread: String, name: String) -> Self {
+        Self::Rename { thread, name }
+    }
+
+    pub const fn thread(&self) -> &String {
+        match self {
+            Self::Archive(thread)
+            | Self::Unarchive(thread)
+            | Self::Delete(thread)
+            | Self::Rename { thread, .. } => thread,
+        }
+    }
+
+    pub const fn operation(&self) -> Operation {
+        match self {
+            Self::Archive(_) => Operation::Archive,
+            Self::Unarchive(_) => Operation::Unarchive,
+            Self::Delete(_) => Operation::Delete,
+            Self::Rename { .. } => Operation::Rename,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -727,11 +764,19 @@ impl Historian {
     }
 
     fn operate(&mut self, order: &Order) -> Result<()> {
-        match order.operation {
-            Operation::Archive => self.archive(&order.thread),
-            Operation::Unarchive => self.unarchive(&order.thread),
-            Operation::Delete => self.delete(&order.thread),
+        match order {
+            Order::Archive(thread) => self.archive(thread),
+            Order::Unarchive(thread) => self.unarchive(thread),
+            Order::Delete(thread) => self.delete(thread),
+            Order::Rename { thread, name } => self.rename(thread, name),
         }
+    }
+
+    fn rename(&self, thread: &str, name: &str) -> Result<()> {
+        let (archived, _) = self.row(thread)?.context("historical session vanished")?;
+        anyhow::ensure!(!archived, "archived sessions cannot be renamed");
+        anyhow::ensure!(!name.trim().is_empty(), "session name must not be empty");
+        CodexRpc::open(&self.home)?.rename_thread(thread, name)
     }
 
     fn archive(&self, thread: &str) -> Result<()> {

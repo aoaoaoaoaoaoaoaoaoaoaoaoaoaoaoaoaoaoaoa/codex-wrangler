@@ -9,9 +9,9 @@ use std::{
 #[cfg(feature = "egui-test")]
 use crate::contract::{
     CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, GuideVisibility,
-    HistoryObservation, HistorySortObservation, HistorySortTarget, HistoryTarget,
-    HistoryTranscriptObservation, Observation, PreferenceTarget, SearchObservation, SearchTarget,
-    Tab, TabTarget, UI_FINGERPRINT, WorkspaceTarget,
+    HistoryObservation, HistoryRenameObservation, HistorySortObservation, HistorySortTarget,
+    HistoryTarget, HistoryTranscriptObservation, Observation, PreferenceTarget, SearchObservation,
+    SearchTarget, Tab, TabTarget, UI_FINGERPRINT, WorkspaceTarget,
 };
 use brass_poolrooms::{
     chrome,
@@ -132,6 +132,22 @@ enum HistoryAction {
     Inspect(String),
     Open(String),
     Operate(HistoryGesture),
+    BeginRename {
+        thread: String,
+        name: String,
+        rect: egui::Rect,
+    },
+    CommitRename {
+        thread: String,
+        name: String,
+    },
+    CancelRename,
+}
+
+struct HistoryRename {
+    thread: String,
+    text: String,
+    seize_focus: bool,
 }
 
 struct TranscriptView {
@@ -197,6 +213,7 @@ struct Wrangler<const START_FLOATING: bool> {
     history_requested: HashSet<(String, i64)>,
     history_pending: HashMap<String, HistoryOperation>,
     history_error: Option<String>,
+    history_rename: Option<HistoryRename>,
     delete_target: Option<String>,
     transcript: Option<TranscriptView>,
     page: Page,
@@ -284,6 +301,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             history_requested: HashSet::new(),
             history_pending: HashMap::new(),
             history_error: None,
+            history_rename: None,
             delete_target: None,
             transcript: None,
             page: Page::Live,
@@ -300,6 +318,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         self.visibility = GalleryVisibility::Concealed;
         self.jiggling = false;
         self.jolts.clear();
+        self.history_rename = None;
         self.transcript = None;
         self.water.reset();
         self.water.set_wetness(Wetness::Dry);
@@ -378,12 +397,13 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     fn reap_history_outcomes(&mut self) -> bool {
         let mut changed = false;
         for outcome in self.historian.take_outcomes() {
-            let _prior = self.history_pending.remove(&outcome.order.thread);
+            let thread = outcome.order.thread();
+            let _prior = self.history_pending.remove(thread);
             self.history_error = outcome.error.map(|error| {
                 format!(
                     "{} {} FAILED · {error}",
-                    outcome.order.operation.present_participle(),
-                    outcome.order.thread
+                    outcome.order.operation().present_participle(),
+                    outcome.order.thread()
                 )
             });
             changed = true;
@@ -459,11 +479,18 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             return;
         }
         self.page = page;
+        self.history_rename = None;
         self.search_focus = SearchFocus::Releasing;
         ctx.request_discard("Wrangler tab changed");
     }
 
     fn seize_shortcuts(&mut self, ui: &mut egui::Ui, search_id: egui::Id, modal_open: bool) {
+        if self.history_rename.is_some() {
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.history_rename = None;
+            }
+            return;
+        }
         let help_invoked = !modal_open && self.guide.take_shortcuts(ui.ctx());
         if !modal_open
             && !help_invoked
@@ -797,9 +824,13 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 }
                 let width = ui.available_width();
                 let columns = HistoryColumns::fit(width);
-                if let Some(column) =
-                    history_header(ui, columns, &self.history_scry, &mut self.water)
-                {
+                if let Some(column) = history_header(
+                    ui,
+                    columns,
+                    &self.history_scry,
+                    self.history_rename.is_none(),
+                    &mut self.water,
+                ) {
                     let sessions = &self.history.as_ref().expect("history exists").sessions;
                     self.history_scry.cycle(column, sessions);
                     ui.ctx().request_discard("Historical order changed");
@@ -821,6 +852,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                                 rows,
                                 columns,
                                 &self.history_pending,
+                                &mut self.history_rename,
                                 &mut self.water,
                                 &mut self.history_hovered,
                             );
@@ -884,12 +916,14 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     fn submit_history(&mut self, order: HistoryOrder) {
-        if self.history_pending.contains_key(&order.thread) {
+        let thread = order.thread().clone();
+        let operation = order.operation();
+        if self.history_pending.contains_key(&thread) {
             return;
         }
-        if self.historian.courier().order(order.clone()).is_ok() {
+        if self.historian.courier().order(order).is_ok() {
             self.history_error = None;
-            let _prior = self.history_pending.insert(order.thread, order.operation);
+            let _prior = self.history_pending.insert(thread, operation);
         }
     }
 
@@ -913,6 +947,19 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 intent: Intent::Open,
             }),
             HistoryAction::Operate(gesture) => self.accept_history_gesture(gesture),
+            HistoryAction::BeginRename { thread, name, rect } => {
+                self.history_rename = Some(HistoryRename {
+                    thread,
+                    text: name,
+                    seize_focus: true,
+                });
+                self.water.click(rect);
+            }
+            HistoryAction::CommitRename { thread, name } => {
+                self.history_rename = None;
+                self.submit_history(HistoryOrder::rename(thread, name));
+            }
+            HistoryAction::CancelRename => self.history_rename = None,
         }
     }
 
@@ -920,10 +967,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         if gesture.operation == HistoryOperation::Delete && self.preferences.confirm_deletion() {
             self.delete_target = Some(gesture.thread);
         } else {
-            self.submit_history(HistoryOrder {
-                thread: gesture.thread,
-                operation: gesture.operation,
-            });
+            self.submit_history(HistoryOrder::operate(gesture.thread, gesture.operation));
         }
     }
 
@@ -1124,10 +1168,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             });
         if delete {
             self.delete_target = None;
-            self.submit_history(HistoryOrder {
-                thread,
-                operation: HistoryOperation::Delete,
-            });
+            self.submit_history(HistoryOrder::operate(thread, HistoryOperation::Delete));
         } else if cancel || modal.should_close() {
             self.delete_target = None;
         }
@@ -1189,7 +1230,18 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     #[cfg(feature = "egui-test")]
-    fn observation(&self) -> Observation {
+    fn rename_observation(&self, focused: bool) -> Option<HistoryRenameObservation> {
+        self.history_rename
+            .as_ref()
+            .map(|rename| HistoryRenameObservation {
+                thread: rename.thread.clone(),
+                draft: rename.text.clone(),
+                focused,
+            })
+    }
+
+    #[cfg(feature = "egui-test")]
+    fn observation(&self, text_edit_focused: bool) -> Observation {
         let live = live_codex_threads(self.census.as_ref());
         let history = live.as_ref().map_or_else(Vec::new, |live| {
             self.history
@@ -1277,6 +1329,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 })
                 .collect(),
             history,
+            history_rename: self.rename_observation(text_edit_focused),
             history_transcript: self.transcript_observation(),
             history_order,
             history_sorts: self
@@ -1370,7 +1423,8 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
             Page::Historical => self.history_hovered.is_none(),
         };
         let mut changed = history_outcome;
-        if stable_pointer && !jiggling && !self.search_focus.held() {
+        if stable_pointer && !jiggling && !self.search_focus.held() && self.history_rename.is_none()
+        {
             changed |= self.drain();
             changed |= self.drain_history();
         }
@@ -1471,8 +1525,8 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
     type Observation = Observation;
 
     #[cfg(feature = "egui-test")]
-    fn observe(&self, _text_edit_focused: bool) -> Self::Observation {
-        self.observation()
+    fn observe(&self, text_edit_focused: bool) -> Self::Observation {
+        self.observation(text_edit_focused)
     }
 }
 
@@ -1545,6 +1599,7 @@ fn transcript_turn(ui: &mut egui::Ui, turn: &HistoryTurn) {
 #[derive(Clone, Copy)]
 struct HistoryColumns {
     id: f32,
+    rename: f32,
     name: f32,
     date: f32,
     turns: f32,
@@ -1557,9 +1612,10 @@ struct HistoryColumns {
 
 impl HistoryColumns {
     fn fit(width: f32) -> Self {
-        const FIXED: f32 = 270.0 + 136.0 + 58.0 + 82.0 + 96.0 + 72.0 + 104.0 + 42.0;
+        const FIXED: f32 = 270.0 + 28.0 + 136.0 + 58.0 + 82.0 + 96.0 + 72.0 + 104.0 + 42.0;
         Self {
             id: 270.0,
+            rename: 28.0,
             name: (width - FIXED).max(120.0),
             date: 136.0,
             turns: 58.0,
@@ -1581,6 +1637,7 @@ fn history_header(
     ui: &mut egui::Ui,
     columns: HistoryColumns,
     scry: &HistoryScry,
+    enabled: bool,
     water: &mut Surface,
 ) -> Option<HistoryColumn> {
     let (rect, _) =
@@ -1607,9 +1664,13 @@ fn history_header(
             label,
             column,
             scry.direction(column),
+            enabled,
             water,
         ) {
             selected = Some(column);
+        }
+        if column == HistoryColumn::SessionId {
+            history_cell(&mut row, columns.rename, |_| {});
         }
     }
     for width in [columns.open, columns.action, columns.delete] {
@@ -1628,6 +1689,7 @@ fn history_sort_cell(
     label: &'static str,
     column: HistoryColumn,
     direction: Option<SortDirection>,
+    enabled: bool,
     water: &mut Surface,
 ) -> bool {
     let mut changed = false;
@@ -1645,21 +1707,24 @@ fn history_sort_cell(
         let gap = 4.0;
         let label_width = (ui.available_width() - side - gap).max(0.0);
         let response = ui
-            .horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                let _label = ui.add_sized(
-                    [label_width, side],
-                    egui::Label::new(text)
-                        .truncate()
-                        .show_tooltip_when_elided(false),
-                );
-                SortToggle::new(&mut detent)
-                    .size(MechanismSize::Small)
-                    .show(ui)
+            .add_enabled_ui(enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    let _label = ui.add_sized(
+                        [label_width, side],
+                        egui::Label::new(text)
+                            .truncate()
+                            .show_tooltip_when_elided(false),
+                    );
+                    SortToggle::new(&mut detent)
+                        .size(MechanismSize::Small)
+                        .show(ui)
+                })
+                .inner
             })
             .inner;
         brass_poolrooms::poolroom_anchor!(ui, HistorySortTarget(column).to_string(), response.rect);
-        if response.hovered() {
+        if enabled && response.hovered() {
             water.hover(("history-sort", column), response.rect);
         }
         water.sort_toggle(&response);
@@ -1676,6 +1741,7 @@ fn history_rows(
     rows: std::ops::Range<usize>,
     columns: HistoryColumns,
     pending: &HashMap<String, HistoryOperation>,
+    rename: &mut Option<HistoryRename>,
     water: &mut Surface,
     hovered: &mut Option<String>,
 ) -> HistoryRows {
@@ -1696,6 +1762,7 @@ fn history_rows(
                     hit,
                     columns,
                     pending.get(&session.thread).copied(),
+                    rename,
                     water,
                     hovered,
                 )
@@ -1716,6 +1783,7 @@ fn history_row(
     hit: &HistoryHit,
     columns: HistoryColumns,
     flight: Option<HistoryOperation>,
+    rename: &mut Option<HistoryRename>,
     water: &mut Surface,
     hovered: &mut Option<String>,
 ) -> Option<HistoryAction> {
@@ -1737,17 +1805,20 @@ fn history_row(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     row.spacing_mut().item_spacing.x = 0.0;
-    history_facts(&mut row, session, hit, columns);
-    let mut action = history_open(&mut row, session, columns.open, flight, water)
-        .or_else(|| {
-            history_operation(&mut row, session, columns.action, flight, water)
-                .map(HistoryAction::Operate)
-        })
-        .or_else(|| {
-            history_delete(&mut row, session, columns.delete, flight, water)
-                .map(HistoryAction::Operate)
-        });
-    if response.clicked() && action.is_none() {
+    let editing = rename.is_some();
+    let mut action = history_facts(&mut row, session, hit, columns, flight, rename, water);
+    if action.is_none() {
+        action = history_open(&mut row, session, columns.open, flight, editing, water);
+    }
+    if action.is_none() {
+        action = history_operation(&mut row, session, columns.action, flight, editing, water)
+            .map(HistoryAction::Operate);
+    }
+    if action.is_none() {
+        action = history_delete(&mut row, session, columns.delete, flight, editing, water)
+            .map(HistoryAction::Operate);
+    }
+    if response.clicked() && action.is_none() && !editing {
         water.click(rect);
         action = Some(HistoryAction::Inspect(session.thread.clone()));
     }
@@ -1772,21 +1843,25 @@ fn history_facts(
     session: &HistorySession,
     hit: &HistoryHit,
     columns: HistoryColumns,
-) {
+    flight: Option<HistoryOperation>,
+    rename: &mut Option<HistoryRename>,
+    water: &mut Surface,
+) -> Option<HistoryAction> {
     history_cell(row, columns.id, |ui| {
         let _id = history_marked_label(ui, &session.thread, hit.id_spans(), chrome::MUTED, 11.0);
     });
-    history_cell(row, columns.name, |ui| {
-        if let Some(name) = session.name.as_deref() {
-            let _name = history_marked_label(ui, name, hit.name_spans(), chrome::TEXT, 13.0);
-        } else {
-            let _anonymous = ui.add(
-                egui::Label::new(RichText::new("anonymous").size(11.0).color(chrome::MUTED))
-                    .truncate()
-                    .show_tooltip_when_elided(false),
-            );
-        }
-    });
+    let mut action = history_rename_control(
+        row,
+        session,
+        columns.rename,
+        flight,
+        rename.is_some(),
+        water,
+    );
+    let name_action = history_name(row, session, hit, columns.name, rename, water);
+    if action.is_none() {
+        action = name_action;
+    }
     history_cell(row, columns.date, |ui| {
         let _date = ui.label(
             RichText::new(&session.last_turn)
@@ -1821,6 +1896,118 @@ fn history_facts(
         };
         let _state = ui.label(RichText::new(label).size(11.0).color(color));
     });
+    action
+}
+
+fn history_rename_control(
+    row: &mut egui::Ui,
+    session: &HistorySession,
+    width: f32,
+    flight: Option<HistoryOperation>,
+    editing: bool,
+    water: &mut Surface,
+) -> Option<HistoryAction> {
+    let mut action = None;
+    history_cell(row, width, |ui| {
+        if session.archived {
+            return;
+        }
+        let rename = ui
+            .add_enabled_ui(!editing && flight.is_none(), |ui| {
+                chrome::Monoglyph::symbol(chrome::Symbol::Rename)
+                    .size(MechanismSize::Small)
+                    .show(ui)
+            })
+            .inner
+            .on_hover_text("Rename this session");
+        water.monoglyph(&rename);
+        brass_poolrooms::poolroom_anchor!(
+            ui,
+            HistoryTarget(&session.thread, "rename").to_string(),
+            rename.rect
+        );
+        if rename.clicked() {
+            action = Some(HistoryAction::BeginRename {
+                thread: session.thread.clone(),
+                name: session.name.clone().unwrap_or_default(),
+                rect: rename.rect,
+            });
+        }
+    });
+    action
+}
+
+fn history_name(
+    row: &mut egui::Ui,
+    session: &HistorySession,
+    hit: &HistoryHit,
+    width: f32,
+    rename: &mut Option<HistoryRename>,
+    water: &mut Surface,
+) -> Option<HistoryAction> {
+    let mut action = None;
+    history_cell(row, width, |ui| {
+        let Some(draft) = rename
+            .as_mut()
+            .filter(|draft| draft.thread == session.thread)
+        else {
+            if let Some(name) = session.name.as_deref() {
+                let _name = history_marked_label(ui, name, hit.name_spans(), chrome::TEXT, 13.0);
+            } else {
+                let _anonymous = ui.add(
+                    egui::Label::new(RichText::new("anonymous").size(11.0).color(chrome::MUTED))
+                        .truncate()
+                        .show_tooltip_when_elided(false),
+                );
+            }
+            return;
+        };
+
+        let before = draft.text.clone();
+        let valid = !draft.text.trim().is_empty();
+        let edit = ui.add_sized(
+            [ui.available_width(), 24.0],
+            egui::TextEdit::singleline(&mut draft.text)
+                .font(egui::TextStyle::Monospace)
+                .hint_text("session name")
+                .text_color(if valid { chrome::TEXT } else { RED }),
+        );
+        brass_poolrooms::poolroom_anchor!(
+            ui,
+            HistoryTarget(&session.thread, "rename-field").to_string(),
+            edit.rect
+        );
+        if draft.seize_focus {
+            edit.request_focus();
+            draft.seize_focus = false;
+            ui.ctx().request_repaint();
+        }
+        if let Some(wake) = chrome::text_wake(ui, &edit, &before, &draft.text) {
+            water.text(wake);
+        }
+        let focused = edit.has_focus();
+        let relinquished = edit.lost_focus();
+        let (enter, escape) = ui.input(|input| {
+            (
+                (focused || relinquished) && input.key_pressed(egui::Key::Enter),
+                focused && input.key_pressed(egui::Key::Escape),
+            )
+        });
+        let name = draft.text.trim();
+        if enter && !name.is_empty() {
+            action = if session.name.as_deref() == Some(name) {
+                Some(HistoryAction::CancelRename)
+            } else {
+                Some(HistoryAction::CommitRename {
+                    thread: session.thread.clone(),
+                    name: name.to_owned(),
+                })
+            };
+        } else if escape || relinquished {
+            action = Some(HistoryAction::CancelRename);
+        }
+    });
+    action
 }
 
 fn history_open(
@@ -1828,12 +2015,13 @@ fn history_open(
     session: &HistorySession,
     width: f32,
     flight: Option<HistoryOperation>,
+    editing: bool,
     water: &mut Surface,
 ) -> Option<HistoryAction> {
     let mut clicked = false;
     history_cell(row, width, |ui| {
         let response = ui.add_enabled(
-            flight.is_none(),
+            !editing && flight.is_none(),
             egui::Button::new(RichText::new("OPEN").size(11.0)).min_size(Vec2::new(60.0, 24.0)),
         );
         chrome::shallow_tension(ui, &response);
@@ -1855,6 +2043,7 @@ fn history_operation(
     session: &HistorySession,
     width: f32,
     flight: Option<HistoryOperation>,
+    editing: bool,
     water: &mut Surface,
 ) -> Option<HistoryGesture> {
     let operation = if session.archived {
@@ -1868,12 +2057,12 @@ fn history_operation(
             || match operation {
                 HistoryOperation::Archive => "ARCHIVE",
                 HistoryOperation::Unarchive => "UNARCHIVE",
-                HistoryOperation::Delete => unreachable!(),
+                HistoryOperation::Delete | HistoryOperation::Rename => unreachable!(),
             },
             HistoryOperation::present_participle,
         );
         let response = ui.add_enabled(
-            flight.is_none(),
+            !editing && flight.is_none(),
             egui::Button::new(RichText::new(label).size(11.0)).min_size(Vec2::new(92.0, 24.0)),
         );
         chrome::shallow_tension(ui, &response);
@@ -1906,12 +2095,13 @@ fn history_delete(
     session: &HistorySession,
     width: f32,
     flight: Option<HistoryOperation>,
+    editing: bool,
     water: &mut Surface,
 ) -> Option<HistoryGesture> {
     let mut clicked = false;
     history_cell(row, width, |ui| {
         let response = ui.add_enabled(
-            flight.is_none(),
+            !editing && flight.is_none(),
             egui::Button::new(RichText::new("×").size(19.0).strong().color(RED))
                 .min_size(Vec2::new(32.0, 26.0))
                 .stroke(Stroke::new(1.2, RED)),
