@@ -491,23 +491,10 @@ fn verify_session_lifecycle(
     story: &mut Story<'_, '_, Observation>,
     fixture: &Fixture,
 ) -> Result<()> {
-    let state = read_roster(&fixture.roster)?;
-    let sessions = state["sessions"]
-        .as_object()
-        .ok_or_else(|| TesterError::Verdict {
-            detail: "known-session state omitted its session map".to_owned(),
-        })?;
-    demand(
-        sessions.contains_key(DORMANT) && !sessions.contains_key(UNSEEN),
-        "Wrangler did not preserve its remembered session boundary",
-    )?;
-    demand(
-        thread_archived(&fixture.index, DORMANT) == Some(true),
-        "fixture did not oppose Codex archive state to Wrangler closure",
-    )?;
-
+    verify_remembrance(fixture)?;
+    verify_history_open(testbed, story)?;
     verify_management_veto(story, fixture)?;
-
+    fork_and_return(testbed, story, app, fixture)?;
     select_and_return(
         testbed,
         story,
@@ -595,6 +582,71 @@ fn verify_session_lifecycle(
             .is_none()
             && thread_archived(&fixture.index, DONE) == Some(false),
         "forgetting a closed session mutated Codex storage or was not sealed immediately",
+    )?;
+    Ok(())
+}
+
+fn verify_remembrance(fixture: &Fixture) -> Result<()> {
+    let state = read_roster(&fixture.roster)?;
+    let sessions = state["sessions"]
+        .as_object()
+        .ok_or_else(|| TesterError::Verdict {
+            detail: "known-session state omitted its session map".to_owned(),
+        })?;
+    demand(
+        sessions.contains_key(DORMANT) && !sessions.contains_key(UNSEEN),
+        "Wrangler did not preserve its remembered session boundary",
+    )?;
+    demand(
+        thread_archived(&fixture.index, DORMANT) == Some(true),
+        "fixture did not oppose Codex archive state to Wrangler closure",
+    )?;
+    Ok(())
+}
+
+fn fork_and_return(
+    testbed: &Testbed,
+    story: &mut Story<'_, '_, Observation>,
+    app: &Application<'_>,
+    fixture: &Fixture,
+) -> Result<()> {
+    story.session().focus()?;
+    let (strike_x, strike_y) = seize_card(story, TURN, "fork")?;
+    let _control_down = story.session().key_down(Key::Control)?;
+    let forked = story.session().click(strike_x, strike_y, Button::Primary)?;
+    let _armed = story.reaction(forked).until(Condition::new(
+        "Ctrl+click to enter fork flight",
+        |state: &Observation| state.flight == Flight::Striking,
+    ))?;
+    let _control_up = story.session().key_up(Key::Control)?;
+    app.wait_until(
+        Duration::from_secs(10),
+        "Codex chat to fork in a fresh Alacritty",
+        || Ok(fixture.fork_launch.is_file()),
+    )?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "fork launch to leave the fixed Wrangler workspace",
+        || Ok(wrangler_count(testbed)? == Some(0)),
+    )?;
+    let _returned = story.session().key(Key::Function(7))?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "i3 to return to the fixed Wrangler workspace after fork",
+        || Ok(wrangler_count(testbed)? == Some(1)),
+    )?;
+    let _landed = story.wait(Condition::new(
+        "Codex fork strike to leave flight",
+        |state: &Observation| state.flight == Flight::Grounded,
+    ))?;
+    demand(
+        fs::read_to_string(&fixture.fork_launch).is_ok_and(|proof| proof.trim() == "fork 7"),
+        "forked session did not launch on its source terminal workspace",
+    )?;
+    let original = wait_card(story, TURN, |card| card.work == Work::Turn)?;
+    demand(
+        original.work == Work::Turn,
+        "forking a session displaced its original live terminal",
     )?;
     Ok(())
 }
@@ -1073,7 +1125,7 @@ fn enable_minimize_on_close(
 }
 
 fn verify_search_and_help(story: &mut Story<'_, '_, Observation>) -> Result<()> {
-    const QUERY: &str = "awaiting verdict|^/WORK/TURN$";
+    const QUERY: &str = "awaiting verdict|^/TEST/WORK/TURN$";
 
     story.session().focus()?;
     let slash = story.session().key(Key::Character('/'))?;
@@ -1218,7 +1270,7 @@ fn verify_history(
     if let Some(destination) = env::var_os("CODEX_WRANGLER_HISTORY_CAPTURE") {
         fs::copy(&capture, destination).map_err(io_verdict("export history capture"))?;
     }
-    verify_history_archive_roundtrip(story, index)?;
+    verify_history_archive_roundtrip(testbed, story, index)?;
     verify_history_deletion(story, index)?;
 
     let returned = story.session().key(Key::Tab)?;
@@ -1310,6 +1362,7 @@ fn sort_history(
 }
 
 fn verify_history_archive_roundtrip(
+    testbed: &Testbed,
     story: &mut Story<'_, '_, Observation>,
     index: &Path,
 ) -> Result<()> {
@@ -1330,6 +1383,7 @@ fn verify_history_archive_roundtrip(
             .then_some(())
         },
     )?;
+    verify_history_transcript(testbed, story)?;
     click_history(story, UNSEEN, "unarchive")?;
     vacate_history(story)?;
     let _unarchived = story.wait_stable(
@@ -1347,6 +1401,99 @@ fn verify_history_archive_roundtrip(
             .then_some(())
         },
     )?;
+    Ok(())
+}
+
+fn verify_history_transcript(
+    testbed: &Testbed,
+    story: &mut Story<'_, '_, Observation>,
+) -> Result<()> {
+    click_history(story, UNSEEN, "inspect")?;
+    let _last = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(120),
+        "historical row to reveal its last turn from compressed storage",
+        |frame| {
+            frame
+                .state
+                .history_transcript
+                .as_ref()
+                .filter(|transcript| {
+                    transcript.thread == UNSEEN
+                        && transcript.cursor == Some(1)
+                        && transcript.total == 2
+                        && transcript.user.as_deref() == Some("What did it become?")
+                        && transcript.model.as_deref() == Some("The final copper machine.")
+                        && transcript.error.is_none()
+                })
+                .map(|_| ())
+        },
+    )?;
+    let capture = testbed.private_path("captures/wrangler-history-transcript.png")?;
+    story.capture()?.save_png(&capture)?;
+    testbed.retain_on_failure("captures/wrangler-history-transcript.png")?;
+    if let Some(destination) = env::var_os("CODEX_WRANGLER_TRANSCRIPT_CAPTURE") {
+        fs::copy(&capture, destination).map_err(io_verdict("export transcript capture"))?;
+    }
+    click_history(story, UNSEEN, "previous-turn")?;
+    let _first = story.wait(Condition::new(
+        "back arrow to reveal the preceding user/model turn",
+        |state: &Observation| {
+            state.history_transcript.as_ref().is_some_and(|transcript| {
+                transcript.cursor == Some(0)
+                    && transcript.user.as_deref() == Some("What is this engine?")
+                    && transcript.model.as_deref() == Some("A brass prototype.")
+            })
+        },
+    ))?;
+    click_history(story, UNSEEN, "next-turn")?;
+    let _last_again = story.wait(Condition::new(
+        "forward arrow to restore the newest turn",
+        |state: &Observation| {
+            state
+                .history_transcript
+                .as_ref()
+                .is_some_and(|transcript| transcript.cursor == Some(1))
+        },
+    ))?;
+    let closed = story.session().key(Key::Escape)?;
+    let _closed = story.reaction(closed).until(Condition::new(
+        "Escape to close the turn inspector",
+        |state: &Observation| state.history_transcript.is_none(),
+    ))?;
+    Ok(())
+}
+
+fn verify_history_open(testbed: &Testbed, story: &mut Story<'_, '_, Observation>) -> Result<()> {
+    story.session().focus()?;
+    let opened = story.session().key(Key::Tab)?;
+    let _opened = story.reaction(opened).until(Condition::new(
+        "physical Tab to open Historical before resuming a session",
+        |state: &Observation| state.tab == Tab::Historical,
+    ))?;
+    let proof = testbed.private_path(format!("resume-proof-{UNSEEN}"))?;
+    click_history(story, UNSEEN, "open")?;
+    story.session().application().wait_until(
+        Duration::from_secs(10),
+        "historical session to open in Alacritty",
+        || Ok(proof.is_file()),
+    )?;
+    demand(
+        fs::read_to_string(proof).is_ok_and(|proof| proof.trim() == "resume 9"),
+        "historical session did not open on Wrangler's current workspace",
+    )?;
+    let _returned = story.session().key(Key::Function(9))?;
+    let _visible = story.wait_stable(
+        Duration::from_secs(8),
+        Duration::from_millis(120),
+        "i3 to return focus to Wrangler after opening history",
+        |frame| (frame.state.tab == Tab::Historical).then_some(()),
+    )?;
+    let returned = story.session().key(Key::Tab)?;
+    let _returned = story.reaction(returned).until(Condition::new(
+        "physical Tab to return to Live after opening history",
+        |state: &Observation| state.tab == Tab::Live,
+    ))?;
     Ok(())
 }
 
@@ -1761,6 +1908,7 @@ struct Fixture {
     preferences: PathBuf,
     index: PathBuf,
     rotate_resume: PathBuf,
+    fork_launch: PathBuf,
     version_resume: PathBuf,
     dormant_resume: PathBuf,
 }
@@ -1780,15 +1928,12 @@ impl Fixture {
         seed_names(testbed)?;
         let state = testbed.write_private("xdg/state/codex-wrangler/window-mode", b"tiled\n")?;
         let roster = seed_roster(testbed)?;
-        for work in ["rotate", "dormant", "done"] {
-            let _work = testbed.create_private_dir(format!("work/{work}"))?;
-        }
+        forge_workdirs(testbed)?;
         let (claude, prime) = seed_foreign_transcripts(testbed)?;
 
         let fake = forge_fake_harness(testbed)?;
         let fake_cli = forge_fake_cli(testbed)?;
         let replaceable_alacritty = forge_replaceable_alacritty(testbed)?;
-        let proof = testbed.private_path("focus-proof")?;
         let rotate_resume = testbed.private_path(format!("resume-proof-{ROTATE}"))?;
         let dormant_resume = testbed.private_path(format!("resume-proof-{DORMANT}"))?;
         let workspace_proof = testbed.private_path("workspace-proof")?;
@@ -1810,6 +1955,7 @@ impl Fixture {
              bindsym F6 workspace number 8, exec --no-startup-id touch /test/tiled-away-proof\n\
              bindsym F7 workspace number 9, exec --no-startup-id touch /test/tiled-home-proof\n\
              bindsym F8 floating enable, move position 0 0, exec --no-startup-id touch /test/floating-proof\n\
+             bindsym F9 [title=\"^Codex Wrangler$\"] focus\n\
              bar {\n\
                mode dock\n\
                position bottom\n\
@@ -1853,7 +1999,7 @@ impl Fixture {
             done_rollout: done,
             input_rollout: input,
             error_rollout: error,
-            proof,
+            proof: testbed.private_path("focus-proof")?,
             workspace_proof,
             launch_workspace_proof,
             tiled_proof,
@@ -1865,10 +2011,18 @@ impl Fixture {
             preferences: testbed.private_path("xdg/state/codex-wrangler/preferences.json")?,
             index: db_path,
             rotate_resume,
+            fork_launch: testbed.private_path(format!("fork-proof-{TURN}"))?,
             version_resume: testbed.private_path(format!("resume-proof-{DONE}"))?,
             dormant_resume,
         })
     }
+}
+
+fn forge_workdirs(testbed: &Testbed) -> Result<()> {
+    for work in ["turn", "rotate", "dormant", "done", "history"] {
+        let _work = testbed.create_private_dir(format!("work/{work}"))?;
+    }
+    Ok(())
 }
 
 fn forge_fake_harness(testbed: &Testbed) -> Result<PathBuf> {
@@ -2044,6 +2198,11 @@ fi
 operation=$1
 thread=$2
 case $operation in
+  fork)
+    workspace=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused).num')
+    printf '%s\n' "$operation $workspace" > "/test/${{operation}}-proof-${{thread}}"
+    exec -a codex bash -c 'sleep 90' wrangler-fork
+    ;;
   archive)
     rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
     destination=/test/home/.codex/archived_sessions/${{rollout##*/}}
@@ -2254,7 +2413,7 @@ fn seed_thread_rows(db: &Connection) -> Result<()> {
             TURN,
             "This first prompt must never become the displayed name",
             None,
-            "/work/turn",
+            "/test/work/turn",
             20,
             rollout_test_path(TURN, "turn"),
         ),
@@ -2354,26 +2513,31 @@ fn seed_thread(db: &Connection, row: &ThreadSeed<'_>) -> Result<()> {
 }
 
 fn seed_historical(sessions: &Path, archive: &Path) -> Result<()> {
-    for (path, first, second) in [
+    for (path, transcript) in [
         (
             rollout(sessions, UNSEEN, "unseen"),
-            "task_started",
-            "turn_started",
+            concat!(
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"content\":[{\"type\":\"text\",\"text\":\"What is this engine?\"}]}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"text\",\"text\":\"A brass prototype.\"}]}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_started\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"content\":[{\"type\":\"text\",\"text\":\"What did it become?\"}]}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"text\",\"text\":\"The final copper machine.\"}]}}}\n",
+            ),
         ),
         (
             archive.join(format!("rollout-2026-08-03T00-00-00-cold-{COLD}.jsonl")),
-            "task_started",
-            "task_started",
+            concat!(
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"First buried question.\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"First buried answer.\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Last buried question.\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Last buried answer.\"}}\n",
+            ),
         ),
     ] {
-        fs::write(
-            path,
-            format!(
-                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"{first}\"}}}}\n\
-                 {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"{second}\"}}}}\n"
-            ),
-        )
-        .map_err(io_verdict("write historical rollout"))?;
+        fs::write(path, transcript).map_err(io_verdict("write historical rollout"))?;
     }
     Ok(())
 }

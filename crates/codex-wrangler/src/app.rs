@@ -9,9 +9,9 @@ use std::{
 #[cfg(feature = "egui-test")]
 use crate::contract::{
     CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, GuideVisibility,
-    HistoryObservation, HistorySortObservation, HistorySortTarget, HistoryTarget, Observation,
-    PreferenceTarget, SearchObservation, SearchTarget, Tab, TabTarget, UI_FINGERPRINT,
-    WorkspaceTarget,
+    HistoryObservation, HistorySortObservation, HistorySortTarget, HistoryTarget,
+    HistoryTranscriptObservation, Observation, PreferenceTarget, SearchObservation, SearchTarget,
+    Tab, TabTarget, UI_FINGERPRINT, WorkspaceTarget,
 };
 use brass_poolrooms::{
     chrome,
@@ -29,11 +29,12 @@ use eternalist_apps::{
 };
 
 use crate::{
-    commands::{Edict, NAVIGATION_IDIOMS, Realm, SCRY_IDIOMS, canon},
+    commands::{Edict, NAVIGATION_IDIOMS, Realm, SCRY_IDIOMS, TILE_IDIOMS, canon},
     contract::{Harness, HistoryColumn, SortDirection, Work},
     history::{
         Census as HistoryCensus, Nexus as HistoryNexus, Operation as HistoryOperation,
-        Order as HistoryOrder, Session as HistorySession, spawn as spawn_history,
+        Order as HistoryOrder, Session as HistorySession, Turn as HistoryTurn,
+        spawn as spawn_history,
     },
     instance::{Incumbent, NO_DESKTOP},
     model::{Card, Census},
@@ -127,6 +128,27 @@ struct HistoryGesture {
     operation: HistoryOperation,
 }
 
+enum HistoryAction {
+    Inspect(String),
+    Open(String),
+    Operate(HistoryGesture),
+}
+
+struct TranscriptView {
+    thread: String,
+    name: Option<String>,
+    state: TranscriptState,
+}
+
+enum TranscriptState {
+    Loading,
+    Ready {
+        turns: Vec<HistoryTurn>,
+        cursor: usize,
+    },
+    Failed(String),
+}
+
 impl SearchFocus {
     const fn held(self) -> bool {
         matches!(self, Self::Held)
@@ -176,6 +198,7 @@ struct Wrangler<const START_FLOATING: bool> {
     history_pending: HashMap<String, HistoryOperation>,
     history_error: Option<String>,
     delete_target: Option<String>,
+    transcript: Option<TranscriptView>,
     page: Page,
     preferences: Preferences,
     guide: CommandGuide,
@@ -262,6 +285,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             history_pending: HashMap::new(),
             history_error: None,
             delete_target: None,
+            transcript: None,
             page: Page::Live,
             preferences: Preferences::restore(),
             guide: CommandGuide::default(),
@@ -276,6 +300,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         self.visibility = GalleryVisibility::Concealed;
         self.jiggling = false;
         self.jolts.clear();
+        self.transcript = None;
         self.water.reset();
         self.water.set_wetness(Wetness::Dry);
     }
@@ -361,6 +386,30 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     outcome.order.thread
                 )
             });
+            changed = true;
+        }
+        changed
+    }
+
+    fn reap_transcripts(&mut self) -> bool {
+        let mut changed = false;
+        for outcome in self.historian.take_transcripts() {
+            let Some(view) = self
+                .transcript
+                .as_mut()
+                .filter(|view| view.thread == outcome.thread)
+            else {
+                continue;
+            };
+            view.state = if let Some(error) = outcome.error {
+                TranscriptState::Failed(error)
+            } else {
+                let cursor = outcome.turns.len().saturating_sub(1);
+                TranscriptState::Ready {
+                    turns: outcome.turns,
+                    cursor,
+                }
+            };
             changed = true;
         }
         changed
@@ -709,9 +758,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         &mut self,
         ui: &mut egui::Ui,
         search_id: egui::Id,
-    ) -> (Option<HistoryGesture>, f32) {
-        let mut gesture = None;
-        let mut inspect = Vec::new();
+    ) -> (Option<HistoryAction>, f32) {
+        let mut action = None;
+        let mut tally = Vec::new();
         let panel = egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -775,8 +824,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                                 &mut self.water,
                                 &mut self.history_hovered,
                             );
-                            gesture = result.gesture;
-                            inspect = result.inspect;
+                            action = result.action;
+                            tally = result.tally;
                         },
                     );
                 scroll.state.offset.y
@@ -787,7 +836,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             .flat_map(|history| &history.sessions)
             .map(|session| (session.thread.as_str(), session.updated_at_ms))
             .collect::<HashMap<_, _>>();
-        let novel = inspect
+        let novel = tally
             .into_iter()
             .filter(|thread| {
                 stamps.get(thread.as_str()).is_some_and(|updated_at_ms| {
@@ -796,14 +845,14 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 })
             })
             .collect::<Vec<_>>();
-        if !novel.is_empty() && self.historian.courier().inspect(novel.clone()).is_err() {
+        if !novel.is_empty() && self.historian.courier().tally(novel.clone()).is_err() {
             for thread in novel {
                 if let Some(updated_at_ms) = stamps.get(thread.as_str()) {
                     let _removed = self.history_requested.remove(&(thread, *updated_at_ms));
                 }
             }
         }
-        (gesture, panel.inner)
+        (action, panel.inner)
     }
 
     fn history_barrier(&mut self, ui: &mut egui::Ui) -> bool {
@@ -844,6 +893,29 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         }
     }
 
+    fn launch_strike(&mut self, strike: Strike) {
+        if self.pending_activation.is_some() {
+            return;
+        }
+        self.summon_attempts = None;
+        self.sight_posture();
+        if self.nexus.strike.try_send(strike.clone()).is_ok() {
+            self.pending_activation = Some(ActivationFlight::launch(strike));
+        }
+    }
+
+    fn accept_history_action(&mut self, action: HistoryAction) {
+        match action {
+            HistoryAction::Inspect(thread) => self.request_transcript(thread),
+            HistoryAction::Open(thread) => self.launch_strike(Strike {
+                harness: Harness::Codex,
+                thread,
+                intent: Intent::Open,
+            }),
+            HistoryAction::Operate(gesture) => self.accept_history_gesture(gesture),
+        }
+    }
+
     fn accept_history_gesture(&mut self, gesture: HistoryGesture) {
         if gesture.operation == HistoryOperation::Delete && self.preferences.confirm_deletion() {
             self.delete_target = Some(gesture.thread);
@@ -852,6 +924,127 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 thread: gesture.thread,
                 operation: gesture.operation,
             });
+        }
+    }
+
+    fn request_transcript(&mut self, thread: String) {
+        let name = self.history.as_ref().and_then(|history| {
+            history
+                .sessions
+                .iter()
+                .find(|session| session.thread == thread)
+                .and_then(|session| session.name.clone())
+        });
+        self.transcript = Some(TranscriptView {
+            thread: thread.clone(),
+            name,
+            state: TranscriptState::Loading,
+        });
+        if self.historian.courier().transcript(thread).is_err()
+            && let Some(view) = &mut self.transcript
+        {
+            view.state = TranscriptState::Failed("history reader is unavailable".to_owned());
+        }
+    }
+
+    fn transcript_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut view) = self.transcript.take() else {
+            return;
+        };
+        let modal = egui::Modal::new(egui::Id::new("codex-history-transcript"))
+            .frame(
+                egui::Frame::new()
+                    .fill(chrome::SURFACE)
+                    .stroke(Stroke::new(1.5, chrome::EDGE_STRONG))
+                    .corner_radius(2)
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .backdrop_color(Color32::from_black_alpha(188))
+            .show(ctx, |ui| {
+                let width = 860.0_f32.min(ctx.content_rect().width() - 48.0);
+                ui.set_width(width);
+                let _top = ui.horizontal(|ui| {
+                    let (cursor, total) = match &view.state {
+                        TranscriptState::Ready { turns, cursor } => (*cursor, turns.len()),
+                        TranscriptState::Loading | TranscriptState::Failed(_) => (0, 0),
+                    };
+                    let previous = ui.add_enabled(
+                        cursor > 0,
+                        egui::Button::new(RichText::new("←").size(18.0))
+                            .min_size(Vec2::new(34.0, 28.0)),
+                    );
+                    chrome::shallow_tension(ui, &previous);
+                    brass_poolrooms::poolroom_anchor!(
+                        ui,
+                        HistoryTarget(&view.thread, "previous-turn").to_string(),
+                        previous.rect
+                    );
+                    let next = ui.add_enabled(
+                        cursor + 1 < total,
+                        egui::Button::new(RichText::new("→").size(18.0))
+                            .min_size(Vec2::new(34.0, 28.0)),
+                    );
+                    chrome::shallow_tension(ui, &next);
+                    brass_poolrooms::poolroom_anchor!(
+                        ui,
+                        HistoryTarget(&view.thread, "next-turn").to_string(),
+                        next.rect
+                    );
+                    if previous.clicked()
+                        && let TranscriptState::Ready { cursor, .. } = &mut view.state
+                    {
+                        *cursor -= 1;
+                        self.water.click(previous.rect);
+                    }
+                    if next.clicked()
+                        && let TranscriptState::Ready { cursor, .. } = &mut view.state
+                    {
+                        *cursor += 1;
+                        self.water.click(next.rect);
+                    }
+                    ui.add_space(8.0);
+                    let title = view.name.as_deref().unwrap_or("anonymous");
+                    let _title = ui.add(
+                        egui::Label::new(chrome::title(title.to_uppercase()))
+                            .truncate()
+                            .show_tooltip_when_elided(false),
+                    );
+                    let _position =
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let position = if total == 0 {
+                                "NO TURNS".to_owned()
+                            } else {
+                                format!("TURN {} / {total}", cursor + 1)
+                            };
+                            let _position = ui.label(chrome::muted(position).size(12.0));
+                        });
+                });
+                let _thread = ui.label(RichText::new(&view.thread).size(11.0).color(chrome::MUTED));
+                ui.add_space(12.0);
+                match &view.state {
+                    TranscriptState::Loading => {
+                        let (arena, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 430.0),
+                            Sense::hover(),
+                        );
+                        let _bouncer = self.living_wait.bouncer(ui, arena);
+                    }
+                    TranscriptState::Failed(error) => {
+                        let _error = ui.label(RichText::new(error).color(RED));
+                    }
+                    TranscriptState::Ready { turns, cursor } => {
+                        if let Some(turn) = turns.get(*cursor) {
+                            transcript_turn(ui, turn);
+                        } else {
+                            let _empty = ui.label(chrome::muted(
+                                "NO USER OR MODEL MESSAGES FOUND IN THIS ROLLOUT",
+                            ));
+                        }
+                    }
+                }
+            });
+        if !modal.should_close() {
+            self.transcript = Some(view);
         }
     }
 
@@ -968,6 +1161,34 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     #[cfg(feature = "egui-test")]
+    fn transcript_observation(&self) -> Option<HistoryTranscriptObservation> {
+        self.transcript.as_ref().map(|view| {
+            let (cursor, total, user, model, error) = match &view.state {
+                TranscriptState::Loading => (None, 0, None, None, None),
+                TranscriptState::Failed(error) => (None, 0, None, None, Some(error.clone())),
+                TranscriptState::Ready { turns, cursor } => {
+                    let turn = turns.get(*cursor);
+                    (
+                        turn.map(|_| *cursor),
+                        turns.len(),
+                        turn.map(|turn| turn.user.clone()),
+                        turn.map(|turn| turn.model.clone()),
+                        None,
+                    )
+                }
+            };
+            HistoryTranscriptObservation {
+                thread: view.thread.clone(),
+                cursor,
+                total,
+                user,
+                model,
+                error,
+            }
+        })
+    }
+
+    #[cfg(feature = "egui-test")]
     fn observation(&self) -> Observation {
         let live = live_codex_threads(self.census.as_ref());
         let history = live.as_ref().map_or_else(Vec::new, |live| {
@@ -1056,6 +1277,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 })
                 .collect(),
             history,
+            history_transcript: self.transcript_observation(),
             history_order,
             history_sorts: self
                 .history_scry
@@ -1085,7 +1307,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         self.hovered = None;
         self.history_hovered = None;
         self.reap_activation();
-        let history_outcome = self.reap_history_outcomes();
+        let history_outcome = self.reap_history_outcomes() | self.reap_transcripts();
         if self.visibility != GalleryVisibility::Visible {
             return;
         }
@@ -1094,7 +1316,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
             ui.memory_mut(|memory| memory.surrender_focus(search_id));
             self.search_focus = SearchFocus::Idle;
         }
-        let modal_open = self.delete_target.is_some();
+        let modal_open = self.delete_target.is_some() || self.transcript.is_some();
         self.seize_shortcuts(ui, search_id, modal_open);
         let basin = ui.max_rect();
         let jiggling = !modal_open
@@ -1123,19 +1345,14 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         if !jiggling {
             self.jolts.clear();
         }
-        if let Some(strike) = selected
-            && self.pending_activation.is_none()
-        {
-            self.summon_attempts = None;
-            self.sight_posture();
-            if self.nexus.strike.try_send(strike.clone()).is_ok() {
-                self.pending_activation = Some(ActivationFlight::launch(strike));
-            }
+        if let Some(strike) = selected {
+            self.launch_strike(strike);
         }
-        if let Some(gesture) = historical {
-            self.accept_history_gesture(gesture);
+        if let Some(action) = historical {
+            self.accept_history_action(action);
         }
         self.deletion_modal(ui.ctx());
+        self.transcript_modal(ui.ctx());
         self.water.heave(ui.ctx(), heave);
         self.guide.show(
             ui.ctx(),
@@ -1146,7 +1363,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
                 Page::Historical => "HISTORICAL",
             },
             |_| CommandStatus::Enabled,
-            &[NAVIGATION_IDIOMS, SCRY_IDIOMS],
+            &[NAVIGATION_IDIOMS, TILE_IDIOMS, SCRY_IDIOMS],
         );
         let stable_pointer = match self.page {
             Page::Live => self.hovered.is_none(),
@@ -1298,6 +1515,33 @@ fn page_tab(ui: &mut egui::Ui, page: Page, selected: bool) -> egui::Response {
     response
 }
 
+fn transcript_turn(ui: &mut egui::Ui, turn: &HistoryTurn) {
+    let _scroll = egui::ScrollArea::vertical()
+        .id_salt("historical-transcript-turn")
+        .auto_shrink([false; 2])
+        .max_height(520.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let _user_header = ui.label(chrome::eyebrow("USER"));
+            ui.add_space(5.0);
+            let user = if turn.user.is_empty() {
+                "(no user message recorded)"
+            } else {
+                &turn.user
+            };
+            let _user = ui.add(egui::Label::new(user).selectable(true).wrap());
+            ui.add_space(16.0);
+            let _model_header = ui.label(chrome::eyebrow("MODEL"));
+            ui.add_space(5.0);
+            let model = if turn.model.is_empty() {
+                "(no model response recorded)"
+            } else {
+                &turn.model
+            };
+            let _model = ui.add(egui::Label::new(model).selectable(true).wrap());
+        });
+}
+
 #[derive(Clone, Copy)]
 struct HistoryColumns {
     id: f32,
@@ -1306,20 +1550,22 @@ struct HistoryColumns {
     turns: f32,
     size: f32,
     state: f32,
+    open: f32,
     action: f32,
     delete: f32,
 }
 
 impl HistoryColumns {
     fn fit(width: f32) -> Self {
-        const FIXED: f32 = 270.0 + 136.0 + 58.0 + 82.0 + 82.0 + 104.0 + 42.0;
+        const FIXED: f32 = 270.0 + 136.0 + 58.0 + 82.0 + 96.0 + 72.0 + 104.0 + 42.0;
         Self {
             id: 270.0,
             name: (width - FIXED).max(120.0),
             date: 136.0,
             turns: 58.0,
             size: 82.0,
-            state: 82.0,
+            state: 96.0,
+            open: 72.0,
             action: 104.0,
             delete: 42.0,
         }
@@ -1327,8 +1573,8 @@ impl HistoryColumns {
 }
 
 struct HistoryRows {
-    gesture: Option<HistoryGesture>,
-    inspect: Vec<String>,
+    action: Option<HistoryAction>,
+    tally: Vec<String>,
 }
 
 fn history_header(
@@ -1366,7 +1612,7 @@ fn history_header(
             selected = Some(column);
         }
     }
-    for width in [columns.action, columns.delete] {
+    for width in [columns.open, columns.action, columns.delete] {
         history_cell(&mut row, width, |_| {});
     }
     ui.painter().line_segment(
@@ -1433,13 +1679,13 @@ fn history_rows(
     water: &mut Surface,
     hovered: &mut Option<String>,
 ) -> HistoryRows {
-    let mut gesture = None;
-    let mut inspect = Vec::new();
+    let mut action = None;
+    let mut tally = Vec::new();
     for visible in rows {
         let hit = &hits[visible];
         let session = &sessions[hit.session()];
         if session.turns.is_none() && !session.tally_failed {
-            inspect.push(session.thread.clone());
+            tally.push(session.thread.clone());
         }
         let found = ui
             .push_id(&session.thread, |ui| {
@@ -1455,11 +1701,11 @@ fn history_rows(
                 )
             })
             .inner;
-        if gesture.is_none() {
-            gesture = found;
+        if action.is_none() {
+            action = found;
         }
     }
-    HistoryRows { gesture, inspect }
+    HistoryRows { action, tally }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1472,9 +1718,9 @@ fn history_row(
     flight: Option<HistoryOperation>,
     water: &mut Surface,
     hovered: &mut Option<String>,
-) -> Option<HistoryGesture> {
-    let (rect, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), HISTORY_ROW), Sense::hover());
+) -> Option<HistoryAction> {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), HISTORY_ROW), Sense::click());
     let pointer_inside = ui.rect_contains_pointer(rect);
     let fill = if pointer_inside {
         Color32::from_rgba_unmultiplied(36, 30, 22, 210)
@@ -1492,8 +1738,24 @@ fn history_row(
     );
     row.spacing_mut().item_spacing.x = 0.0;
     history_facts(&mut row, session, hit, columns);
-    let gesture = history_operation(&mut row, session, columns.action, flight, water)
-        .or_else(|| history_delete(&mut row, session, columns.delete, flight, water));
+    let mut action = history_open(&mut row, session, columns.open, flight, water)
+        .or_else(|| {
+            history_operation(&mut row, session, columns.action, flight, water)
+                .map(HistoryAction::Operate)
+        })
+        .or_else(|| {
+            history_delete(&mut row, session, columns.delete, flight, water)
+                .map(HistoryAction::Operate)
+        });
+    if response.clicked() && action.is_none() {
+        water.click(rect);
+        action = Some(HistoryAction::Inspect(session.thread.clone()));
+    }
+    brass_poolrooms::poolroom_anchor!(
+        ui,
+        HistoryTarget(&session.thread, "inspect").to_string(),
+        response.rect
+    );
     if pointer_inside {
         *hovered = Some(session.thread.clone());
         water.hover(("historical", &session.thread), rect);
@@ -1502,7 +1764,7 @@ fn history_row(
         [rect.left_bottom(), rect.right_bottom()],
         Stroke::new(1.0, chrome::EDGE),
     );
-    gesture
+    action
 }
 
 fn history_facts(
@@ -1555,10 +1817,37 @@ fn history_facts(
         let (label, color) = if session.archived {
             ("ARCHIVED", chrome::HOT)
         } else {
-            ("OPEN", chrome::MUTED)
+            ("UNARCHIVED", chrome::MUTED)
         };
         let _state = ui.label(RichText::new(label).size(11.0).color(color));
     });
+}
+
+fn history_open(
+    row: &mut egui::Ui,
+    session: &HistorySession,
+    width: f32,
+    flight: Option<HistoryOperation>,
+    water: &mut Surface,
+) -> Option<HistoryAction> {
+    let mut clicked = false;
+    history_cell(row, width, |ui| {
+        let response = ui.add_enabled(
+            flight.is_none(),
+            egui::Button::new(RichText::new("OPEN").size(11.0)).min_size(Vec2::new(60.0, 24.0)),
+        );
+        chrome::shallow_tension(ui, &response);
+        brass_poolrooms::poolroom_anchor!(
+            ui,
+            HistoryTarget(&session.thread, "open").to_string(),
+            response.rect
+        );
+        clicked = response.clicked();
+        if clicked {
+            water.click(response.rect);
+        }
+    });
+    clicked.then(|| HistoryAction::Open(session.thread.clone()))
 }
 
 fn history_operation(
@@ -1795,12 +2084,17 @@ fn card(
         if physics.jiggling && !dismissible {
             return None;
         }
-        physics.water.click(visual);
+        let forking = ui.input(|input| input.modifiers.matches_exact(egui::Modifiers::CTRL));
         let intent = if physics.jiggling {
             Intent::Dismiss
+        } else if forking && card.harness == Harness::Codex {
+            Intent::Fork
+        } else if forking {
+            return None;
         } else {
             Intent::Select
         };
+        physics.water.click(visual);
         Some(Strike {
             harness: card.harness,
             thread: card.thread.clone(),

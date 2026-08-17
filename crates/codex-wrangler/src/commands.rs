@@ -28,9 +28,15 @@ const SCRY_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
     "Clears the current tab's filter without hiding Wrangler.",
     &ESCAPE,
 )];
+const TILE_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
+    "Ctrl+click Codex tile",
+    "Forks the chat in a new Alacritty on its workspace.",
+    &[],
+)];
 
 pub const NAVIGATION_IDIOMS: GuideSection = GuideSection::new("NAVIGATION", &NAVIGATION_GESTURES);
 pub const SCRY_IDIOMS: GuideSection = GuideSection::new("SEARCH", &SCRY_GESTURES);
+pub const TILE_IDIOMS: GuideSection = GuideSection::new("TILES", &TILE_GESTURES);
 
 const EDICTS: [CommandSpec<Edict, Realm>; 1] = [CommandSpec::new(
     Edict::Scry,

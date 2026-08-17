@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
-    io::{Read, Write as _},
+    io::{BufRead as _, BufReader, Read, Write as _},
     os::{
         fd::AsFd as _,
         unix::{fs::PermissionsExt as _, net::UnixStream},
@@ -23,6 +23,7 @@ use memchr::memmem;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{names::NameIndex, state, watchfire::Watchfire};
 
@@ -50,6 +51,19 @@ pub struct Session {
 pub struct Census {
     pub sessions: Vec<Session>,
     pub fault: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Turn {
+    pub user: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TranscriptOutcome {
+    pub thread: String,
+    pub turns: Vec<Turn>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +98,7 @@ pub struct Outcome {
 pub struct Nexus {
     latest: Arc<Mutex<Option<Census>>>,
     outcomes: Arc<Mutex<Vec<Outcome>>>,
+    transcripts: Arc<Mutex<Vec<TranscriptOutcome>>>,
     courier: Courier,
     alive: Arc<AtomicBool>,
     wake: UnixStream,
@@ -97,7 +112,8 @@ pub struct Courier {
 
 enum Intent {
     Operate(Order),
-    Inspect(Vec<String>),
+    Tally(Vec<String>),
+    Read(String),
 }
 
 #[derive(Clone)]
@@ -119,6 +135,21 @@ struct CountResult {
     tally: std::result::Result<u64, String>,
 }
 
+struct TranscriptJob {
+    thread: String,
+    artifact: Artifact,
+}
+
+enum ReadJob {
+    Count(CountJob),
+    Transcript(TranscriptJob),
+}
+
+enum ReadResult {
+    Count(CountResult),
+    Transcript(TranscriptOutcome),
+}
+
 impl Courier {
     pub fn order(&self, order: Order) -> Result<(), TrySendError<Order>> {
         self.send(Intent::Operate(order))
@@ -127,23 +158,37 @@ impl Courier {
                 TrySendError::Disconnected(Intent::Operate(order)) => {
                     TrySendError::Disconnected(order)
                 }
-                TrySendError::Full(Intent::Inspect(_))
-                | TrySendError::Disconnected(Intent::Inspect(_)) => {
+                TrySendError::Full(Intent::Tally(_) | Intent::Read(_))
+                | TrySendError::Disconnected(Intent::Tally(_) | Intent::Read(_)) => {
                     unreachable!("operation intent remains an operation")
                 }
             })
     }
 
-    pub fn inspect(&self, threads: Vec<String>) -> Result<(), TrySendError<Vec<String>>> {
-        self.send(Intent::Inspect(threads))
+    pub fn tally(&self, threads: Vec<String>) -> Result<(), TrySendError<Vec<String>>> {
+        self.send(Intent::Tally(threads))
             .map_err(|error| match error {
-                TrySendError::Full(Intent::Inspect(threads)) => TrySendError::Full(threads),
-                TrySendError::Disconnected(Intent::Inspect(threads)) => {
+                TrySendError::Full(Intent::Tally(threads)) => TrySendError::Full(threads),
+                TrySendError::Disconnected(Intent::Tally(threads)) => {
                     TrySendError::Disconnected(threads)
                 }
-                TrySendError::Full(Intent::Operate(_))
-                | TrySendError::Disconnected(Intent::Operate(_)) => {
+                TrySendError::Full(Intent::Operate(_) | Intent::Read(_))
+                | TrySendError::Disconnected(Intent::Operate(_) | Intent::Read(_)) => {
                     unreachable!("inspection intent remains an inspection")
+                }
+            })
+    }
+
+    pub fn transcript(&self, thread: String) -> Result<(), TrySendError<String>> {
+        self.send(Intent::Read(thread))
+            .map_err(|error| match error {
+                TrySendError::Full(Intent::Read(thread)) => TrySendError::Full(thread),
+                TrySendError::Disconnected(Intent::Read(thread)) => {
+                    TrySendError::Disconnected(thread)
+                }
+                TrySendError::Full(Intent::Operate(_) | Intent::Tally(_))
+                | TrySendError::Disconnected(Intent::Operate(_) | Intent::Tally(_)) => {
+                    unreachable!("transcript intent remains a transcript request")
                 }
             })
     }
@@ -172,6 +217,15 @@ impl Nexus {
         )
     }
 
+    pub fn take_transcripts(&self) -> Vec<TranscriptOutcome> {
+        std::mem::take(
+            &mut *self
+                .transcripts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     pub const fn courier(&self) -> &Courier {
         &self.courier
     }
@@ -190,6 +244,7 @@ impl Drop for Nexus {
 pub fn spawn(repaint: NativeWake) -> Nexus {
     let latest = Arc::new(Mutex::new(None));
     let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let transcripts = Arc::new(Mutex::new(Vec::new()));
     let alive = Arc::new(AtomicBool::new(true));
     let (intent_tx, intent_rx) = bounded(32);
     let (wake, worker_wake) = UnixStream::pair().expect("forge history wake pipe");
@@ -199,7 +254,7 @@ pub fn spawn(repaint: NativeWake) -> Nexus {
         .set_nonblocking(true)
         .expect("make historian wake pipe nonblocking");
     let courier_wake = wake.try_clone().expect("clone history wake pipe");
-    let (count_tx, count_rx) = bounded(64);
+    let (read_tx, read_rx) = bounded(64);
     let (result_tx, result_rx) = bounded(64);
     let (result_wake, worker_result_wake) =
         UnixStream::pair().expect("forge history counter wake pipe");
@@ -210,15 +265,16 @@ pub fn spawn(repaint: NativeWake) -> Nexus {
         .set_nonblocking(true)
         .expect("make historian counter pipe nonblocking");
 
-    let counter_alive = Arc::clone(&alive);
-    let counter = thread::Builder::new()
-        .name("codex-wrangler-turn-counter".to_owned())
-        .spawn(move || count_turns(&count_rx, &result_tx, &result_wake, &counter_alive))
-        .expect("spawn historical turn counter");
+    let reader_alive = Arc::clone(&alive);
+    let reader = thread::Builder::new()
+        .name("codex-wrangler-history-reader".to_owned())
+        .spawn(move || read_history(&read_rx, &result_tx, &result_wake, &reader_alive))
+        .expect("spawn historical reader");
 
     let worker_alive = Arc::clone(&alive);
     let worker_latest = Arc::clone(&latest);
     let worker_outcomes = Arc::clone(&outcomes);
+    let worker_transcripts = Arc::clone(&transcripts);
     let historian = thread::Builder::new()
         .name("codex-wrangler-historian".to_owned())
         .spawn(move || {
@@ -226,9 +282,10 @@ pub fn spawn(repaint: NativeWake) -> Nexus {
                 &repaint,
                 &worker_latest,
                 &worker_outcomes,
+                &worker_transcripts,
                 &intent_rx,
                 &worker_wake,
-                &count_tx,
+                &read_tx,
                 &result_rx,
                 &worker_result_wake,
                 &worker_alive,
@@ -239,13 +296,14 @@ pub fn spawn(repaint: NativeWake) -> Nexus {
     Nexus {
         latest,
         outcomes,
+        transcripts,
         courier: Courier {
             channel: intent_tx,
             wake: courier_wake,
         },
         alive,
         wake,
-        threads: vec![historian, counter],
+        threads: vec![historian, reader],
     }
 }
 
@@ -254,10 +312,11 @@ fn raid(
     repaint: &NativeWake,
     latest: &Mutex<Option<Census>>,
     outcomes: &Mutex<Vec<Outcome>>,
+    transcripts: &Mutex<Vec<TranscriptOutcome>>,
     intents: &Receiver<Intent>,
     wake: &UnixStream,
-    count_tx: &Sender<CountJob>,
-    results: &Receiver<CountResult>,
+    read_tx: &Sender<ReadJob>,
+    results: &Receiver<ReadResult>,
     result_wake: &UnixStream,
     alive: &AtomicBool,
 ) {
@@ -311,6 +370,7 @@ fn raid(
         }
 
         let mut dirty = false;
+        let mut repaint_demand = false;
         if readiness[0] {
             dirty = match historian.watchfire.reap() {
                 Ok(flare) => flare.overflowed || !flare.paths.is_empty(),
@@ -320,26 +380,13 @@ fn raid(
                 }
             };
         }
-        while let Ok(result) = results.try_recv() {
-            dirty |= historian.absorb(result);
-        }
-        while let Ok(intent) = intents.try_recv() {
-            match intent {
-                Intent::Inspect(threads) => historian.inspect(threads, count_tx),
-                Intent::Operate(order) => {
-                    let error = historian
-                        .operate(&order)
-                        .and_then(|()| historian.refresh())
-                        .err()
-                        .map(|error| format!("{error:#}"));
-                    outcomes
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(Outcome { order, error });
-                    dirty = true;
-                }
-            }
-        }
+        let (read_dirty, read_repaint) = drain_reads(&mut historian, results, transcripts);
+        dirty |= read_dirty;
+        repaint_demand |= read_repaint;
+        let (intent_dirty, intent_repaint) =
+            execute_intents(&mut historian, intents, read_tx, outcomes, transcripts);
+        dirty |= intent_dirty;
+        repaint_demand |= intent_repaint;
         let now = Instant::now();
         if now >= integrity_audit {
             dirty = true;
@@ -354,13 +401,64 @@ fn raid(
         if let Err(error) = historian.ledger.commit_due(now) {
             eprintln!("codex-wrangler could not seal its turn index: {error:#}");
         }
-        if dirty {
+        if dirty || repaint_demand {
             let _repaint = repaint.request_repaint();
         }
     }
     if let Err(error) = historian.ledger.commit() {
         eprintln!("codex-wrangler could not seal its turn index: {error:#}");
     }
+}
+
+fn drain_reads(
+    historian: &mut Historian,
+    results: &Receiver<ReadResult>,
+    transcripts: &Mutex<Vec<TranscriptOutcome>>,
+) -> (bool, bool) {
+    let mut dirty = false;
+    let mut repaint = false;
+    while let Ok(result) = results.try_recv() {
+        match result {
+            ReadResult::Count(result) => dirty |= historian.absorb(result),
+            ReadResult::Transcript(outcome) => {
+                transcripts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(outcome);
+                repaint = true;
+            }
+        }
+    }
+    (dirty, repaint)
+}
+
+fn execute_intents(
+    historian: &mut Historian,
+    intents: &Receiver<Intent>,
+    reader: &Sender<ReadJob>,
+    outcomes: &Mutex<Vec<Outcome>>,
+    transcripts: &Mutex<Vec<TranscriptOutcome>>,
+) -> (bool, bool) {
+    let mut dirty = false;
+    let mut repaint = false;
+    while let Ok(intent) = intents.try_recv() {
+        match intent {
+            Intent::Tally(threads) => historian.tally(threads, reader),
+            Intent::Read(thread) => repaint |= historian.read(thread, reader, transcripts),
+            Intent::Operate(order) => {
+                let error = historian
+                    .operate(&order)
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                outcomes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Outcome { order, error });
+                dirty = true;
+            }
+        }
+    }
+    (dirty, repaint)
 }
 
 fn wait_for_signal(
@@ -535,7 +633,7 @@ impl Historian {
         }
     }
 
-    fn inspect(&mut self, threads: Vec<String>, counter: &Sender<CountJob>) {
+    fn tally(&mut self, threads: Vec<String>, reader: &Sender<ReadJob>) {
         for thread in threads {
             let Some(artifact) = self.artifacts.get(&thread).cloned() else {
                 continue;
@@ -546,16 +644,51 @@ impl Historian {
             {
                 continue;
             }
-            if counter
-                .try_send(CountJob {
+            if reader
+                .try_send(ReadJob::Count(CountJob {
                     thread: thread.clone(),
                     artifact,
-                })
+                }))
                 .is_err()
             {
                 let _removed = self.requested.remove(&thread);
             }
         }
+    }
+
+    fn read(
+        &self,
+        thread: String,
+        reader: &Sender<ReadJob>,
+        transcripts: &Mutex<Vec<TranscriptOutcome>>,
+    ) -> bool {
+        let Some(artifact) = self.artifacts.get(&thread).cloned() else {
+            transcripts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(TranscriptOutcome {
+                    thread,
+                    turns: Vec::new(),
+                    error: Some("session payload vanished".to_owned()),
+                });
+            return true;
+        };
+        let job = TranscriptJob {
+            thread: thread.clone(),
+            artifact,
+        };
+        if reader.try_send(ReadJob::Transcript(job)).is_err() {
+            transcripts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(TranscriptOutcome {
+                    thread,
+                    turns: Vec::new(),
+                    error: Some("history reader is busy".to_owned()),
+                });
+            return true;
+        }
+        false
     }
 
     fn absorb(&mut self, result: CountResult) -> bool {
@@ -621,16 +754,7 @@ impl Historian {
         if !archived {
             bail!("session `{thread}` is not archived");
         }
-        let materialized = materialize(&nominal)?;
-        let result = run_codex(&self.home, &["unarchive", thread]);
-        if result.is_err() && materialized {
-            let still_archived = self.row(thread)?.is_some_and(|row| row.0);
-            if still_archived {
-                let _removed = fs::remove_file(&nominal);
-            }
-        }
-        result?;
-        remove_compressed(&nominal)
+        prepare_resume(&self.home, thread, archived, &nominal)
     }
 
     fn delete(&self, thread: &str) -> Result<()> {
@@ -654,6 +778,19 @@ impl Historian {
             .optional()
             .with_context(|| format!("query historical session `{thread}`"))
     }
+}
+
+pub(crate) fn prepare_resume(
+    home: &Path,
+    thread: &str,
+    archived: bool,
+    nominal: &Path,
+) -> Result<()> {
+    let _materialized = materialize(nominal)?;
+    if archived && let Err(error) = run_codex(home, &["unarchive", thread]) {
+        return Err(error);
+    }
+    remove_compressed(nominal)
 }
 
 fn resolve_artifact(nominal: &Path, updated_at_ms: i64) -> Option<Artifact> {
@@ -782,9 +919,9 @@ fn run_codex(home: &Path, arguments: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn count_turns(
-    jobs: &Receiver<CountJob>,
-    results: &Sender<CountResult>,
+fn read_history(
+    jobs: &Receiver<ReadJob>,
+    results: &Sender<ReadResult>,
     wake: &UnixStream,
     alive: &AtomicBool,
 ) {
@@ -792,11 +929,23 @@ fn count_turns(
         let Ok(job) = jobs.recv_timeout(Duration::from_millis(250)) else {
             continue;
         };
-        let tally = tally(&job.artifact, alive).map_err(|error| format!("{error:#}"));
-        let result = CountResult {
-            thread: job.thread,
-            updated_at_ms: job.artifact.updated_at_ms,
-            tally,
+        let result = match job {
+            ReadJob::Count(job) => ReadResult::Count(CountResult {
+                thread: job.thread,
+                updated_at_ms: job.artifact.updated_at_ms,
+                tally: tally(&job.artifact, alive).map_err(|error| format!("{error:#}")),
+            }),
+            ReadJob::Transcript(job) => {
+                let (turns, error) = match read_transcript(&job.artifact, alive) {
+                    Ok(turns) => (turns, None),
+                    Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+                };
+                ReadResult::Transcript(TranscriptOutcome {
+                    thread: job.thread,
+                    turns,
+                    error,
+                })
+            }
         };
         if results.send(result).is_err() {
             break;
@@ -806,9 +955,21 @@ fn count_turns(
 }
 
 fn tally(artifact: &Artifact, alive: &AtomicBool) -> Result<u64> {
+    read_artifact(artifact, alive, |reader| scan(reader, alive))
+}
+
+fn read_transcript(artifact: &Artifact, alive: &AtomicBool) -> Result<Vec<Turn>> {
+    read_artifact(artifact, alive, |reader| parse_turns(reader, alive))
+}
+
+fn read_artifact<T>(
+    artifact: &Artifact,
+    alive: &AtomicBool,
+    consume: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<T> {
     debug_assert_eq!(artifact.nominal == artifact.path, !artifact.compressed);
     if !artifact.compressed {
-        return scan(File::open(&artifact.path)?, alive);
+        return consume(&mut File::open(&artifact.path)?);
     }
     let mut child = Command::new("nice")
         .args(["-n", "15", "zstd", "-q", "-d", "-c"])
@@ -818,8 +979,8 @@ fn tally(artifact: &Artifact, alive: &AtomicBool) -> Result<u64> {
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("open compressed session `{}`", artifact.path.display()))?;
-    let stdout = child.stdout.take().context("open zstd output")?;
-    let result = scan(stdout, alive);
+    let mut stdout = child.stdout.take().context("open zstd output")?;
+    let result = consume(&mut stdout);
     if !alive.load(Ordering::Acquire) {
         let _killed = child.kill();
     }
@@ -828,6 +989,92 @@ fn tally(artifact: &Artifact, alive: &AtomicBool) -> Result<u64> {
         bail!("zstd could not read `{}`", artifact.path.display());
     }
     result
+}
+
+fn parse_turns(reader: &mut dyn Read, alive: &AtomicBool) -> Result<Vec<Turn>> {
+    let mut turns = Vec::new();
+    for line in BufReader::new(reader).lines() {
+        if !alive.load(Ordering::Acquire) {
+            bail!("transcript scan cancelled");
+        }
+        let line = line?;
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let payload = &event["payload"];
+        match payload.get("type").and_then(Value::as_str) {
+            Some("user_message") => {
+                if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                    push_user(&mut turns, message);
+                }
+            }
+            Some("agent_message") => {
+                if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                    assign_model(&mut turns, message);
+                }
+            }
+            Some("item_completed") => absorb_completed_item(&mut turns, &payload["item"]),
+            Some("task_complete" | "turn_complete") => {
+                if let Some(message) = payload.get("last_agent_message").and_then(Value::as_str) {
+                    assign_model(&mut turns, message);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(turns)
+}
+
+fn absorb_completed_item(turns: &mut Vec<Turn>, item: &Value) {
+    let Some(content) = item.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    let message = content
+        .iter()
+        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+            Some("text") => part.get("text").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    match item.get("type").and_then(Value::as_str) {
+        Some("UserMessage") => push_user(turns, &message),
+        Some("AgentMessage") => assign_model(turns, &message),
+        _ => {}
+    }
+}
+
+fn push_user(turns: &mut Vec<Turn>, message: &str) {
+    let message = message.trim();
+    if message.is_empty()
+        || turns
+            .last()
+            .is_some_and(|turn| turn.model.is_empty() && turn.user == message)
+    {
+        return;
+    }
+    turns.push(Turn {
+        user: message.to_owned(),
+        model: String::new(),
+    });
+}
+
+fn assign_model(turns: &mut Vec<Turn>, message: &str) {
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+    if turns.is_empty() {
+        turns.push(Turn {
+            user: String::new(),
+            model: message.to_owned(),
+        });
+    } else if let Some(turn) = turns.last_mut() {
+        message.clone_into(&mut turn.model);
+    }
 }
 
 fn scan(mut reader: impl Read, alive: &AtomicBool) -> Result<u64> {

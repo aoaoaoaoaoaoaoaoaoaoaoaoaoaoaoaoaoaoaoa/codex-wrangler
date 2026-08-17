@@ -43,7 +43,24 @@ const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Intent {
     Select,
+    Fork,
+    Open,
     Dismiss,
+}
+
+#[derive(Clone, Copy)]
+enum CodexLaunch {
+    Resume,
+    Fork,
+}
+
+impl CodexLaunch {
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Resume => "resume",
+            Self::Fork => "fork",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -274,7 +291,7 @@ fn execute_strikes(
 ) -> bool {
     let mut struck = false;
     while let Ok(strike) = strikes.try_recv() {
-        let conceal = strike.intent == Intent::Select;
+        let conceal = matches!(strike.intent, Intent::Select | Intent::Fork | Intent::Open);
         let succeeded = recon.execute(&strike, now).unwrap_or_else(|error| {
             eprintln!(
                 "codex-wrangler could not execute {:?} for {}: {error:#}",
@@ -552,6 +569,9 @@ impl Recon {
     }
 
     fn execute(&mut self, strike: &Strike, now: Instant) -> Result<bool> {
+        if strike.harness == Harness::Codex && strike.intent == Intent::Open {
+            return self.open_historical(&strike.thread);
+        }
         let Some(card) = self
             .semantic
             .iter()
@@ -568,6 +588,8 @@ impl Recon {
         }
         match strike.intent {
             Intent::Select => self.select_codex(&card, now),
+            Intent::Fork => self.fork_codex(&card),
+            Intent::Open => Ok(false),
             Intent::Dismiss => self.dismiss_codex(&card, now),
         }
     }
@@ -638,6 +660,41 @@ impl Recon {
         Ok(true)
     }
 
+    fn fork_codex(&mut self, card: &Card) -> Result<bool> {
+        let codex = self.codex.as_ref().context("Codex adapter is absent")?;
+        let session = codex
+            .roster
+            .get(&card.thread)
+            .context("Codex session is absent from Wrangler state")?;
+        let cwd = session.cwd.clone();
+        let home = codex.home.clone();
+        self.launch_codex(&card.thread, &cwd, card.workspace, &home, CodexLaunch::Fork)?;
+        Ok(true)
+    }
+
+    fn open_historical(&mut self, thread: &str) -> Result<bool> {
+        let codex = self.codex.as_ref().context("Codex adapter is absent")?;
+        let (cwd, archived, nominal) = codex
+            .db
+            .query_row(
+                "SELECT cwd, archived, rollout_path FROM threads WHERE id = ?1",
+                params![thread],
+                |row| {
+                    Ok((
+                        PathBuf::from(row.get::<_, String>(0)?),
+                        row.get::<_, bool>(1)?,
+                        PathBuf::from(row.get::<_, String>(2)?),
+                    ))
+                },
+            )
+            .optional()?
+            .context("historical Codex session vanished")?;
+        let home = codex.home.clone();
+        crate::history::prepare_resume(&home, thread, archived, &nominal)?;
+        self.launch_codex(thread, &cwd, None, &home, CodexLaunch::Resume)?;
+        Ok(true)
+    }
+
     fn retire(&mut self, seat: Seat, now: Instant) -> Result<()> {
         if !self.stasis.prepare_retirement(now, seat.window) {
             anyhow::bail!("Codex process {} remains frozen", seat.process.pid);
@@ -671,12 +728,33 @@ impl Recon {
         active: Option<AccountMark>,
         version: Option<Version>,
     ) -> Result<bool> {
-        let codex = self.codex.as_mut().context("Codex adapter is absent")?;
+        let codex = self.codex.as_ref().context("Codex adapter is absent")?;
         let session = codex
             .roster
             .get(thread_id)
-            .cloned()
             .context("Codex session is absent from Wrangler state")?;
+        let cwd = session.cwd.clone();
+        let home = codex.home.clone();
+        self.launch_codex(thread_id, &cwd, workspace, &home, CodexLaunch::Resume)?;
+        let codex = self.codex.as_mut().context("Codex adapter is absent")?;
+        if let Some(active) = active {
+            codex.roster.bind(thread_id, active);
+        }
+        if let Some(version) = version {
+            codex.roster.bind_version(thread_id, &version.to_string());
+        }
+        codex.commit()?;
+        Ok(true)
+    }
+
+    fn launch_codex(
+        &mut self,
+        thread_id: &str,
+        cwd: &Path,
+        workspace: Option<u32>,
+        home: &Path,
+        launch: CodexLaunch,
+    ) -> Result<()> {
         if let Some(workspace) = workspace {
             let destination = format!("workspace number {workspace}");
             let status = Command::new("i3-msg")
@@ -689,9 +767,9 @@ impl Recon {
         }
         let mut child = Command::new("alacritty")
             .arg("--working-directory")
-            .arg(&session.cwd)
-            .args(["-e", "codex", "resume", thread_id])
-            .env("CODEX_HOME", &codex.home)
+            .arg(cwd)
+            .args(["-e", "codex", launch.verb(), thread_id])
+            .env("CODEX_HOME", home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -719,15 +797,7 @@ impl Recon {
             })
             .context("spawn Alacritty reaper")?;
         self.desktop.activate(window)?;
-        let codex = self.codex.as_mut().context("Codex adapter is absent")?;
-        if let Some(active) = active {
-            codex.roster.bind(thread_id, active);
-        }
-        if let Some(version) = version {
-            codex.roster.bind_version(thread_id, &version.to_string());
-        }
-        codex.commit()?;
-        Ok(true)
+        Ok(())
     }
 
     fn active_account(&self, operation: &str) -> Option<AccountMark> {
