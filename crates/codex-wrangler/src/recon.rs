@@ -30,6 +30,7 @@ use crate::{
     desktop::{Desktop, DesktopSignal},
     model::{Card, Census, snip},
     names::NameIndex,
+    pinboard::Pinboard,
     rollout::{RolloutSummary, Rollouts, TurnState},
     roster::{AccountMark, Roster, Sighting as SessionSighting},
     stasis::{ProcessKey, Quarry, Stasis},
@@ -44,6 +45,8 @@ const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 pub enum Intent {
     Select,
     Fork,
+    Pin,
+    Unpin,
     Open,
     Dismiss,
 }
@@ -419,6 +422,7 @@ struct Recon {
     stasis: Stasis,
     transcripts: Transcripts,
     watchfire: Watchfire,
+    pinboard: Pinboard,
 }
 
 #[derive(Clone, Copy)]
@@ -446,6 +450,7 @@ impl Recon {
             stasis: Stasis::arm(),
             transcripts: Transcripts::default(),
             watchfire: Watchfire::kindle()?,
+            pinboard: Pinboard::restore()?,
         })
     }
 
@@ -534,6 +539,9 @@ impl Recon {
             cards.extend(codex.closed_cards(codex_seats.keys().map(String::as_str)));
             codex.commit()?;
         }
+        for card in &mut cards {
+            card.pinned = self.pinboard.contains(card.harness, &card.thread);
+        }
         for card in &cards {
             card.assert_lawful();
         }
@@ -580,6 +588,12 @@ impl Recon {
         else {
             return Ok(false);
         };
+        if matches!(strike.intent, Intent::Pin | Intent::Unpin) {
+            self.pinboard
+                .set(strike.harness, &strike.thread, strike.intent == Intent::Pin);
+            self.pinboard.commit()?;
+            return Ok(true);
+        }
         if strike.harness != Harness::Codex {
             return match (strike.intent, card.window) {
                 (Intent::Select, Some(window)) => self.activate(window, now),
@@ -589,8 +603,17 @@ impl Recon {
         match strike.intent {
             Intent::Select => self.select_codex(&card, now),
             Intent::Fork => self.fork_codex(&card),
+            Intent::Pin | Intent::Unpin => unreachable!("pin intent returned above"),
             Intent::Open => Ok(false),
-            Intent::Dismiss => self.dismiss_codex(&card, now),
+            Intent::Dismiss => {
+                let forgotten = card.work == Work::Closed;
+                let succeeded = self.dismiss_codex(&card, now)?;
+                if succeeded && forgotten {
+                    self.pinboard.set(card.harness, &card.thread, false);
+                    self.pinboard.commit()?;
+                }
+                Ok(succeeded)
+            }
         }
     }
 
@@ -964,6 +987,7 @@ impl Codex {
                 window: Some(window),
                 workspace,
                 updated_at_ms: thread.updated_at_ms,
+                pinned: false,
             },
             rollout,
         )))
@@ -984,6 +1008,7 @@ impl Codex {
                 window: None,
                 workspace: session.workspace,
                 updated_at_ms: session.updated_at_ms,
+                pinned: false,
             })
             .collect()
     }
@@ -1169,6 +1194,7 @@ fn foreign_card(
         updated_at_ms: summary
             .as_ref()
             .map_or_else(|| i64::from(process.pid), |summary| summary.updated_at_ms),
+        pinned: false,
     };
     (card, path)
 }

@@ -215,9 +215,9 @@ dependencies = [
 
 [[package]]
 name = "brass_poolrooms"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c16ccdd43749fc28f24c6861ea5e41310da450514531686cac3ea3be1138e3cd"
+checksum = "b5d3782bbfcee4cd06ff5f18238d51392f7614848b1058f23d17541115080866"
 dependencies = [
  "anyhow",
  "bytemuck",

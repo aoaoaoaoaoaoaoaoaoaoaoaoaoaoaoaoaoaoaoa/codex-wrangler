@@ -22,8 +22,8 @@ mod terminal_fixture;
 #[path = "../../codex-wrangler/src/contract.rs"]
 mod contract;
 use contract::{
-    CardKey, CardTarget, ClosePreference, DeleteGuard, Flight, GuideVisibility, Harness,
-    HistoryColumn, HistoryOperation, HistorySortTarget, HistoryTarget, Observation,
+    CardKey, CardTarget, ClosePreference, DeleteGuard, Flight, ForkField, GuideVisibility, Harness,
+    HistoryColumn, HistoryOperation, HistorySortTarget, HistoryTarget, Observation, PinField,
     PreferenceTarget, SearchTarget, SortDirection, Tab, TabTarget, UI_FINGERPRINT, Work,
     WorkspaceTarget,
 };
@@ -497,6 +497,7 @@ fn verify_session_lifecycle(
     verify_remembrance(fixture)?;
     verify_history_open(testbed, story)?;
     verify_management_veto(story, fixture)?;
+    pin_and_unpin(story, fixture)?;
     fork_and_return(testbed, story, app, fixture)?;
     select_and_return(
         testbed,
@@ -615,7 +616,14 @@ fn fork_and_return(
 ) -> Result<()> {
     story.session().focus()?;
     let (strike_x, strike_y) = seize_card(story, TURN, "fork")?;
-    let _control_down = story.session().key_down(Key::Control)?;
+    let control_down = story.session().key_down(Key::Control)?;
+    let _yearning = story
+        .reaction(control_down)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "held Ctrl to arm the Longinus fork field",
+            |state: &Observation| state.fork_field == ForkField::Armed && !state.jiggling,
+        ))?;
     let forked = story.session().click(strike_x, strike_y, Button::Primary)?;
     let _armed = story.reaction(forked).until(Condition::new(
         "Ctrl+click to enter fork flight",
@@ -651,6 +659,78 @@ fn fork_and_return(
         original.work == Work::Turn,
         "forking a session displaced its original live terminal",
     )?;
+    Ok(())
+}
+
+fn pin_and_unpin(story: &mut Story<'_, '_, Observation>, fixture: &Fixture) -> Result<()> {
+    let (x, y) = seize_card(story, DONE, "pin")?;
+    let alt_down = story.session().key_down(Key::Alt)?;
+    let _settled = story
+        .reaction(alt_down)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "held Alt to settle tiles beneath the Forge Pin",
+            |state: &Observation| {
+                state.pin_field == PinField::Armed
+                    && state.fork_field == ForkField::Quiescent
+                    && !state.jiggling
+            },
+        ))?;
+    let clicked = story.session().click(x, y, Button::Primary)?;
+    let _flight = story.reaction(clicked).until(Condition::new(
+        "Alt+click to submit the pin",
+        |state: &Observation| state.flight == Flight::Striking,
+    ))?;
+    let _alt_up = story.session().key_up(Key::Alt)?;
+    vacate_gallery(story, "pointer to release the pinned card")?;
+    let _pinned = story.wait(Condition::new(
+        "pinned session to enter the head bucket",
+        |state: &Observation| {
+            state
+                .cards
+                .iter()
+                .any(|card| card.thread == DONE && card.pinned)
+                && state
+                    .visible
+                    .first()
+                    .is_some_and(|card| card.thread == DONE)
+        },
+    ))?;
+    let persisted = fs::read_to_string(&fixture.pinboard).unwrap_or_default();
+    demand(
+        persisted.contains(DONE),
+        "pin did not reach XDG state before acknowledgement",
+    )?;
+
+    let (x, y) = seize_card(story, DONE, "unpin")?;
+    let alt_down = story.session().key_down(Key::Alt)?;
+    let _settled = story
+        .reaction(alt_down)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "held Alt to settle the pinned tile beneath the Forge Pin",
+            |state: &Observation| state.pin_field == PinField::Armed,
+        ))?;
+    let clicked = story.session().click(x, y, Button::Primary)?;
+    let _flight = story.reaction(clicked).until(Condition::new(
+        "Alt+click to submit the unpin",
+        |state: &Observation| state.flight == Flight::Striking,
+    ))?;
+    let _alt_up = story.session().key_up(Key::Alt)?;
+    vacate_gallery(story, "pointer to release the unpinned card")?;
+    let _unpinned = story.wait(Condition::new(
+        "unpinned session to leave the head bucket",
+        |state: &Observation| {
+            state
+                .cards
+                .iter()
+                .any(|card| card.thread == DONE && !card.pinned)
+                && state
+                    .visible
+                    .first()
+                    .is_some_and(|card| card.thread != DONE)
+        },
+    ))?;
     Ok(())
 }
 
@@ -2158,6 +2238,7 @@ struct Fixture {
     state: PathBuf,
     roster: PathBuf,
     preferences: PathBuf,
+    pinboard: PathBuf,
     index: PathBuf,
     rotate_resume: PathBuf,
     fork_launch: PathBuf,
@@ -2175,14 +2256,12 @@ impl Fixture {
         seed_historical(&codex, &archive)?;
         let db_path = testbed.private_path("home/.codex/state_5.sqlite")?;
         seed_index(&db_path)?;
-        let goals = testbed.private_path("home/.codex/goals_1.sqlite")?;
-        seed_goals(&goals)?;
+        let goals = forge_goals(testbed)?;
         seed_names(testbed)?;
         let state = testbed.write_private("xdg/state/codex-wrangler/window-mode", b"tiled\n")?;
         let roster = seed_roster(testbed)?;
         forge_workdirs(testbed)?;
         let (claude, prime) = seed_foreign_transcripts(testbed)?;
-
         let fake = forge_fake_harness(testbed)?;
         let fake_cli = forge_fake_cli(testbed)?;
         forge_zstd_guard(testbed)?;
@@ -2262,6 +2341,7 @@ impl Fixture {
             state,
             roster,
             preferences: testbed.private_path("xdg/state/codex-wrangler/preferences.json")?,
+            pinboard: testbed.private_path("xdg/state/codex-wrangler/pinned-sessions.json")?,
             index: db_path,
             rotate_resume,
             fork_launch: testbed.private_path(format!("fork-proof-{TURN}"))?,
@@ -2269,6 +2349,12 @@ impl Fixture {
             dormant_resume,
         })
     }
+}
+
+fn forge_goals(testbed: &Testbed) -> Result<PathBuf> {
+    let goals = testbed.private_path("home/.codex/goals_1.sqlite")?;
+    seed_goals(&goals)?;
+    Ok(goals)
 }
 
 fn forge_workdirs(testbed: &Testbed) -> Result<()> {

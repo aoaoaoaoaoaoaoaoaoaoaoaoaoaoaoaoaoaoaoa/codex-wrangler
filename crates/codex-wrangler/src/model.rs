@@ -13,6 +13,7 @@ pub struct Card {
     pub window: Option<u32>,
     pub workspace: Option<u32>,
     pub updated_at_ms: i64,
+    pub pinned: bool,
 }
 
 impl Card {
@@ -47,11 +48,13 @@ pub fn snip(text: &str, limit: usize) -> String {
 
 impl Ord for Card {
     fn cmp(&self, other: &Self) -> Ordering {
-        rank(self.work)
-            .cmp(&rank(other.work))
-            .then_with(|| other.updated_at_ms.cmp(&self.updated_at_ms))
-            .then_with(|| self.harness.cmp(&other.harness))
-            .then_with(|| self.thread.cmp(&other.thread))
+        other.pinned.cmp(&self.pinned).then_with(|| {
+            rank(self.work)
+                .cmp(&rank(other.work))
+                .then_with(|| other.updated_at_ms.cmp(&self.updated_at_ms))
+                .then_with(|| self.harness.cmp(&other.harness))
+                .then_with(|| self.thread.cmp(&other.thread))
+        })
     }
 }
 
@@ -88,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_live_sessions_share_recency_while_closed_remains_last() {
+    fn pinned_heads_while_unpinned_stops_share_recency_and_closed_tails() {
         let card = |thread: &str, work, updated_at_ms| Card {
             harness: Harness::Codex,
             thread: thread.to_owned(),
@@ -99,16 +102,18 @@ mod tests {
             window: (work != Work::Closed).then_some(1),
             workspace: None,
             updated_at_ms,
+            pinned: false,
         };
         let mut cards = [
             card("old-sleep", Work::Sleep, 10),
             card("new-done", Work::Done, 20),
             card("newest-closed", Work::Closed, 30),
         ];
+        cards[0].pinned = true;
         cards.sort();
         assert_eq!(
             cards.map(|card| card.thread),
-            ["new-done", "old-sleep", "newest-closed"]
+            ["old-sleep", "new-done", "newest-closed"]
         );
     }
 }

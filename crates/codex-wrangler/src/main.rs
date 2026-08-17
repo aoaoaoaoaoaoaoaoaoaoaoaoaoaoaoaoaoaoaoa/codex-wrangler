@@ -8,6 +8,7 @@ mod i3;
 mod instance;
 mod model;
 mod names;
+mod pinboard;
 mod posture;
 mod preferences;
 mod recon;

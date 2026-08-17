@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "egui-test")]
-pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/23";
+pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/25";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -76,6 +76,22 @@ pub enum Flight {
 #[cfg(feature = "egui-test")]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum ForkField {
+    Quiescent,
+    Armed,
+}
+
+#[cfg(feature = "egui-test")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PinField {
+    Quiescent,
+    Armed,
+}
+
+#[cfg(feature = "egui-test")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Tab {
     Live,
     Historical,
@@ -105,6 +121,7 @@ pub struct CardObservation {
     pub thread: String,
     pub work: Work,
     pub workspace: Option<u32>,
+    pub pinned: bool,
 }
 
 #[cfg(feature = "egui-test")]
@@ -115,6 +132,8 @@ pub struct Observation {
     pub hovered: Option<CardKey>,
     pub loading: bool,
     pub jiggling: bool,
+    pub fork_field: ForkField,
+    pub pin_field: PinField,
     pub flight: Flight,
     pub search: SearchObservation,
     pub guide: GuideVisibility,

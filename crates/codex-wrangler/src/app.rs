@@ -8,14 +8,15 @@ use std::{
 
 #[cfg(feature = "egui-test")]
 use crate::contract::{
-    CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, GuideVisibility,
-    HistoryObservation, HistoryRenameObservation, HistorySortObservation, HistorySortTarget,
-    HistoryTarget, HistoryTranscriptObservation, Observation, PreferenceTarget, SearchObservation,
-    SearchTarget, Tab, TabTarget, UI_FINGERPRINT, WorkspaceTarget,
+    CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, ForkField,
+    GuideVisibility, HistoryObservation, HistoryRenameObservation, HistorySortObservation,
+    HistorySortTarget, HistoryTarget, HistoryTranscriptObservation, Observation, PinField,
+    PreferenceTarget, SearchObservation, SearchTarget, Tab, TabTarget, UI_FINGERPRINT,
+    WorkspaceTarget,
 };
 use brass_poolrooms::{
     chrome,
-    chrome::{MechanismSize, SortDetent, SortToggle},
+    chrome::{ForgePin, LonginusCursor, MechanismSize, SortDetent, SortToggle},
     water::{Domain, Floor, Frame as WaterFrame, Poke, Surface, Wetness},
 };
 use egui::{
@@ -60,16 +61,37 @@ const TILE_IMPULSE_CEIL: f32 = 1.60;
 const TILE_SWEEP_EPSILON: f32 = 0.05;
 const FEAR_REACH: f32 = 720.0;
 const FEAR_FLEE: f32 = 2.25;
+const YEARNING_REACH: f32 = 880.0;
+const YEARNING_PULL: f32 = 5.0;
+const YEARNING_SWELL: f32 = 5.5;
+const PIN_REACH: f32 = 760.0;
+const PIN_PULL: f32 = 3.5;
+const PIN_SETTLE: f32 = 2.75;
 const HISTORY_ROW: f32 = 34.0;
 
-type JoltLedger = HashMap<Harness, HashMap<String, Vec2>>;
+#[derive(Clone, Copy, Default)]
+struct TilePose {
+    offset: Vec2,
+    swell: f32,
+}
+
+type JoltLedger = HashMap<Harness, HashMap<String, TilePose>>;
 
 struct CardPhysics<'a> {
-    jiggling: bool,
+    tool: TileTool,
     recoiling: bool,
     water: &'a mut Surface,
     jolts: &'a mut JoltLedger,
     hovered: &'a mut Option<usize>,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum TileTool {
+    #[default]
+    Rest,
+    Dismiss,
+    Fork,
+    Pin,
 }
 
 struct ActivationFlight {
@@ -265,7 +287,7 @@ struct Wrangler<const START_FLOATING: bool> {
     hovered: Option<usize>,
     history_hovered: Option<String>,
     search_focus: SearchFocus,
-    jiggling: bool,
+    tile_tool: TileTool,
     jolts: JoltLedger,
     scry: Scry,
     history_scry: HistoryScry,
@@ -353,7 +375,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             hovered: None,
             history_hovered: None,
             search_focus: SearchFocus::Idle,
-            jiggling: false,
+            tile_tool: TileTool::Rest,
             jolts: JoltLedger::new(),
             scry: Scry::default(),
             history_scry: HistoryScry::default(),
@@ -375,7 +397,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     fn quench(&mut self) {
         self.clear_search();
         self.visibility = GalleryVisibility::Concealed;
-        self.jiggling = false;
+        self.tile_tool = TileTool::Rest;
         self.jolts.clear();
         self.history_rename = None;
         self.transcript = None;
@@ -793,7 +815,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         &mut self,
         ui: &mut egui::Ui,
         search_id: egui::Id,
-        jiggling: bool,
+        tool: TileTool,
         recoiling: bool,
     ) -> (Option<Strike>, f32) {
         let mut selected = None;
@@ -844,7 +866,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                                 &census.cards,
                                 self.scry.hits(),
                                 &mut CardPhysics {
-                                    jiggling,
+                                    tool,
                                     recoiling,
                                     water: &mut self.water,
                                     jolts: &mut self.jolts,
@@ -1326,6 +1348,40 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     #[cfg(feature = "egui-test")]
+    const fn fork_field(&self) -> ForkField {
+        if matches!(self.tile_tool, TileTool::Fork) {
+            ForkField::Armed
+        } else {
+            ForkField::Quiescent
+        }
+    }
+
+    #[cfg(feature = "egui-test")]
+    const fn pin_field(&self) -> PinField {
+        if matches!(self.tile_tool, TileTool::Pin) {
+            PinField::Armed
+        } else {
+            PinField::Quiescent
+        }
+    }
+
+    #[cfg(feature = "egui-test")]
+    fn card_observations(&self) -> Vec<CardObservation> {
+        self.census
+            .iter()
+            .flat_map(|census| &census.cards)
+            .map(|card| CardObservation {
+                harness: card.harness,
+                name: card.name.clone(),
+                thread: card.thread.clone(),
+                work: card.work,
+                workspace: card.workspace,
+                pinned: card.pinned,
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "egui-test")]
     fn observation(&self, text_edit_focused: bool) -> Observation {
         let live = live_codex_threads(self.census.as_ref());
         let history = live.as_ref().map_or_else(Vec::new, |live| {
@@ -1367,7 +1423,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     })
             }),
             loading: self.census.is_none(),
-            jiggling: self.jiggling,
+            jiggling: matches!(self.tile_tool, TileTool::Dismiss),
+            fork_field: self.fork_field(),
+            pin_field: self.pin_field(),
             flight: if self.pending_activation.is_some() {
                 Flight::Striking
             } else {
@@ -1405,18 +1463,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     thread: card.thread.clone(),
                 })
                 .collect(),
-            cards: self
-                .census
-                .iter()
-                .flat_map(|census| &census.cards)
-                .map(|card| CardObservation {
-                    harness: card.harness,
-                    name: card.name.clone(),
-                    thread: card.thread.clone(),
-                    work: card.work,
-                    workspace: card.workspace,
-                })
-                .collect(),
+            cards: self.card_observations(),
             history,
             history_rename: self.rename_observation(text_edit_focused),
             history_transcript: self.transcript_observation(),
@@ -1461,14 +1508,25 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         let modal_open = self.delete_target.is_some() || self.transcript.is_some();
         self.seize_shortcuts(ui, search_id, modal_open);
         let basin = ui.max_rect();
-        let jiggling = !modal_open
+        let physical_mode = !modal_open
             && self.page == Page::Live
             && !self.guide.is_open()
-            && !ui.ctx().text_edit_focused()
-            && ui.input(|input| input.modifiers.shift);
-        let recoiling = self.jiggling && !jiggling;
-        self.jiggling = jiggling;
-        if jiggling {
+            && !ui.ctx().text_edit_focused();
+        let modifiers = ui.input(|input| input.modifiers);
+        let tile_tool = if !physical_mode {
+            TileTool::Rest
+        } else if modifiers.matches_exact(egui::Modifiers::SHIFT) {
+            TileTool::Dismiss
+        } else if modifiers.matches_exact(egui::Modifiers::CTRL) {
+            TileTool::Fork
+        } else if modifiers.matches_exact(egui::Modifiers::ALT) {
+            TileTool::Pin
+        } else {
+            TileTool::Rest
+        };
+        let recoiling = self.tile_tool != TileTool::Rest && tile_tool == TileTool::Rest;
+        self.tile_tool = tile_tool;
+        if tile_tool == TileTool::Dismiss {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(45));
         }
@@ -1476,7 +1534,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         self.water.set_floor(Some(Floor::shallow(basin)));
         let (selected, historical, heave) = match self.page {
             Page::Live => {
-                let (selected, heave) = self.gallery_panel(ui, search_id, jiggling, recoiling);
+                let (selected, heave) = self.gallery_panel(ui, search_id, tile_tool, recoiling);
                 (selected, None, heave)
             }
             Page::Historical => {
@@ -1484,7 +1542,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
                 (None, gesture, heave)
             }
         };
-        if !jiggling {
+        if tile_tool == TileTool::Rest {
             self.jolts.clear();
         }
         if let Some(strike) = selected {
@@ -1512,7 +1570,10 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
             Page::Historical => self.history_hovered.is_none(),
         };
         let mut changed = history_outcome;
-        if stable_pointer && !jiggling && !self.search_focus.held() && self.history_rename.is_none()
+        if stable_pointer
+            && tile_tool == TileTool::Rest
+            && !self.search_focus.held()
+            && self.history_rename.is_none()
         {
             changed |= self.drain();
             changed |= self.drain_history();
@@ -2326,16 +2387,32 @@ fn card(
 ) -> Option<Strike> {
     let (id, rect) = ui.allocate_space(Vec2::new(width, TILE_HEIGHT));
     let dismissible = dismissible(card.harness, card.work);
-    let fleeing = physics.jiggling && dismissible;
-    let offset = fear_offset(ui, &card.thread, rect, fleeing);
-    let visual = rect.translate(offset);
-    let pointer_inside = ui.rect_contains_pointer(visual);
-    if physics.jiggling || physics.recoiling {
+    let fleeing = physics.tool == TileTool::Dismiss && dismissible;
+    let yearning = physics.tool == TileTool::Fork && card.harness == Harness::Codex;
+    let pinning = physics.tool == TileTool::Pin;
+    let pose = if fleeing {
+        TilePose {
+            offset: fear_offset(ui, &card.thread, rect, true),
+            swell: 0.0,
+        }
+    } else if yearning {
+        yearning_pose(ui, rect)
+    } else if pinning {
+        pinning_pose(ui, rect)
+    } else {
+        TilePose::default()
+    };
+    let visual = egui::Rect::from_center_size(
+        rect.center() + pose.offset,
+        rect.size() + Vec2::splat(pose.swell * 2.0),
+    );
+    let pointer_inside = ui.rect_contains_pointer(rect);
+    if physics.tool != TileTool::Rest || physics.recoiling {
         let travel = advance_jolt(
             physics.jolts,
             card.harness,
             &card.thread,
-            fleeing.then_some(offset),
+            (fleeing || yearning || pinning).then_some(pose),
         );
         displace_tile(physics.water, visual, travel);
     }
@@ -2356,7 +2433,7 @@ fn card(
 
     // Final authority owns the whole tile after every inert child.
     let response = ui
-        .interact(visual, id, Sense::click())
+        .interact(rect, id, Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     brass_poolrooms::poolroom_anchor!(
         ui,
@@ -2365,23 +2442,31 @@ fn card(
     );
     if response.hovered() {
         *physics.hovered = Some(hit.card());
+        if pinning {
+            ui.ctx().set_cursor_image(Some(ForgePin::cursor_image()));
+        } else if yearning {
+            ui.ctx().set_cursor_image(Some(LonginusCursor::image()));
+        }
         physics
             .water
             .hover((card.harness.slug(), &card.thread), visual);
     }
     if response.clicked() {
-        if physics.jiggling && !dismissible {
-            return None;
-        }
-        let forking = ui.input(|input| input.modifiers.matches_exact(egui::Modifiers::CTRL));
-        let intent = if physics.jiggling {
-            Intent::Dismiss
-        } else if forking && card.harness == Harness::Codex {
-            Intent::Fork
-        } else if forking {
-            return None;
-        } else {
+        let modifiers = ui.input(|input| input.modifiers);
+        let intent = if modifiers.matches_exact(egui::Modifiers::SHIFT) {
+            dismissible.then_some(Intent::Dismiss)?
+        } else if modifiers.matches_exact(egui::Modifiers::CTRL) {
+            (card.harness == Harness::Codex).then_some(Intent::Fork)?
+        } else if modifiers.matches_exact(egui::Modifiers::ALT) {
+            if card.pinned {
+                Intent::Unpin
+            } else {
+                Intent::Pin
+            }
+        } else if modifiers.matches_exact(egui::Modifiers::NONE) {
             Intent::Select
+        } else {
+            return None;
         };
         physics.water.click(visual);
         Some(Strike {
@@ -2438,6 +2523,15 @@ fn paint_card_contents(
     );
     drop(body);
     paint_card_work(ui.painter(), visual, card.work);
+    if card.pinned {
+        let _pin = ui.painter().text(
+            visual.left_bottom() + Vec2::new(14.0, -10.0),
+            egui::Align2::LEFT_BOTTOM,
+            "PINNED",
+            egui::FontId::monospace(9.5),
+            chrome::HOT,
+        );
+    }
 }
 
 fn marked_label(
@@ -2489,6 +2583,48 @@ fn fear_offset(ui: &egui::Ui, thread: &str, bounds: egui::Rect, afraid: bool) ->
     fear_pose(thread, clock, bounds, pointer)
 }
 
+fn yearning_pose(ui: &egui::Ui, bounds: egui::Rect) -> TilePose {
+    yearning_pose_at(bounds, ui.input(|input| input.pointer.hover_pos()))
+}
+
+fn yearning_pose_at(bounds: egui::Rect, pointer: Option<egui::Pos2>) -> TilePose {
+    let Some(pointer) = pointer else {
+        return TilePose::default();
+    };
+    let toward = pointer - bounds.center();
+    let proximity = proximity(toward.length(), YEARNING_REACH);
+    let direction = if toward.length_sq() > f32::EPSILON {
+        toward.normalized()
+    } else {
+        Vec2::ZERO
+    };
+    TilePose {
+        offset: direction * (YEARNING_PULL * proximity),
+        swell: YEARNING_SWELL * proximity,
+    }
+}
+
+fn pinning_pose(ui: &egui::Ui, bounds: egui::Rect) -> TilePose {
+    pinning_pose_at(bounds, ui.input(|input| input.pointer.hover_pos()))
+}
+
+fn pinning_pose_at(bounds: egui::Rect, pointer: Option<egui::Pos2>) -> TilePose {
+    let Some(pointer) = pointer else {
+        return TilePose::default();
+    };
+    let toward = pointer - bounds.center();
+    let proximity = proximity(toward.length(), PIN_REACH);
+    let direction = if toward.length_sq() > f32::EPSILON {
+        toward.normalized()
+    } else {
+        Vec2::ZERO
+    };
+    TilePose {
+        offset: direction * (PIN_PULL * proximity),
+        swell: -PIN_SETTLE * proximity,
+    }
+}
+
 fn fear_pose(thread: &str, clock: f64, bounds: egui::Rect, pointer: Option<egui::Pos2>) -> Vec2 {
     let Some(pointer) = pointer else {
         return Vec2::ZERO;
@@ -2513,7 +2649,11 @@ const fn dismissible(harness: Harness, work: Work) -> bool {
 }
 
 fn fear_proximity(distance: f32) -> f32 {
-    let linear = (1.0 - distance / FEAR_REACH).clamp(0.0, 1.0);
+    proximity(distance, FEAR_REACH)
+}
+
+fn proximity(distance: f32, reach: f32) -> f32 {
+    let linear = (1.0 - distance / reach).clamp(0.0, 1.0);
     linear * linear * (3.0 - 2.0 * linear)
 }
 
@@ -2534,13 +2674,16 @@ fn advance_jolt(
     ledger: &mut JoltLedger,
     harness: Harness,
     thread: &str,
-    current: Option<Vec2>,
-) -> Vec2 {
+    current: Option<TilePose>,
+) -> TilePose {
     let bank = ledger.entry(harness).or_default();
     match current {
         Some(current) => {
             if let Some(prior) = bank.get_mut(thread) {
-                let travel = current - *prior;
+                let travel = TilePose {
+                    offset: current.offset - prior.offset,
+                    swell: current.swell - prior.swell,
+                };
                 *prior = current;
                 travel
             } else {
@@ -2548,32 +2691,46 @@ fn advance_jolt(
                 current
             }
         }
-        None => bank.remove(thread).map_or(Vec2::ZERO, |prior| -prior),
+        None => bank
+            .remove(thread)
+            .map_or(TilePose::default(), |prior| TilePose {
+                offset: -prior.offset,
+                swell: -prior.swell,
+            }),
     }
 }
 
 /// Couple the tile's projected swept volume into both water axes. `rect` is
 /// the current visual pose; layout motion is deliberately excluded because
 /// tray heave already owns it.
-fn displace_tile(water: &mut Surface, rect: egui::Rect, travel: Vec2) {
-    let envelope = rect.union(rect.translate(-travel));
-    let horizontal = travel.x.abs() * rect.height();
+fn displace_tile(water: &mut Surface, rect: egui::Rect, travel: TilePose) {
+    let envelope = rect.union(rect.translate(-travel.offset));
+    let horizontal = travel.offset.x.abs() * rect.height();
     if horizontal >= TILE_SWEEP_EPSILON {
         water.poke(
             envelope,
             Poke::slide(
                 (horizontal / TILE_AREA_PER_IMPULSE).min(TILE_IMPULSE_CEIL),
-                travel.x.signum(),
+                travel.offset.x.signum(),
             ),
         );
     }
-    let vertical = travel.y.abs() * rect.width();
+    let vertical = travel.offset.y.abs() * rect.width();
     if vertical >= TILE_SWEEP_EPSILON {
         water.poke(
             envelope,
             Poke::drag(
                 (vertical / TILE_AREA_PER_IMPULSE).min(TILE_IMPULSE_CEIL),
-                travel.y.signum(),
+                travel.offset.y.signum(),
+            ),
+        );
+    }
+    let volume = travel.swell * (rect.width() + rect.height()) * 2.0;
+    if volume.abs() >= TILE_SWEEP_EPSILON {
+        water.poke(
+            rect,
+            Poke::ring(
+                (volume / TILE_AREA_PER_IMPULSE).clamp(-TILE_IMPULSE_CEIL, TILE_IMPULSE_CEIL),
             ),
         );
     }
@@ -2741,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn fear_is_near_loud_far_quiet_and_repulsed() {
+    fn tool_fields_obey_pointer_proximity_and_direction() {
         let tile = egui::Rect::from_center_size(egui::pos2(500.0, 400.0), egui::vec2(300.0, 185.0));
         let near_pointer = egui::pos2(490.0, 400.0);
         let far_pointer = egui::pos2(-100.0, 400.0);
@@ -2755,6 +2912,18 @@ mod tests {
         assert!(motion_span(&samples) > motion_span(&far));
         assert!(samples.iter().all(|sample| sample.x > 0.0));
         assert_eq!(fear_pose("thread", 0.0, tile, None), Vec2::ZERO);
+
+        let near_yearning = yearning_pose_at(tile, Some(near_pointer));
+        let far_yearning = yearning_pose_at(tile, Some(far_pointer));
+        assert!(near_yearning.swell > far_yearning.swell);
+        assert!(near_yearning.offset.x < 0.0);
+        assert!(far_yearning.offset.length() < near_yearning.offset.length());
+
+        let near_pinning = pinning_pose_at(tile, Some(near_pointer));
+        let far_pinning = pinning_pose_at(tile, Some(far_pointer));
+        assert!(near_pinning.swell < far_pinning.swell);
+        assert!(near_pinning.offset.x < 0.0);
+        assert!(far_pinning.offset.length() < near_pinning.offset.length());
     }
 
     #[test]
@@ -2775,7 +2944,14 @@ mod tests {
         let ctx = egui::Context::default();
         let mut water = Surface::new(Wetness::Wet);
         let rect = egui::Rect::from_min_size(egui::pos2(40.0, 50.0), egui::vec2(300.0, 185.0));
-        displace_tile(&mut water, rect, egui::vec2(2.0, -1.5));
+        displace_tile(
+            &mut water,
+            rect,
+            TilePose {
+                offset: egui::vec2(2.0, -1.5),
+                swell: 0.0,
+            },
+        );
         water.begin(Domain::basin(rect.expand(100.0)));
         let frame = water.frame(&ctx, 1.0, &[], None);
         assert!(frame.wants_repaint());
