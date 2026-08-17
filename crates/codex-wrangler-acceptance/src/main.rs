@@ -23,8 +23,9 @@ mod terminal_fixture;
 mod contract;
 use contract::{
     CardKey, CardTarget, ClosePreference, DeleteGuard, Flight, GuideVisibility, Harness,
-    HistoryColumn, HistorySortTarget, HistoryTarget, Observation, PreferenceTarget, SearchTarget,
-    SortDirection, Tab, TabTarget, UI_FINGERPRINT, Work, WorkspaceTarget,
+    HistoryColumn, HistoryOperation, HistorySortTarget, HistoryTarget, Observation,
+    PreferenceTarget, SearchTarget, SortDirection, Tab, TabTarget, UI_FINGERPRINT, Work,
+    WorkspaceTarget,
 };
 
 const GOAL: &str = "10000000-0000-7000-8000-000000000001";
@@ -1376,6 +1377,21 @@ fn verify_history_rename(story: &mut Story<'_, '_, Observation>, index: &Path) -
             "Enter to submit the historical session name",
             |state: &Observation| state.history_rename.is_none(),
         ))?;
+    let _latched = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(150),
+        "successful rename to remain inert until authoritative census reconciliation",
+        |frame| {
+            (thread_name(index, UNSEEN).as_deref() == Some(RENAMED_HISTORY)
+                && frame
+                    .state
+                    .history
+                    .iter()
+                    .find(|session| session.thread == UNSEEN)
+                    .is_some_and(|session| session.pending == Some(HistoryOperation::Rename)))
+            .then_some(())
+        },
+    )?;
     vacate_history(story)?;
     let _renamed = story.wait_stable(
         Duration::from_secs(10),
@@ -1751,7 +1767,7 @@ fn verify_history_deletion(story: &mut Story<'_, '_, Observation>, index: &Path)
                     .history
                     .iter()
                     .find(|session| session.thread == COLD)
-                    .is_some_and(|session| session.deleting))
+                    .is_some_and(|session| session.pending == Some(HistoryOperation::Delete)))
             .then_some(())
         },
     )?;

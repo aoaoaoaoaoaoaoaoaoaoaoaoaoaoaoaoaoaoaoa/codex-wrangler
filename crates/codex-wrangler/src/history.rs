@@ -25,7 +25,21 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{codex_rpc::CodexRpc, names::NameIndex, state, watchfire::Watchfire};
+use crate::{
+    codex_rpc::CodexRpc, contract::HistoryOperation as Operation, names::NameIndex, state,
+    watchfire::Watchfire,
+};
+
+impl Operation {
+    pub const fn present_participle(self) -> &'static str {
+        match self {
+            Self::Archive => "ARCHIVING…",
+            Self::Unarchive => "UNARCHIVING…",
+            Self::Delete => "DELETING…",
+            Self::Rename => "RENAMING…",
+        }
+    }
+}
 
 const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 const LEDGER_SETTLE: Duration = Duration::from_secs(2);
@@ -65,25 +79,6 @@ pub struct TranscriptOutcome {
     pub thread: String,
     pub turns: Vec<Turn>,
     pub error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Operation {
-    Archive,
-    Unarchive,
-    Delete,
-    Rename,
-}
-
-impl Operation {
-    pub const fn present_participle(self) -> &'static str {
-        match self {
-            Self::Archive => "ARCHIVING…",
-            Self::Unarchive => "UNARCHIVING…",
-            Self::Delete => "DELETING…",
-            Self::Rename => "RENAMING…",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

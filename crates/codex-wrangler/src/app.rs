@@ -30,11 +30,10 @@ use eternalist_apps::{
 
 use crate::{
     commands::{Edict, NAVIGATION_IDIOMS, Realm, SCRY_IDIOMS, TILE_IDIOMS, canon},
-    contract::{Harness, HistoryColumn, SortDirection, Work},
+    contract::{Harness, HistoryColumn, HistoryOperation, SortDirection, Work},
     history::{
-        Census as HistoryCensus, Nexus as HistoryNexus, Operation as HistoryOperation,
-        Order as HistoryOrder, Session as HistorySession, Turn as HistoryTurn,
-        spawn as spawn_history,
+        Census as HistoryCensus, Nexus as HistoryNexus, Order as HistoryOrder,
+        Session as HistorySession, Turn as HistoryTurn, spawn as spawn_history,
     },
     instance::{Incumbent, NO_DESKTOP},
     model::{Card, Census},
@@ -150,6 +149,66 @@ struct HistoryRename {
     seize_focus: bool,
 }
 
+enum HistoryEffect {
+    Archived(bool),
+    Deleted,
+    Renamed(String),
+}
+
+struct HistoryLease {
+    effect: HistoryEffect,
+    phase: HistoryPhase,
+}
+
+#[derive(Eq, PartialEq)]
+enum HistoryPhase {
+    Submitted,
+    Acknowledged,
+}
+
+impl HistoryLease {
+    fn claim(order: &HistoryOrder) -> Self {
+        let effect = match order {
+            HistoryOrder::Archive(_) => HistoryEffect::Archived(true),
+            HistoryOrder::Unarchive(_) => HistoryEffect::Archived(false),
+            HistoryOrder::Delete(_) => HistoryEffect::Deleted,
+            HistoryOrder::Rename { name, .. } => HistoryEffect::Renamed(name.trim().to_owned()),
+        };
+        Self {
+            effect,
+            phase: HistoryPhase::Submitted,
+        }
+    }
+
+    const fn operation(&self) -> HistoryOperation {
+        match self.effect {
+            HistoryEffect::Archived(true) => HistoryOperation::Archive,
+            HistoryEffect::Archived(false) => HistoryOperation::Unarchive,
+            HistoryEffect::Deleted => HistoryOperation::Delete,
+            HistoryEffect::Renamed(_) => HistoryOperation::Rename,
+        }
+    }
+
+    fn settled(&self, thread: &str, census: &HistoryCensus) -> bool {
+        if self.phase != HistoryPhase::Acknowledged {
+            return false;
+        }
+        let session = census
+            .sessions
+            .iter()
+            .find(|session| session.thread == thread);
+        match &self.effect {
+            HistoryEffect::Archived(archived) => {
+                session.is_some_and(|session| session.archived == *archived)
+            }
+            HistoryEffect::Deleted => session.is_none(),
+            HistoryEffect::Renamed(name) => {
+                session.and_then(|session| session.name.as_deref()) == Some(name)
+            }
+        }
+    }
+}
+
 struct TranscriptView {
     thread: String,
     name: Option<String>,
@@ -211,7 +270,7 @@ struct Wrangler<const START_FLOATING: bool> {
     scry: Scry,
     history_scry: HistoryScry,
     history_requested: HashSet<(String, i64)>,
-    history_pending: HashMap<String, HistoryOperation>,
+    history_pending: HashMap<String, HistoryLease>,
     history_error: Option<String>,
     history_rename: Option<HistoryRename>,
     delete_target: Option<String>,
@@ -387,13 +446,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn drain_history(&mut self) -> bool {
         if let Some(census) = self.historian.take_census() {
-            self.history_pending.retain(|thread, operation| {
-                *operation != HistoryOperation::Delete
-                    || census
-                        .sessions
-                        .iter()
-                        .any(|session| session.thread == *thread)
-            });
+            self.history_pending
+                .retain(|thread, lease| !lease.settled(thread, &census));
             self.history = Some(census);
             self.reconcile_history_scry();
             return true;
@@ -406,16 +460,29 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         for outcome in self.historian.take_outcomes() {
             let thread = outcome.order.thread();
             let operation = outcome.order.operation();
-            if outcome.error.is_some() || operation != HistoryOperation::Delete {
+            if let Some(error) = outcome.error {
                 let _prior = self.history_pending.remove(thread);
-            }
-            self.history_error = outcome.error.map(|error| {
-                format!(
+                self.history_error = Some(format!(
                     "{} {} FAILED · {error}",
                     operation.present_participle(),
                     outcome.order.thread()
-                )
-            });
+                ));
+            } else {
+                let census = self.history.as_ref();
+                let settled = self.history_pending.get_mut(thread).is_some_and(|lease| {
+                    assert_eq!(
+                        lease.operation(),
+                        operation,
+                        "history outcome crossed its resource lease"
+                    );
+                    lease.phase = HistoryPhase::Acknowledged;
+                    census.is_some_and(|census| lease.settled(thread, census))
+                });
+                if settled {
+                    let _prior = self.history_pending.remove(thread);
+                }
+                self.history_error = None;
+            }
             changed = true;
         }
         changed
@@ -927,13 +994,21 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn submit_history(&mut self, order: HistoryOrder) {
         let thread = order.thread().clone();
-        let operation = order.operation();
         if self.history_pending.contains_key(&thread) {
             return;
         }
+        let lease = HistoryLease::claim(&order);
+        let operation = lease.operation();
+        let prior = self.history_pending.insert(thread.clone(), lease);
+        assert!(prior.is_none(), "history resource admitted two leases");
         if self.historian.courier().order(order).is_ok() {
             self.history_error = None;
-            let _prior = self.history_pending.insert(thread, operation);
+        } else {
+            let _lease = self.history_pending.remove(&thread);
+            self.history_error = Some(format!(
+                "{} {thread} FAILED · history worker is unavailable",
+                operation.present_participle()
+            ));
         }
     }
 
@@ -1264,8 +1339,10 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     turns: session.turns,
                     bytes: session.bytes,
                     archived: session.archived,
-                    deleting: self.history_pending.get(&session.thread)
-                        == Some(&HistoryOperation::Delete),
+                    pending: self
+                        .history_pending
+                        .get(&session.thread)
+                        .map(HistoryLease::operation),
                 })
                 .collect()
         });
@@ -1752,7 +1829,7 @@ fn history_rows(
     hits: &[HistoryHit],
     rows: std::ops::Range<usize>,
     columns: HistoryColumns,
-    pending: &HashMap<String, HistoryOperation>,
+    pending: &HashMap<String, HistoryLease>,
     rename: &mut Option<HistoryRename>,
     water: &mut Surface,
     hovered: &mut Option<String>,
@@ -1773,7 +1850,7 @@ fn history_rows(
                     session,
                     hit,
                     columns,
-                    pending.get(&session.thread).copied(),
+                    pending.get(&session.thread).map(HistoryLease::operation),
                     rename,
                     water,
                     hovered,

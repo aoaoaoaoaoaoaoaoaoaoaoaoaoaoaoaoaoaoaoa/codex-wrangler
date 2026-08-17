@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "egui-test")]
-pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/22";
+pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/23";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -54,6 +54,15 @@ pub enum HistoryColumn {
 pub enum SortDirection {
     Ascending,
     Descending,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoryOperation {
+    Archive,
+    Unarchive,
+    Delete,
+    Rename,
 }
 
 #[cfg(feature = "egui-test")]
@@ -130,7 +139,7 @@ pub struct HistoryObservation {
     pub turns: Option<u64>,
     pub bytes: u64,
     pub archived: bool,
-    pub deleting: bool,
+    pub pending: Option<HistoryOperation>,
 }
 
 #[cfg(feature = "egui-test")]
