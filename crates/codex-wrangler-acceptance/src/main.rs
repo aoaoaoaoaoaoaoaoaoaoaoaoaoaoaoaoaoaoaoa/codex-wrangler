@@ -15,8 +15,8 @@ use brass_poolrooms::{
 };
 use egui_tester::{
     AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key, Motion,
-    ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery, X11Session,
-    demand,
+    ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery, X11CursorImage,
+    X11Session, demand,
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -1121,7 +1121,10 @@ fn verify_gallery(
 }
 
 fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result<()> {
-    let _pointer = seize_card(story, DONE, "Forge Pin witness")?;
+    vacate_gallery(
+        story,
+        "pointer to leave every tile before native cursor proof",
+    )?;
     let rest = story.anchor(WorkspaceTarget(Harness::Codex, DONE))?.rect;
     let alt_down = story.session().key_down(Key::Alt)?;
     let _armed = story
@@ -1130,9 +1133,7 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
         .until(Condition::new(
             "held Alt to arm the immobile Forge Pin field",
             |state: &Observation| {
-                state.pin_field == PinField::Armed
-                    && !state.jiggling
-                    && hovered(state, Harness::Codex, DONE)
+                state.pin_field == PinField::Armed && !state.jiggling && state.hovered.is_none()
             },
         ))?;
     demand_native_cursor("Forge Pin", &ForgePin::cursor_image(), story.session())?;
@@ -1148,8 +1149,8 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
         "released Alt to quench the Forge Pin field",
         |state: &Observation| state.pin_field == PinField::Quiescent,
     ))?;
+    demand_native_cursor_released("Forge Pin", &ForgePin::cursor_image(), story.session())?;
 
-    let _pointer = seize_card(story, TURN, "Longinus witness")?;
     let control_down = story.session().key_down(Key::Control)?;
     let _armed = story
         .reaction(control_down)
@@ -1157,9 +1158,7 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
         .until(Condition::new(
             "held Ctrl to arm the Longinus fork field",
             |state: &Observation| {
-                state.fork_field == ForkField::Armed
-                    && !state.jiggling
-                    && hovered(state, Harness::Codex, TURN)
+                state.fork_field == ForkField::Armed && !state.jiggling && state.hovered.is_none()
             },
         ))?;
     demand_native_cursor("Longinus", &LonginusCursor::image(), story.session())?;
@@ -1168,6 +1167,7 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
         "released Ctrl to quench the Longinus fork field",
         |state: &Observation| state.fork_field == ForkField::Quiescent,
     ))?;
+    demand_native_cursor_released("Longinus", &LonginusCursor::image(), story.session())?;
     vacate_gallery(story, "pointer to leave the native cursor fields")
 }
 
@@ -3160,16 +3160,7 @@ fn demand_native_cursor(
     expected: &CustomCursorImage,
     session: &X11Session<'_, '_>,
 ) -> Result<()> {
-    let expected_pixels = expected
-        .rgba
-        .chunks_exact(4)
-        .map(|pixel| {
-            u32::from(pixel[3]) << 24
-                | u32::from(pixel[0]) << 16
-                | u32::from(pixel[1]) << 8
-                | u32::from(pixel[2])
-        })
-        .collect::<Vec<_>>();
+    let expected_pixels = native_cursor_pixels(expected);
     let deadline = Instant::now() + input_reaction_budget().functional_timeout();
     loop {
         let actual = session.cursor_image()?;
@@ -3178,13 +3169,7 @@ fn demand_native_cursor(
             .iter()
             .zip(&expected_pixels)
             .position(|(actual, expected)| actual != expected);
-        let exact = actual.width == expected.size[0]
-            && actual.height == expected.size[1]
-            && actual.hotspot_x == expected.hotspot[0]
-            && actual.hotspot_y == expected.hotspot[1]
-            && first_pixel_delta.is_none()
-            && actual.argb.len() == expected_pixels.len();
-        if exact {
+        if native_cursor_is(&actual, expected, &expected_pixels) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -3207,4 +3192,53 @@ fn demand_native_cursor(
         }
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+fn demand_native_cursor_released(
+    label: &str,
+    expected: &CustomCursorImage,
+    session: &X11Session<'_, '_>,
+) -> Result<()> {
+    let expected_pixels = native_cursor_pixels(expected);
+    let deadline = Instant::now() + input_reaction_budget().functional_timeout();
+    loop {
+        let actual = session.cursor_image()?;
+        if !native_cursor_is(&actual, expected, &expected_pixels) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return demand(
+                false,
+                format!(
+                    "X11 retained the {label} cursor after its modifier was released without pointer motion"
+                ),
+            );
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn native_cursor_pixels(cursor: &CustomCursorImage) -> Vec<u32> {
+    cursor
+        .rgba
+        .chunks_exact(4)
+        .map(|pixel| {
+            u32::from(pixel[3]) << 24
+                | u32::from(pixel[0]) << 16
+                | u32::from(pixel[1]) << 8
+                | u32::from(pixel[2])
+        })
+        .collect()
+}
+
+fn native_cursor_is(
+    actual: &X11CursorImage,
+    expected: &CustomCursorImage,
+    expected_pixels: &[u32],
+) -> bool {
+    actual.width == expected.size[0]
+        && actual.height == expected.size[1]
+        && actual.hotspot_x == expected.hotspot[0]
+        && actual.hotspot_y == expected.hotspot[1]
+        && actual.argb == expected_pixels
 }

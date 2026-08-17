@@ -1495,8 +1495,16 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
     };
 
     fn draw(&mut self, ui: &mut egui::Ui) {
-        // Bitmap cursors are sticky platform output. Each frame must earn one.
-        ui.ctx().set_cursor_image(None);
+        let modifiers = ui.input(|input| input.modifiers);
+        // Bitmap cursors are sticky platform output. Modifier ownership is
+        // window-wide and each frame must earn it anew.
+        ui.ctx().set_cursor_image(if modifiers.ctrl {
+            Some(LonginusCursor::image())
+        } else if modifiers.alt {
+            Some(ForgePin::cursor_image())
+        } else {
+            None
+        });
         self.kindle_if_summoned();
         self.hovered = None;
         self.history_hovered = None;
@@ -1517,7 +1525,6 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
             && self.page == Page::Live
             && !self.guide.is_open()
             && !ui.ctx().text_edit_focused();
-        let modifiers = ui.input(|input| input.modifiers);
         let tile_tool = if !physical_mode {
             TileTool::Rest
         } else if modifiers.matches_exact(egui::Modifiers::SHIFT) {
@@ -2393,7 +2400,6 @@ fn card(
     let dismissible = dismissible(card.harness, card.work);
     let fleeing = physics.tool == TileTool::Dismiss && dismissible;
     let yearning = physics.tool == TileTool::Fork && card.harness == Harness::Codex;
-    let pinning = physics.tool == TileTool::Pin;
     let pose = if fleeing {
         TilePose {
             offset: fear_offset(ui, &card.thread, rect, true),
@@ -2444,11 +2450,6 @@ fn card(
     );
     if response.hovered() {
         *physics.hovered = Some(hit.card());
-        if pinning {
-            ui.ctx().set_cursor_image(Some(ForgePin::cursor_image()));
-        } else if yearning {
-            ui.ctx().set_cursor_image(Some(LonginusCursor::image()));
-        }
         physics
             .water
             .hover((card.harness.slug(), &card.thread), visual);
@@ -2508,7 +2509,6 @@ fn paint_card_contents(
                 .show_tooltip_when_elided(false),
         )
     };
-    body.set_max_width(inner.width());
     body.add_space(6.0);
     let path_spans = if name.is_none() { match_spans } else { &[] };
     let _cwd = marked_label(&mut body, &card.cwd, path_spans, chrome::HOT);
@@ -2525,15 +2525,6 @@ fn paint_card_contents(
     );
     drop(body);
     paint_card_work(ui.painter(), visual, card.work);
-    if card.pinned {
-        let _pin = ui.painter().text(
-            visual.left_bottom() + Vec2::new(14.0, -10.0),
-            egui::Align2::LEFT_BOTTOM,
-            "PINNED",
-            egui::FontId::monospace(9.5),
-            chrome::HOT,
-        );
-    }
 }
 
 fn marked_label(
@@ -2800,6 +2791,11 @@ fn paint_workspace(ui: &egui::Ui, tile: egui::Rect, card: &Card) -> f32 {
         WorkspaceTarget(card.harness, &card.thread).to_string(),
         rect
     );
+    if card.pinned {
+        ForgePin::new(egui::pos2(rect.center().x, rect.bottom() + 26.0))
+            .size(MechanismSize::Small)
+            .paint(ui.painter(), false);
+    }
     width
 }
 
