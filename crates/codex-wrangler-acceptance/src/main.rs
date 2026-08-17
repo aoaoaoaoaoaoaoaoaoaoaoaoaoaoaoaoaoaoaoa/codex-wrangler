@@ -1137,6 +1137,7 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
             },
         ))?;
     demand_native_cursor("Forge Pin", &ForgePin::cursor_image(), story.session())?;
+    cross_card_with_native_cursor(story, DONE, "Forge Pin", &ForgePin::cursor_image())?;
     thread::sleep(Duration::from_millis(140));
     let _frame = story.frame()?;
     let pinning = story.anchor(WorkspaceTarget(Harness::Codex, DONE))?.rect;
@@ -1151,6 +1152,10 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
     ))?;
     demand_native_cursor_released("Forge Pin", &ForgePin::cursor_image(), story.session())?;
 
+    vacate_gallery(
+        story,
+        "pointer to leave every tile before Longinus precedence proof",
+    )?;
     let control_down = story.session().key_down(Key::Control)?;
     let _armed = story
         .reaction(control_down)
@@ -1162,6 +1167,7 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
             },
         ))?;
     demand_native_cursor("Longinus", &LonginusCursor::image(), story.session())?;
+    cross_card_with_native_cursor(story, TURN, "Longinus", &LonginusCursor::image())?;
     let control_up = story.session().key_up(Key::Control)?;
     let _released = story.reaction(control_up).until(Condition::new(
         "released Ctrl to quench the Longinus fork field",
@@ -1169,6 +1175,25 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
     ))?;
     demand_native_cursor_released("Longinus", &LonginusCursor::image(), story.session())?;
     vacate_gallery(story, "pointer to leave the native cursor fields")
+}
+
+fn cross_card_with_native_cursor(
+    story: &mut Story<'_, '_, Observation>,
+    thread: &str,
+    label: &str,
+    cursor: &CustomCursorImage,
+) -> Result<()> {
+    let point = story.anchor(CardTarget(Harness::Codex, thread))?.center();
+    let moved = story.session().move_to(point.0, point.1)?;
+    let sought = thread.to_owned();
+    let _crossed = story
+        .reaction(moved)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            format!("held {label} cursor to cross into card `{thread}`"),
+            move |state: &Observation| hovered(state, Harness::Codex, &sought),
+        ))?;
+    demand_native_cursor(label, cursor, story.session())
 }
 
 fn verify_census(state: &Observation) -> Result<()> {
