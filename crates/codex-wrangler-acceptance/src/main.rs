@@ -2563,6 +2563,7 @@ fn forge_fake_cli(testbed: &Testbed) -> Result<PathBuf> {
         format!(
             r#"#!/bin/bash
 db=/test/home/.codex/state_5.sqlite
+sqlite() {{ sqlite3 -batch -cmd '.timeout 2000' "$db" "$@"; }}
 if [ "${{1:-}}" = --version ]; then
   printf '%s\n' 'codex-cli 0.147.0'
   exit 0
@@ -2586,7 +2587,7 @@ if [ "${{1:-}}" = app-server ]; then
         thread=$(printf '%s\n' "$request" | jq -r '.params.threadId')
         name=$(printf '%s\n' "$request" | jq -r '.params.name')
         quoted=$(printf '%s' "$name" | sed "s/'/''/g")
-        changed=$(sqlite3 "$db" "UPDATE threads SET name = '$quoted' WHERE id = '$thread' AND archived = 0; SELECT changes();")
+        changed=$(sqlite "UPDATE threads SET name = '$quoted' WHERE id = '$thread' AND archived = 0; SELECT changes();")
         if [ "$changed" = 1 ]; then
           jq -nc --arg id "$thread" --arg name "$name" '{{id:$id,thread_name:$name}}' >> /test/home/.codex/session_index.jsonl
           printf '%s\n' '{{"id":'$id',"result":{{}}}}'
@@ -2596,10 +2597,10 @@ if [ "${{1:-}}" = app-server ]; then
         ;;
       thread/archive)
         thread=$(printf '%s\n' "$request" | jq -r '.params.threadId')
-        rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+        rollout=$(sqlite "SELECT rollout_path FROM threads WHERE id = '$thread'")
         destination=/test/home/.codex/archived_sessions/${{rollout##*/}}
         mv "$rollout" "$destination"
-        sqlite3 "$db" "UPDATE threads SET archived = 1, rollout_path = '$destination' WHERE id = '$thread'"
+        sqlite "UPDATE threads SET archived = 1, rollout_path = '$destination' WHERE id = '$thread'"
         printf '%s\n' '{{"id":'$id',"result":{{}}}}'
         ;;
       *)
@@ -2619,33 +2620,33 @@ case $operation in
     exec -a codex bash -c 'sleep 90' wrangler-fork
     ;;
   archive)
-    rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+    rollout=$(sqlite "SELECT rollout_path FROM threads WHERE id = '$thread'")
     destination=/test/home/.codex/archived_sessions/${{rollout##*/}}
     mv "$rollout" "$destination"
-    sqlite3 "$db" "UPDATE threads SET archived = 1, rollout_path = '$destination' WHERE id = '$thread'"
+    sqlite "UPDATE threads SET archived = 1, rollout_path = '$destination' WHERE id = '$thread'"
     printf '%s\n' "$operation" > "/test/${{operation}}-proof-${{thread}}"
     exit 0
     ;;
   unarchive)
-    rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+    rollout=$(sqlite "SELECT rollout_path FROM threads WHERE id = '$thread'")
     destination=/test/home/.codex/sessions/2026/08/03/${{rollout##*/}}
     mv "$rollout" "$destination"
-    sqlite3 "$db" "UPDATE threads SET archived = 0, rollout_path = '$destination' WHERE id = '$thread'"
+    sqlite "UPDATE threads SET archived = 0, rollout_path = '$destination' WHERE id = '$thread'"
     printf '%s\n' "$operation" > "/test/${{operation}}-proof-${{thread}}"
     exit 0
     ;;
   delete)
     thread=$3
-    rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+    rollout=$(sqlite "SELECT rollout_path FROM threads WHERE id = '$thread'")
     rm -f "$rollout"
-    sqlite3 "$db" "DELETE FROM threads WHERE id = '$thread'"
+    sqlite "DELETE FROM threads WHERE id = '$thread'"
     printf '%s\n' "$operation" > "/test/${{operation}}-proof-${{thread}}"
     exit 0
     ;;
 esac
 workspace=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused).num')
 printf '%s\n' "$operation $workspace" > "/test/${{operation}}-proof-${{thread}}"
-rollout=$(sqlite3 "$db" "SELECT rollout_path FROM threads WHERE id = '$thread'")
+rollout=$(sqlite "SELECT rollout_path FROM threads WHERE id = '$thread'")
 exec -a codex bash -c 'exec 9>>"$1"; sleep 90; :' wrangler-resume "$rollout"
 "#,
         ),
