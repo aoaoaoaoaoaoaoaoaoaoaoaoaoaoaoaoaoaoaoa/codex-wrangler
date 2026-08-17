@@ -30,10 +30,11 @@ use crate::{codex_rpc::CodexRpc, names::NameIndex, state, watchfire::Watchfire};
 const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 const LEDGER_SETTLE: Duration = Duration::from_secs(2);
 const INDEX_FILE: &str = "history-index.json";
-const INDEX_VERSION: u8 = 1;
+const INDEX_VERSION: u8 = 2;
 const SCAN_BLOCK: usize = 64 << 10;
-const TASK_STARTED: &[u8] = b"\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"";
-const TURN_STARTED: &[u8] = b"\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_started\"";
+const USER_MESSAGE: &[u8] = b"\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\"";
+const PAGINATED_USER_MESSAGE: &[u8] = b"\"item\":{\"type\":\"UserMessage\"";
+const LONG_WINDOW: &str = "--long=31";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
@@ -892,7 +893,7 @@ fn materialize(nominal: &Path) -> Result<bool> {
         bail!("session payload `{}` is absent", nominal.display());
     }
     let temporary = temporary_path(nominal, "inflate")?;
-    run_zstd(&["-q", "-d", "-f"], &source, &temporary)?;
+    run_zstd(&["-q", "-d", LONG_WINDOW, "-f"], &source, &temporary)?;
     seal_artifact(&temporary, nominal)?;
     Ok(true)
 }
@@ -1017,7 +1018,7 @@ fn read_artifact<T>(
         return consume(&mut File::open(&artifact.path)?);
     }
     let mut child = Command::new("nice")
-        .args(["-n", "15", "zstd", "-q", "-d", "-c"])
+        .args(["-n", "15", "zstd", "-q", "-d", LONG_WINDOW, "-c"])
         .arg(&artifact.path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1123,7 +1124,7 @@ fn assign_model(turns: &mut Vec<Turn>, message: &str) {
 }
 
 fn scan(mut reader: impl Read, alive: &AtomicBool) -> Result<u64> {
-    let overlap = TASK_STARTED.len().max(TURN_STARTED.len()) - 1;
+    let overlap = USER_MESSAGE.len().max(PAGINATED_USER_MESSAGE.len()) - 1;
     let mut buffer = vec![0_u8; SCAN_BLOCK + overlap];
     let mut carry = 0;
     let mut turns = 0_u64;
@@ -1137,7 +1138,7 @@ fn scan(mut reader: impl Read, alive: &AtomicBool) -> Result<u64> {
         }
         let length = carry + read;
         let bytes = &buffer[..length];
-        for needle in [TASK_STARTED, TURN_STARTED] {
+        for needle in [USER_MESSAGE, PAGINATED_USER_MESSAGE] {
             turns += memmem::find_iter(bytes, needle)
                 .filter(|start| start + needle.len() > carry)
                 .count() as u64;
@@ -1260,9 +1261,9 @@ mod tests {
     fn turn_counter_crosses_blocks_without_counting_quoted_examples() {
         let padding = "x".repeat(SCAN_BLOCK - 24);
         let transcript = format!(
-            "{padding}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}\n\
-             {{\"type\":\"response_item\",\"payload\":{{\"text\":\"\\\"type\\\":\\\"event_msg\\\",\\\"payload\\\":{{\\\"type\\\":\\\"turn_started\\\"}}\"}}}}\n\
-             {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_started\"}}}}\n"
+            "{padding}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"forge it\"}}}}\n\
+             {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"item_completed\",\"item\":{{\"type\":\"UserMessage\",\"content\":[]}}}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"text\":\"\\\"type\\\":\\\"event_msg\\\",\\\"payload\\\":{{\\\"type\\\":\\\"user_message\\\"}}\"}}}}\n"
         );
         assert_eq!(
             scan(transcript.as_bytes(), &AtomicBool::new(true),).expect("count turns"),

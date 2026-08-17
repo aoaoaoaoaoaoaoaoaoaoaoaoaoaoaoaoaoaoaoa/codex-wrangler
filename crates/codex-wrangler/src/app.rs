@@ -387,6 +387,13 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn drain_history(&mut self) -> bool {
         if let Some(census) = self.historian.take_census() {
+            self.history_pending.retain(|thread, operation| {
+                *operation != HistoryOperation::Delete
+                    || census
+                        .sessions
+                        .iter()
+                        .any(|session| session.thread == *thread)
+            });
             self.history = Some(census);
             self.reconcile_history_scry();
             return true;
@@ -398,11 +405,14 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let mut changed = false;
         for outcome in self.historian.take_outcomes() {
             let thread = outcome.order.thread();
-            let _prior = self.history_pending.remove(thread);
+            let operation = outcome.order.operation();
+            if outcome.error.is_some() || operation != HistoryOperation::Delete {
+                let _prior = self.history_pending.remove(thread);
+            }
             self.history_error = outcome.error.map(|error| {
                 format!(
                     "{} {} FAILED · {error}",
-                    outcome.order.operation().present_participle(),
+                    operation.present_participle(),
                     outcome.order.thread()
                 )
             });
@@ -1254,6 +1264,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     turns: session.turns,
                     bytes: session.bytes,
                     archived: session.archived,
+                    deleting: self.history_pending.get(&session.thread)
+                        == Some(&HistoryOperation::Delete),
                 })
                 .collect()
         });
@@ -1807,18 +1819,28 @@ fn history_row(
     row.spacing_mut().item_spacing.x = 0.0;
     let editing = rename.is_some();
     let mut action = history_facts(&mut row, session, hit, columns, flight, rename, water);
-    if action.is_none() {
+    if flight == Some(HistoryOperation::Delete) {
+        history_cell(&mut row, columns.open, |_| {});
+        history_cell(&mut row, columns.action, |ui| {
+            let _deleting = ui.label(chrome::muted("DELETING…").size(11.0));
+        });
+        history_cell(&mut row, columns.delete, |_| {});
+    } else if action.is_none() {
         action = history_open(&mut row, session, columns.open, flight, editing, water);
+        if action.is_none() {
+            action = history_operation(&mut row, session, columns.action, flight, editing, water)
+                .map(HistoryAction::Operate);
+        }
+        if action.is_none() {
+            action = history_delete(&mut row, session, columns.delete, flight, editing, water)
+                .map(HistoryAction::Operate);
+        }
     }
-    if action.is_none() {
-        action = history_operation(&mut row, session, columns.action, flight, editing, water)
-            .map(HistoryAction::Operate);
-    }
-    if action.is_none() {
-        action = history_delete(&mut row, session, columns.delete, flight, editing, water)
-            .map(HistoryAction::Operate);
-    }
-    if response.clicked() && action.is_none() && !editing {
+    if response.clicked()
+        && action.is_none()
+        && !editing
+        && flight != Some(HistoryOperation::Delete)
+    {
         water.click(rect);
         action = Some(HistoryAction::Inspect(session.thread.clone()));
     }
@@ -1909,7 +1931,7 @@ fn history_rename_control(
 ) -> Option<HistoryAction> {
     let mut action = None;
     history_cell(row, width, |ui| {
-        if session.archived {
+        if session.archived || flight == Some(HistoryOperation::Delete) {
             return;
         }
         let rename = ui

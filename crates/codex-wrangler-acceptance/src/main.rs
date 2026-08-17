@@ -1276,17 +1276,19 @@ fn verify_history(
                 .map(|session| session.thread.as_str())
                 .collect::<BTreeSet<_>>();
             (ids == BTreeSet::from([UNSEEN, COLD])
+                && frame.state.history.iter().all(|session| session.bytes > 0)
                 && frame
                     .state
                     .history
                     .iter()
-                    .all(|session| session.turns == Some(2) && session.bytes > 0)
+                    .find(|session| session.thread == UNSEEN)
+                    .is_some_and(|session| session.turns == Some(2))
                 && frame
                     .state
                     .history
                     .iter()
                     .find(|session| session.thread == COLD)
-                    .is_some_and(|session| session.archived))
+                    .is_some_and(|session| session.archived && session.turns == Some(1)))
             .then_some(())
         },
     )?;
@@ -1429,7 +1431,7 @@ fn verify_history_sorting(story: &mut Story<'_, '_, Observation>) -> Result<()> 
             (HistoryColumn::SessionId, SortDirection::Descending),
             (HistoryColumn::Turns, SortDirection::Descending),
         ],
-        vec![COLD, UNSEEN],
+        vec![UNSEEN, COLD],
         "turn sort to descend",
     )?;
     sort_history(
@@ -1630,11 +1632,27 @@ fn verify_history_deletion(story: &mut Story<'_, '_, Observation>, index: &Path)
         "future deletion confirmation to be disabled",
         |state: &Observation| state.delete_guard == DeleteGuard::Bypassed,
     ))?;
-    let enter = story.session().key(Key::Return)?;
-    let _confirmed = story.reaction(enter).until(Condition::new(
-        "Enter to confirm permanent deletion",
+    let escape = story.session().key(Key::Escape)?;
+    let _cancelled = story.reaction(escape).until(Condition::new(
+        "Escape to dismiss the armed deletion",
         |state: &Observation| state.delete_prompt.is_none(),
     ))?;
+    click_history(story, COLD, "delete")?;
+    let _latched = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(150),
+        "successful deletion to remain inert beneath the pointer until census reconciliation",
+        |frame| {
+            (thread_archived(index, COLD).is_none()
+                && frame
+                    .state
+                    .history
+                    .iter()
+                    .find(|session| session.thread == COLD)
+                    .is_some_and(|session| session.deleting))
+            .then_some(())
+        },
+    )?;
     vacate_history(story)?;
     let _deleted = story.wait_stable(
         Duration::from_secs(10),
@@ -2049,6 +2067,7 @@ impl Fixture {
 
         let fake = forge_fake_harness(testbed)?;
         let fake_cli = forge_fake_cli(testbed)?;
+        forge_zstd_guard(testbed)?;
         let replaceable_alacritty = forge_replaceable_alacritty(testbed)?;
         let rotate_resume = testbed.private_path(format!("resume-proof-{ROTATE}"))?;
         let dormant_resume = testbed.private_path(format!("resume-proof-{DORMANT}"))?;
@@ -2365,6 +2384,28 @@ exec -a codex bash -c 'exec 9>>"$1"; sleep 90; :' wrangler-resume "$rollout"
     )
 }
 
+fn forge_zstd_guard(testbed: &Testbed) -> Result<()> {
+    let zstd = testbed.write_private(
+        "bin/zstd",
+        r#"#!/bin/sh
+decode=0
+long=0
+for argument in "$@"; do
+  case $argument in
+    -d|--decompress) decode=1 ;;
+    --long=31) long=1 ;;
+  esac
+done
+if [ "$decode" = 1 ] && [ "$long" != 1 ]; then
+  printf '%s\n' 'Wrangler omitted long-window archive support' >&2
+  exit 70
+fi
+exec /usr/bin/zstd "$@"
+"#,
+    )?;
+    arm_executable(&zstd, "make guarded zstd fixture executable")
+}
+
 fn arm_executable(path: &Path, operation: &'static str) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io_verdict(operation))
 }
@@ -2656,12 +2697,8 @@ fn seed_historical(sessions: &Path, archive: &Path) -> Result<()> {
         (
             archive.join(format!("rollout-2026-08-03T00-00-00-cold-{COLD}.jsonl")),
             concat!(
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"First buried question.\"}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"First buried answer.\"}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Last buried question.\"}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Last buried answer.\"}}\n",
             ),
         ),
     ] {

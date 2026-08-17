@@ -14,6 +14,10 @@ unarchived session metadata; its removal seam is `CodexRpc::rename_thread` and
 `CodexLaunch`. Delete a row only when its fixture, claim variant, parser arm,
 and named removal seam leave in the same change.
 
+Historical turn tallies count persisted `user_message` and paginated
+`item_completed/UserMessage` records. Compressed history accepts Zstandard
+long-window frames; external archival pipelines may legitimately produce them.
+
 Stopped-session rollover compares the launcher's `codex --version` with the
 session runtime last sealed in Wrangler's XDG roster. SQLite `cli_version`
 seeds that value once; it is the creation version and does not advance on
