@@ -64,9 +64,6 @@ const FEAR_FLEE: f32 = 2.25;
 const YEARNING_REACH: f32 = 880.0;
 const YEARNING_PULL: f32 = 5.0;
 const YEARNING_SWELL: f32 = 5.5;
-const PIN_REACH: f32 = 760.0;
-const PIN_PULL: f32 = 3.5;
-const PIN_SETTLE: f32 = 2.75;
 const HISTORY_ROW: f32 = 34.0;
 
 #[derive(Clone, Copy, Default)]
@@ -92,6 +89,12 @@ enum TileTool {
     Dismiss,
     Fork,
     Pin,
+}
+
+impl TileTool {
+    const fn kinetic(self) -> bool {
+        matches!(self, Self::Dismiss | Self::Fork)
+    }
 }
 
 struct ActivationFlight {
@@ -1492,6 +1495,8 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
     };
 
     fn draw(&mut self, ui: &mut egui::Ui) {
+        // Bitmap cursors are sticky platform output. Each frame must earn one.
+        ui.ctx().set_cursor_image(None);
         self.kindle_if_summoned();
         self.hovered = None;
         self.history_hovered = None;
@@ -1524,7 +1529,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         } else {
             TileTool::Rest
         };
-        let recoiling = self.tile_tool != TileTool::Rest && tile_tool == TileTool::Rest;
+        let recoiling = self.tile_tool.kinetic() && tile_tool == TileTool::Rest;
         self.tile_tool = tile_tool;
         if tile_tool == TileTool::Dismiss {
             ui.ctx()
@@ -1542,7 +1547,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
                 (None, gesture, heave)
             }
         };
-        if tile_tool == TileTool::Rest {
+        if !tile_tool.kinetic() {
             self.jolts.clear();
         }
         if let Some(strike) = selected {
@@ -1571,7 +1576,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         };
         let mut changed = history_outcome;
         if stable_pointer
-            && tile_tool == TileTool::Rest
+            && !tile_tool.kinetic()
             && !self.search_focus.held()
             && self.history_rename.is_none()
         {
@@ -2260,22 +2265,21 @@ fn history_delete(
 ) -> Option<HistoryGesture> {
     let mut clicked = false;
     history_cell(row, width, |ui| {
-        let response = ui.add_enabled(
-            !editing && flight.is_none(),
-            egui::Button::new(RichText::new("×").size(19.0).strong().color(RED))
-                .min_size(Vec2::new(32.0, 26.0))
-                .stroke(Stroke::new(1.2, RED)),
-        );
-        chrome::shallow_tension(ui, &response);
+        let response = ui
+            .add_enabled_ui(!editing && flight.is_none(), |ui| {
+                chrome::Monoglyph::symbol(chrome::Symbol::Delete)
+                    .size(MechanismSize::Small)
+                    .show(ui)
+            })
+            .inner
+            .on_hover_text("Delete this session permanently");
+        water.monoglyph(&response);
         brass_poolrooms::poolroom_anchor!(
             ui,
             HistoryTarget(&session.thread, "delete").to_string(),
             response.rect
         );
         clicked = response.clicked();
-        if clicked {
-            water.click(response.rect);
-        }
     });
     clicked.then(|| HistoryGesture {
         thread: session.thread.clone(),
@@ -2397,8 +2401,6 @@ fn card(
         }
     } else if yearning {
         yearning_pose(ui, rect)
-    } else if pinning {
-        pinning_pose(ui, rect)
     } else {
         TilePose::default()
     };
@@ -2407,12 +2409,12 @@ fn card(
         rect.size() + Vec2::splat(pose.swell * 2.0),
     );
     let pointer_inside = ui.rect_contains_pointer(rect);
-    if physics.tool != TileTool::Rest || physics.recoiling {
+    if physics.tool.kinetic() || physics.recoiling {
         let travel = advance_jolt(
             physics.jolts,
             card.harness,
             &card.thread,
-            (fleeing || yearning || pinning).then_some(pose),
+            (fleeing || yearning).then_some(pose),
         );
         displace_tile(physics.water, visual, travel);
     }
@@ -2601,27 +2603,6 @@ fn yearning_pose_at(bounds: egui::Rect, pointer: Option<egui::Pos2>) -> TilePose
     TilePose {
         offset: direction * (YEARNING_PULL * proximity),
         swell: YEARNING_SWELL * proximity,
-    }
-}
-
-fn pinning_pose(ui: &egui::Ui, bounds: egui::Rect) -> TilePose {
-    pinning_pose_at(bounds, ui.input(|input| input.pointer.hover_pos()))
-}
-
-fn pinning_pose_at(bounds: egui::Rect, pointer: Option<egui::Pos2>) -> TilePose {
-    let Some(pointer) = pointer else {
-        return TilePose::default();
-    };
-    let toward = pointer - bounds.center();
-    let proximity = proximity(toward.length(), PIN_REACH);
-    let direction = if toward.length_sq() > f32::EPSILON {
-        toward.normalized()
-    } else {
-        Vec2::ZERO
-    };
-    TilePose {
-        offset: direction * (PIN_PULL * proximity),
-        swell: -PIN_SETTLE * proximity,
     }
 }
 
@@ -2918,12 +2899,6 @@ mod tests {
         assert!(near_yearning.swell > far_yearning.swell);
         assert!(near_yearning.offset.x < 0.0);
         assert!(far_yearning.offset.length() < near_yearning.offset.length());
-
-        let near_pinning = pinning_pose_at(tile, Some(near_pointer));
-        let far_pinning = pinning_pose_at(tile, Some(far_pointer));
-        assert!(near_pinning.swell < far_pinning.swell);
-        assert!(near_pinning.offset.x < 0.0);
-        assert!(far_pinning.offset.length() < near_pinning.offset.length());
     }
 
     #[test]

@@ -9,9 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use brass_poolrooms::{
+    chrome::{ForgePin, LonginusCursor},
+    egui::CustomCursorImage,
+};
 use egui_tester::{
     AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key, Motion,
-    ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery, demand,
+    ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery, X11Session,
+    demand,
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -622,7 +627,11 @@ fn fork_and_return(
         .within(input_reaction_budget())
         .until(Condition::new(
             "held Ctrl to arm the Longinus fork field",
-            |state: &Observation| state.fork_field == ForkField::Armed && !state.jiggling,
+            |state: &Observation| {
+                state.fork_field == ForkField::Armed
+                    && !state.jiggling
+                    && hovered(state, Harness::Codex, TURN)
+            },
         ))?;
     let forked = story.session().click(strike_x, strike_y, Button::Primary)?;
     let _armed = story.reaction(forked).until(Condition::new(
@@ -669,11 +678,12 @@ fn pin_and_unpin(story: &mut Story<'_, '_, Observation>, fixture: &Fixture) -> R
         .reaction(alt_down)
         .within(input_reaction_budget())
         .until(Condition::new(
-            "held Alt to settle tiles beneath the Forge Pin",
+            "held Alt to arm the immobile Forge Pin field",
             |state: &Observation| {
                 state.pin_field == PinField::Armed
                     && state.fork_field == ForkField::Quiescent
                     && !state.jiggling
+                    && hovered(state, Harness::Codex, DONE)
             },
         ))?;
     let clicked = story.session().click(x, y, Button::Primary)?;
@@ -708,8 +718,10 @@ fn pin_and_unpin(story: &mut Story<'_, '_, Observation>, fixture: &Fixture) -> R
         .reaction(alt_down)
         .within(input_reaction_budget())
         .until(Condition::new(
-            "held Alt to settle the pinned tile beneath the Forge Pin",
-            |state: &Observation| state.pin_field == PinField::Armed,
+            "held Alt to arm the immobile Forge Pin field on a pinned tile",
+            |state: &Observation| {
+                state.pin_field == PinField::Armed && hovered(state, Harness::Codex, DONE)
+            },
         ))?;
     let clicked = story.session().click(x, y, Button::Primary)?;
     let _flight = story.reaction(clicked).until(Condition::new(
@@ -1059,6 +1071,7 @@ fn verify_gallery(
         },
     )?;
     verify_census(&frame.state)?;
+    verify_native_cursor_fields(story)?;
     enable_minimize_on_close(story, &fixture.preferences)?;
     verify_search_and_help(story)?;
     verify_history(testbed, story, &fixture.index)?;
@@ -1105,6 +1118,57 @@ fn verify_gallery(
         fs::copy(&capture, destination).map_err(io_verdict("export acceptance capture"))?;
     }
     Ok(())
+}
+
+fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result<()> {
+    let _pointer = seize_card(story, DONE, "Forge Pin witness")?;
+    let rest = story.anchor(WorkspaceTarget(Harness::Codex, DONE))?.rect;
+    let alt_down = story.session().key_down(Key::Alt)?;
+    let _armed = story
+        .reaction(alt_down)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "held Alt to arm the immobile Forge Pin field",
+            |state: &Observation| {
+                state.pin_field == PinField::Armed
+                    && !state.jiggling
+                    && hovered(state, Harness::Codex, DONE)
+            },
+        ))?;
+    demand_native_cursor("Forge Pin", &ForgePin::cursor_image(), story.session())?;
+    thread::sleep(Duration::from_millis(140));
+    let _frame = story.frame()?;
+    let pinning = story.anchor(WorkspaceTarget(Harness::Codex, DONE))?.rect;
+    demand(
+        rect_motion(rest, pinning) <= 0.05,
+        "Alt made the tile move beneath its immobile Forge Pin field",
+    )?;
+    let alt_up = story.session().key_up(Key::Alt)?;
+    let _released = story.reaction(alt_up).until(Condition::new(
+        "released Alt to quench the Forge Pin field",
+        |state: &Observation| state.pin_field == PinField::Quiescent,
+    ))?;
+
+    let _pointer = seize_card(story, TURN, "Longinus witness")?;
+    let control_down = story.session().key_down(Key::Control)?;
+    let _armed = story
+        .reaction(control_down)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "held Ctrl to arm the Longinus fork field",
+            |state: &Observation| {
+                state.fork_field == ForkField::Armed
+                    && !state.jiggling
+                    && hovered(state, Harness::Codex, TURN)
+            },
+        ))?;
+    demand_native_cursor("Longinus", &LonginusCursor::image(), story.session())?;
+    let control_up = story.session().key_up(Key::Control)?;
+    let _released = story.reaction(control_up).until(Condition::new(
+        "released Ctrl to quench the Longinus fork field",
+        |state: &Observation| state.fork_field == ForkField::Quiescent,
+    ))?;
+    vacate_gallery(story, "pointer to leave the native cursor fields")
 }
 
 fn verify_census(state: &Observation) -> Result<()> {
@@ -3087,5 +3151,59 @@ fn verdict(operation: &'static str) -> impl FnOnce(rusqlite::Error) -> egui_test
 fn io_verdict(operation: &'static str) -> impl FnOnce(std::io::Error) -> egui_tester::Error {
     move |error| egui_tester::Error::Verdict {
         detail: format!("{operation}: {error}"),
+    }
+}
+
+fn demand_native_cursor(
+    label: &str,
+    expected: &CustomCursorImage,
+    session: &X11Session<'_, '_>,
+) -> Result<()> {
+    let expected_pixels = expected
+        .rgba
+        .chunks_exact(4)
+        .map(|pixel| {
+            u32::from(pixel[3]) << 24
+                | u32::from(pixel[0]) << 16
+                | u32::from(pixel[1]) << 8
+                | u32::from(pixel[2])
+        })
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + input_reaction_budget().functional_timeout();
+    loop {
+        let actual = session.cursor_image()?;
+        let first_pixel_delta = actual
+            .argb
+            .iter()
+            .zip(&expected_pixels)
+            .position(|(actual, expected)| actual != expected);
+        let exact = actual.width == expected.size[0]
+            && actual.height == expected.size[1]
+            && actual.hotspot_x == expected.hotspot[0]
+            && actual.hotspot_y == expected.hotspot[1]
+            && first_pixel_delta.is_none()
+            && actual.argb.len() == expected_pixels.len();
+        if exact {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return demand(
+                false,
+                format!(
+                    "X11 did not install the exact {label} cursor requested by Wrangler: actual {}x{} @ {},{} ({} pixels), expected {}x{} @ {},{} ({} pixels), first pixel delta {first_pixel_delta:?}",
+                    actual.width,
+                    actual.height,
+                    actual.hotspot_x,
+                    actual.hotspot_y,
+                    actual.argb.len(),
+                    expected.size[0],
+                    expected.size[1],
+                    expected.hotspot[0],
+                    expected.hotspot[1],
+                    expected_pixels.len(),
+                ),
+            );
+        }
+        thread::sleep(Duration::from_millis(2));
     }
 }
