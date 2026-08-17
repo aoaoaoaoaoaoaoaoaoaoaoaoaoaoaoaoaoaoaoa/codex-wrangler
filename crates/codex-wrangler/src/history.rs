@@ -775,9 +775,30 @@ impl Historian {
 
     fn rename(&self, thread: &str, name: &str) -> Result<()> {
         let (archived, _) = self.row(thread)?.context("historical session vanished")?;
-        anyhow::ensure!(!archived, "archived sessions cannot be renamed");
-        anyhow::ensure!(!name.trim().is_empty(), "session name must not be empty");
-        CodexRpc::open(&self.home)?.rename_thread(thread, name)
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "session name must not be empty");
+        if archived {
+            self.rename_archived(thread, name)
+        } else {
+            CodexRpc::open(&self.home)?.rename_thread(thread, name)
+        }
+    }
+
+    fn rename_archived(&self, thread: &str, name: &str) -> Result<()> {
+        let connection = Connection::open_with_flags(
+            self.home.join("state_5.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("open Codex metadata for archived rename")?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        let changed = connection.execute(
+            "UPDATE threads SET name = ?2
+             WHERE id = ?1 AND archived = 1 AND source = 'cli' AND agent_role IS NULL
+               AND (thread_source = 'user' OR thread_source IS NULL)",
+            params![thread, name],
+        )?;
+        anyhow::ensure!(changed == 1, "archived session ceased to be renameable");
+        Ok(())
     }
 
     fn archive(&self, thread: &str) -> Result<()> {

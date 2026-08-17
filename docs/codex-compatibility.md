@@ -10,7 +10,9 @@ Live discovery detects capabilities, never version strings. This table is the su
 Both lines require `state_5.sqlite` and the UUID forms of `codex resume` and
 `codex fork`. Both also provide app-server `thread/name/set` for unloaded,
 unarchived session metadata; its removal seam is `CodexRpc::rename_thread` and
-`HistoryOperation::Rename`. Interactive launch grammar is isolated at
+`HistoryOperation::Rename`. Because that RPC excludes archived rows, Wrangler
+updates their canonical `threads.name` field directly through the
+`Historian::rename_archived` seam. Interactive launch grammar is isolated at
 `CodexLaunch`. Delete a row only when its fixture, claim variant, parser arm,
 and named removal seam leave in the same change.
 

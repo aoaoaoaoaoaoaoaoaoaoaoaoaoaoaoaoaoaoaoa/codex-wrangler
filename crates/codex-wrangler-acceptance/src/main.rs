@@ -41,6 +41,7 @@ const ERROR: &str = "b0000000-0000-7000-8000-00000000000b";
 const COLD: &str = "c0000000-0000-7000-8000-00000000000c";
 const FRESH: &str = "d0000000-0000-7000-8000-00000000000d";
 const RENAMED_HISTORY: &str = "Copper archive";
+const RENAMED_ARCHIVED_HISTORY: &str = "Obsidian archive";
 const OLD_RESET: i64 = 1_000_000;
 const NEW_RESET: i64 = 2_000_000;
 const FUNCTIONAL_ACCEPTANCE_ENV: &str = "CODEX_WRANGLER_FUNCTIONAL_ACCEPTANCE";
@@ -1293,6 +1294,7 @@ fn verify_history(
         },
     )?;
     verify_history_rename(story, index)?;
+    verify_archived_history_rename(story, index)?;
     verify_history_sorting(story)?;
     let capture = testbed.private_path("captures/wrangler-history.png")?;
     story.capture()?.save_png(&capture)?;
@@ -1397,6 +1399,106 @@ fn verify_history_rename(story: &mut Story<'_, '_, Observation>, index: &Path) -
         legacy_thread_name(index, UNSEEN).as_deref() == Some(RENAMED_HISTORY),
         "Codex rename omitted its legacy session-name projection",
     )
+}
+
+fn verify_archived_history_rename(
+    story: &mut Story<'_, '_, Observation>,
+    index: &Path,
+) -> Result<()> {
+    let _opened = story
+        .tap(
+            HistoryTarget(COLD, "rename"),
+            Button::Primary,
+            Motion::default(),
+        )?
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "archived pencil to arm its in-situ name editor",
+            |state: &Observation| {
+                state.history_rename.as_ref().is_some_and(|rename| {
+                    rename.thread == COLD && rename.draft.is_empty() && rename.focused
+                })
+            },
+        ))?;
+    let _typed = story
+        .replace_text(
+            HistoryTarget(COLD, "rename-field"),
+            RENAMED_ARCHIVED_HISTORY,
+            Condition::new(
+                "archived name editor to retain focus",
+                |state: &Observation| {
+                    state
+                        .history_rename
+                        .as_ref()
+                        .is_some_and(|rename| rename.thread == COLD && rename.focused)
+                },
+            ),
+        )?
+        .next_frame()?;
+    let committed = story.session().key(Key::Return)?;
+    let _committed = story
+        .reaction(committed)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "Enter to submit the archived session name",
+            |state: &Observation| state.history_rename.is_none(),
+        ))?;
+    vacate_history(story)?;
+    let _renamed = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(120),
+        "archived metadata rename to return through the historical index",
+        |frame| {
+            frame
+                .state
+                .history
+                .iter()
+                .find(|session| session.thread == COLD)
+                .filter(|session| {
+                    session.archived && session.name.as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
+                })
+                .map(|_| ())
+        },
+    )?;
+    demand(
+        thread_name(index, COLD).as_deref() == Some(RENAMED_ARCHIVED_HISTORY),
+        "archived rename witness advanced before canonical Codex metadata",
+    )?;
+    click_history(story, COLD, "unarchive")?;
+    vacate_history(story)?;
+    let _unarchived = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(120),
+        "renamed session to retain its name through unarchive",
+        |frame| {
+            (thread_archived(index, COLD) == Some(false)
+                && thread_name(index, COLD).as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
+                && frame.state.history.iter().any(|session| {
+                    session.thread == COLD
+                        && !session.archived
+                        && session.name.as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
+                }))
+            .then_some(())
+        },
+    )?;
+    click_history(story, COLD, "archive")?;
+    vacate_history(story)?;
+    let _rearchived = story.wait_stable(
+        Duration::from_secs(10),
+        Duration::from_millis(120),
+        "renamed session to retain its name through rearchive",
+        |frame| {
+            (thread_archived(index, COLD) == Some(true)
+                && thread_name(index, COLD).as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
+                && frame.state.history.iter().any(|session| {
+                    session.thread == COLD
+                        && session.archived
+                        && session.name.as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
+                }))
+            .then_some(())
+        },
+    )?;
+    Ok(())
 }
 
 fn verify_history_sorting(story: &mut Story<'_, '_, Observation>) -> Result<()> {

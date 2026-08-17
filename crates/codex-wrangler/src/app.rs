@@ -1931,7 +1931,7 @@ fn history_rename_control(
 ) -> Option<HistoryAction> {
     let mut action = None;
     history_cell(row, width, |ui| {
-        if session.archived || flight == Some(HistoryOperation::Delete) {
+        if flight == Some(HistoryOperation::Delete) {
             return;
         }
         let rename = ui
