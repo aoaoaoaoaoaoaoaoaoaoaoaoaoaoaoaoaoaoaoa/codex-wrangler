@@ -215,15 +215,15 @@ dependencies = [
 
 [[package]]
 name = "brass_foundry"
-version = "0.13.8"
+version = "0.13.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b6df9c67fa7fcfd844d76118ad3b1941fe2d90a9edd849e9ab976f6bbf6746c"
+checksum = "3e1d4f62d7be279759b068059ea98b6eb921529dbd0ae0c2a043355ab45f222e"
 
 [[package]]
 name = "brass_poolrooms"
-version = "0.13.8"
+version = "0.13.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef8645fdd69fb0c211a8912bbc61d15490349ec66e30479346df38f7072eff06"
+checksum = "f32e0fda9135304d0dc47bf7803c3c94787d57e2670515abfbfe3306566df10c"
 dependencies = [
  "anyhow",
  "brass_foundry",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler-acceptance"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
  "brass_poolrooms",
  "egui-tester",

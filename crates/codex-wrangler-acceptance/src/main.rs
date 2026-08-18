@@ -1156,6 +1156,7 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
         story,
         "pointer to leave every tile before Longinus precedence proof",
     )?;
+    let longinus_rest = story.anchor(WorkspaceTarget(Harness::Codex, TURN))?.rect;
     let control_down = story.session().key_down(Key::Control)?;
     let _armed = story
         .reaction(control_down)
@@ -1168,6 +1169,13 @@ fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result
         ))?;
     demand_native_cursor("Longinus", &LonginusCursor::image(), story.session())?;
     cross_card_with_native_cursor(story, TURN, "Longinus", &LonginusCursor::image())?;
+    thread::sleep(Duration::from_millis(140));
+    let _frame = story.frame()?;
+    let radiating = story.anchor(WorkspaceTarget(Harness::Codex, TURN))?.rect;
+    demand(
+        rect_motion(longinus_rest, radiating) <= 0.05,
+        "Longinus radiator moved the tile beneath its waves",
+    )?;
     let control_up = story.session().key_up(Key::Control)?;
     let _released = story.reaction(control_up).until(Condition::new(
         "released Ctrl to quench the Longinus fork field",

@@ -17,7 +17,7 @@ use crate::contract::{
 use brass_poolrooms::{
     chrome,
     chrome::{ForgePin, LonginusCursor, MechanismSize, SortDetent, SortToggle},
-    water::{Domain, Floor, Frame as WaterFrame, Poke, Surface, Wetness},
+    water::{Domain, Floor, Frame as WaterFrame, Poke, Radiator, Surface, Wetness},
 };
 use egui::{
     Color32, RichText, Sense, Stroke, StrokeKind, Vec2,
@@ -56,23 +56,17 @@ const WHITE: Color32 = Color32::from_rgb(238, 234, 224);
 const ASH: Color32 = Color32::from_rgb(174, 172, 166);
 const TYPE_LIFT: f32 = 1.0;
 const SUMMON_BARRAGE: u8 = 12;
+const LONGINUS_FREQUENCY_HZ: f32 = 0.66;
+const LONGINUS_STRENGTH: f32 = 0.58;
+const LONGINUS_CHROMA_GAIN: f32 = 3.0;
 const TILE_AREA_PER_IMPULSE: f32 = 2_000.0;
 const TILE_IMPULSE_CEIL: f32 = 1.60;
 const TILE_SWEEP_EPSILON: f32 = 0.05;
 const FEAR_REACH: f32 = 720.0;
 const FEAR_FLEE: f32 = 2.25;
-const YEARNING_REACH: f32 = 880.0;
-const YEARNING_PULL: f32 = 5.0;
-const YEARNING_SWELL: f32 = 5.5;
 const HISTORY_ROW: f32 = 34.0;
 
-#[derive(Clone, Copy, Default)]
-struct TilePose {
-    offset: Vec2,
-    swell: f32,
-}
-
-type JoltLedger = HashMap<Harness, HashMap<String, TilePose>>;
+type JoltLedger = HashMap<Harness, HashMap<String, Vec2>>;
 
 struct CardPhysics<'a> {
     tool: TileTool,
@@ -93,7 +87,7 @@ enum TileTool {
 
 impl TileTool {
     const fn kinetic(self) -> bool {
-        matches!(self, Self::Dismiss | Self::Fork)
+        matches!(self, Self::Dismiss)
     }
 }
 
@@ -274,6 +268,7 @@ impl ActivationFlight {
 
 struct Wrangler<const START_FLOATING: bool> {
     water: Surface,
+    resting_ior_spread: f32,
     living_wait: LivingWait,
     nexus: Nexus,
     historian: HistoryNexus,
@@ -360,8 +355,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         })
         .map_err(|error| eprintln!("codex-wrangler could not raise its tray: {error:#}"))
         .ok();
+        let water = Surface::new(Wetness::Wet);
+        let resting_ior_spread = water.chemistry().ior_spread;
         Self {
-            water: Surface::new(Wetness::Wet),
+            water,
+            resting_ior_spread,
             living_wait: LivingWait::default(),
             nexus,
             historian,
@@ -1297,6 +1295,19 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         }
     }
 
+    fn longinus_field(&mut self, ui: &egui::Ui, held: bool) {
+        self.water.chemistry_mut().ior_spread =
+            self.resting_ior_spread * if held { LONGINUS_CHROMA_GAIN } else { 1.0 };
+        if held && let Some(tip) = ui.input(|input| input.pointer.hover_pos()) {
+            self.water.radiate(Radiator::point(
+                "longinus-tip",
+                tip,
+                LONGINUS_STRENGTH,
+                LONGINUS_FREQUENCY_HZ,
+            ));
+        }
+    }
+
     #[cfg(feature = "egui-test")]
     fn search_observation(&self) -> SearchObservation {
         let (query, valid) = match self.page {
@@ -1536,7 +1547,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         } else {
             TileTool::Rest
         };
-        let recoiling = self.tile_tool.kinetic() && tile_tool == TileTool::Rest;
+        let recoiling = self.tile_tool.kinetic() && !tile_tool.kinetic();
         self.tile_tool = tile_tool;
         if tile_tool == TileTool::Dismiss {
             ui.ctx()
@@ -1544,6 +1555,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         }
         self.water.begin(Domain::basin(basin));
         self.water.set_floor(Some(Floor::shallow(basin)));
+        self.longinus_field(ui, modifiers.ctrl);
         let (selected, historical, heave) = match self.page {
             Page::Live => {
                 let (selected, heave) = self.gallery_panel(ui, search_id, tile_tool, recoiling);
@@ -2399,28 +2411,19 @@ fn card(
     let (id, rect) = ui.allocate_space(Vec2::new(width, TILE_HEIGHT));
     let dismissible = dismissible(card.harness, card.work);
     let fleeing = physics.tool == TileTool::Dismiss && dismissible;
-    let yearning = physics.tool == TileTool::Fork && card.harness == Harness::Codex;
-    let pose = if fleeing {
-        TilePose {
-            offset: fear_offset(ui, &card.thread, rect, true),
-            swell: 0.0,
-        }
-    } else if yearning {
-        yearning_pose(ui, rect)
+    let offset = if fleeing {
+        fear_offset(ui, &card.thread, rect, true)
     } else {
-        TilePose::default()
+        Vec2::ZERO
     };
-    let visual = egui::Rect::from_center_size(
-        rect.center() + pose.offset,
-        rect.size() + Vec2::splat(pose.swell * 2.0),
-    );
+    let visual = rect.translate(offset);
     let pointer_inside = ui.rect_contains_pointer(rect);
     if physics.tool.kinetic() || physics.recoiling {
         let travel = advance_jolt(
             physics.jolts,
             card.harness,
             &card.thread,
-            (fleeing || yearning).then_some(pose),
+            fleeing.then_some(offset),
         );
         displace_tile(physics.water, visual, travel);
     }
@@ -2576,27 +2579,6 @@ fn fear_offset(ui: &egui::Ui, thread: &str, bounds: egui::Rect, afraid: bool) ->
     fear_pose(thread, clock, bounds, pointer)
 }
 
-fn yearning_pose(ui: &egui::Ui, bounds: egui::Rect) -> TilePose {
-    yearning_pose_at(bounds, ui.input(|input| input.pointer.hover_pos()))
-}
-
-fn yearning_pose_at(bounds: egui::Rect, pointer: Option<egui::Pos2>) -> TilePose {
-    let Some(pointer) = pointer else {
-        return TilePose::default();
-    };
-    let toward = pointer - bounds.center();
-    let proximity = proximity(toward.length(), YEARNING_REACH);
-    let direction = if toward.length_sq() > f32::EPSILON {
-        toward.normalized()
-    } else {
-        Vec2::ZERO
-    };
-    TilePose {
-        offset: direction * (YEARNING_PULL * proximity),
-        swell: YEARNING_SWELL * proximity,
-    }
-}
-
 fn fear_pose(thread: &str, clock: f64, bounds: egui::Rect, pointer: Option<egui::Pos2>) -> Vec2 {
     let Some(pointer) = pointer else {
         return Vec2::ZERO;
@@ -2646,16 +2628,13 @@ fn advance_jolt(
     ledger: &mut JoltLedger,
     harness: Harness,
     thread: &str,
-    current: Option<TilePose>,
-) -> TilePose {
+    current: Option<Vec2>,
+) -> Vec2 {
     let bank = ledger.entry(harness).or_default();
     match current {
         Some(current) => {
             if let Some(prior) = bank.get_mut(thread) {
-                let travel = TilePose {
-                    offset: current.offset - prior.offset,
-                    swell: current.swell - prior.swell,
-                };
+                let travel = current - *prior;
                 *prior = current;
                 travel
             } else {
@@ -2663,46 +2642,32 @@ fn advance_jolt(
                 current
             }
         }
-        None => bank
-            .remove(thread)
-            .map_or(TilePose::default(), |prior| TilePose {
-                offset: -prior.offset,
-                swell: -prior.swell,
-            }),
+        None => bank.remove(thread).map_or(Vec2::ZERO, |prior| -prior),
     }
 }
 
 /// Couple the tile's projected swept volume into both water axes. `rect` is
 /// the current visual pose; layout motion is deliberately excluded because
 /// tray heave already owns it.
-fn displace_tile(water: &mut Surface, rect: egui::Rect, travel: TilePose) {
-    let envelope = rect.union(rect.translate(-travel.offset));
-    let horizontal = travel.offset.x.abs() * rect.height();
+fn displace_tile(water: &mut Surface, rect: egui::Rect, travel: Vec2) {
+    let envelope = rect.union(rect.translate(-travel));
+    let horizontal = travel.x.abs() * rect.height();
     if horizontal >= TILE_SWEEP_EPSILON {
         water.poke(
             envelope,
             Poke::slide(
                 (horizontal / TILE_AREA_PER_IMPULSE).min(TILE_IMPULSE_CEIL),
-                travel.offset.x.signum(),
+                travel.x.signum(),
             ),
         );
     }
-    let vertical = travel.offset.y.abs() * rect.width();
+    let vertical = travel.y.abs() * rect.width();
     if vertical >= TILE_SWEEP_EPSILON {
         water.poke(
             envelope,
             Poke::drag(
                 (vertical / TILE_AREA_PER_IMPULSE).min(TILE_IMPULSE_CEIL),
-                travel.offset.y.signum(),
-            ),
-        );
-    }
-    let volume = travel.swell * (rect.width() + rect.height()) * 2.0;
-    if volume.abs() >= TILE_SWEEP_EPSILON {
-        water.poke(
-            rect,
-            Poke::ring(
-                (volume / TILE_AREA_PER_IMPULSE).clamp(-TILE_IMPULSE_CEIL, TILE_IMPULSE_CEIL),
+                travel.y.signum(),
             ),
         );
     }
@@ -2889,12 +2854,6 @@ mod tests {
         assert!(motion_span(&samples) > motion_span(&far));
         assert!(samples.iter().all(|sample| sample.x > 0.0));
         assert_eq!(fear_pose("thread", 0.0, tile, None), Vec2::ZERO);
-
-        let near_yearning = yearning_pose_at(tile, Some(near_pointer));
-        let far_yearning = yearning_pose_at(tile, Some(far_pointer));
-        assert!(near_yearning.swell > far_yearning.swell);
-        assert!(near_yearning.offset.x < 0.0);
-        assert!(far_yearning.offset.length() < near_yearning.offset.length());
     }
 
     #[test]
@@ -2915,14 +2874,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut water = Surface::new(Wetness::Wet);
         let rect = egui::Rect::from_min_size(egui::pos2(40.0, 50.0), egui::vec2(300.0, 185.0));
-        displace_tile(
-            &mut water,
-            rect,
-            TilePose {
-                offset: egui::vec2(2.0, -1.5),
-                swell: 0.0,
-            },
-        );
+        displace_tile(&mut water, rect, egui::vec2(2.0, -1.5));
         water.begin(Domain::basin(rect.expand(100.0)));
         let frame = water.frame(&ctx, 1.0, &[], None);
         assert!(frame.wants_repaint());
