@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "egui-test")]
-pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/25";
+pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/27";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -137,6 +137,7 @@ pub struct Observation {
     pub flight: Flight,
     pub search: SearchObservation,
     pub guide: GuideVisibility,
+    pub settings: SettingsObservation,
     pub tab: Tab,
     pub delete_guard: DeleteGuard,
     pub close_preference: ClosePreference,
@@ -187,6 +188,14 @@ pub struct SearchObservation {
     pub valid: bool,
     pub focused: bool,
     pub editing: bool,
+}
+
+#[cfg(feature = "egui-test")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SettingsObservation {
+    pub open: bool,
+    pub fault: bool,
+    pub settled: bool,
 }
 
 #[cfg(feature = "egui-test")]

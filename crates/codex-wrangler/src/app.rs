@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 #[cfg(feature = "egui-test")]
@@ -11,12 +12,12 @@ use crate::contract::{
     CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, ForkField,
     GuideVisibility, HistoryObservation, HistoryRenameObservation, HistorySortObservation,
     HistorySortTarget, HistoryTarget, HistoryTranscriptObservation, Observation, PinField,
-    PreferenceTarget, SearchObservation, SearchTarget, Tab, TabTarget, UI_FINGERPRINT,
-    WorkspaceTarget,
+    PreferenceTarget, SearchObservation, SearchTarget, SettingsObservation, Tab, TabTarget,
+    UI_FINGERPRINT, WorkspaceTarget,
 };
 use brass_poolrooms::{
     chrome,
-    chrome::{ForgePin, LonginusCursor, MechanismSize, SortDetent, SortToggle},
+    chrome::{ForgePin, LonginusCursor, MechanismSize, ScrewScroll, SortDetent, SortToggle},
     water::{Domain, Floor, Frame as WaterFrame, Poke, Radiator, Surface, Wetness},
 };
 use egui::{
@@ -27,10 +28,13 @@ use eternalist_apps::{
     CloseDisposition, LivingWait, NativeApp, NativeWake, WindowSpec,
     command_guide::CommandGuide,
     commands::{CommandDispatch, CommandStatus},
+    settings::{SettingSpec, SettingsFile, SettingsSheet},
 };
 
 use crate::{
-    commands::{Edict, NAVIGATION_IDIOMS, Realm, SCRY_IDIOMS, TILE_IDIOMS, canon},
+    commands::{
+        APPLICATION_IDIOMS, Edict, NAVIGATION_IDIOMS, Realm, SCRY_IDIOMS, TILE_IDIOMS, canon,
+    },
     contract::{Harness, HistoryColumn, HistoryOperation, SortDirection, Work},
     history::{
         Census as HistoryCensus, Nexus as HistoryNexus, Order as HistoryOrder,
@@ -65,6 +69,16 @@ const TILE_SWEEP_EPSILON: f32 = 0.05;
 const FEAR_REACH: f32 = 720.0;
 const FEAR_FLEE: f32 = 2.25;
 const HISTORY_ROW: f32 = 34.0;
+const MINIMIZE_ON_CLOSE: SettingSpec = SettingSpec::new(
+    "minimize_on_close",
+    "MINIMIZE ON CLOSE",
+    "Keep Wrangler resident in the system tray when its window closes.",
+);
+const CONFIRM_DELETION: SettingSpec = SettingSpec::new(
+    "confirm_deletion",
+    "CONFIRM DELETE",
+    "Require confirmation before permanently deleting a historical session.",
+);
 
 type JoltLedger = HashMap<Harness, HashMap<String, Vec2>>;
 
@@ -297,7 +311,10 @@ struct Wrangler<const START_FLOATING: bool> {
     transcript: Option<TranscriptView>,
     page: Page,
     preferences: Preferences,
+    settings: SettingsSheet,
     guide: CommandGuide,
+    window_focused: Option<bool>,
+    configuration_fault_seen: Option<String>,
     visibility: GalleryVisibility,
     ledger: Ledger,
     tray: Option<Tray>,
@@ -310,18 +327,19 @@ pub fn launch(
     posture: Posture,
 ) -> anyhow::Result<()> {
     match posture {
-        Posture::Floating => {
-            eternalist_apps::run(ctx.clone(), Wrangler::<true>::raise(ctx, incumbent, ledger))
-        }
+        Posture::Floating => eternalist_apps::run(
+            ctx.clone(),
+            Wrangler::<true>::raise(ctx, incumbent, ledger)?,
+        ),
         Posture::Tiled => eternalist_apps::run(
             ctx.clone(),
-            Wrangler::<false>::raise(ctx, incumbent, ledger),
+            Wrangler::<false>::raise(ctx, incumbent, ledger)?,
         ),
     }
 }
 
 impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
-    fn raise(ctx: &egui::Context, incumbent: Incumbent, ledger: Ledger) -> Self {
+    fn raise(ctx: &egui::Context, incumbent: Incumbent, ledger: Ledger) -> anyhow::Result<Self> {
         lift_typography(ctx);
         let wake = NativeWake::from_context(ctx);
         let nexus = spawn(wake.clone());
@@ -357,7 +375,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         .ok();
         let water = Surface::new(Wetness::Wet);
         let resting_ior_spread = water.chemistry().ior_spread;
-        Self {
+        let preferences = Preferences::raise(ctx)?;
+        Ok(Self {
             water,
             resting_ior_spread,
             living_wait: LivingWait::default(),
@@ -387,12 +406,15 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             delete_target: None,
             transcript: None,
             page: Page::Live,
-            preferences: Preferences::restore(),
+            preferences,
+            settings: SettingsSheet::default(),
             guide: CommandGuide::default(),
+            window_focused: None,
+            configuration_fault_seen: None,
             visibility: GalleryVisibility::Visible,
             ledger,
             tray,
-        }
+        })
     }
 
     fn quench(&mut self) {
@@ -591,8 +613,18 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             }
             return;
         }
-        let help_invoked = !modal_open && self.guide.take_shortcuts(ui.ctx());
+        let settings_was_open = self.settings.is_open();
+        let settings_invoked =
+            !modal_open && !self.guide.is_open() && self.settings.take_shortcut(ui.ctx());
+        if !settings_was_open && self.settings.is_open() && self.preferences.settled() {
+            let _requested = self.preferences.request_reload();
+        }
+        let help_invoked = !modal_open
+            && !settings_invoked
+            && !self.settings.is_open()
+            && self.guide.take_shortcuts(ui.ctx());
         if !modal_open
+            && !self.settings.is_open()
             && !help_invoked
             && !self.guide.is_open()
             && let Some(CommandDispatch::Invoke(Edict::Scry)) =
@@ -601,6 +633,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             self.search_focus = SearchFocus::Seeking;
         }
         if !modal_open
+            && !self.settings.is_open()
             && !help_invoked
             && !self.guide.is_open()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
@@ -608,6 +641,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             self.select_page(self.page.next(), ui.ctx());
         }
         if !modal_open
+            && !self.settings.is_open()
             && !self.guide.is_open()
             && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
@@ -704,19 +738,40 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn close_preference(&mut self, ui: &mut egui::Ui) {
         let mut minimize = self.preferences.minimize_on_close();
-        let latch = chrome::Checkbox::new(&mut minimize, "MINIMIZE ON CLOSE")
-            .label_side(chrome::LabelSide::Left)
-            .size(MechanismSize::Small)
-            .show(ui);
+        let latch = ui
+            .add_enabled_ui(self.preferences.writable(), |ui| {
+                chrome::Checkbox::new(&mut minimize, MINIMIZE_ON_CLOSE.name())
+                    .label_side(chrome::LabelSide::Left)
+                    .size(MechanismSize::Small)
+                    .show(ui)
+            })
+            .inner;
         brass_poolrooms::poolroom_anchor!(
             ui,
             PreferenceTarget("minimize-on-close").to_string(),
             latch.rect
         );
         self.water.checkbox(&latch);
-        if latch.changed() {
-            self.preferences.set_minimize_on_close(minimize);
+        let changed = latch.changed();
+        let _hint = latch
+            .into_response()
+            .on_hover_text(MINIMIZE_ON_CLOSE.detail());
+        if changed {
+            let _revised = self.preferences.set_minimize_on_close(minimize);
         }
+    }
+
+    fn application_menus(&mut self, ui: &mut egui::Ui) {
+        let was_open = self.settings.is_open();
+        let settings = self
+            .settings
+            .activator(ui, self.preferences.fault().is_some());
+        self.water.monoglyph(&settings);
+        if !was_open && self.settings.is_open() && self.preferences.settled() {
+            let _requested = self.preferences.request_reload();
+        }
+        let help = self.guide.activator(ui);
+        self.water.monoglyph(&help);
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -733,9 +788,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 RichText::new(label).size(13.0).color(RED)
             };
             let _count = ui.label(count);
-            ui.add_space(8.0);
-            let _help = ui.label(chrome::muted("? TO OPEN HELP").size(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.application_menus(ui);
+                ui.add_space(8.0);
                 self.close_preference(ui);
                 ui.add_space(8.0);
                 if self.page == Page::Live {
@@ -748,18 +803,26 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     legend(ui, "ERROR", Work::Error);
                 } else {
                     let mut guarded = self.preferences.confirm_deletion();
-                    let guard = chrome::Checkbox::new(&mut guarded, "CONFIRM DELETE")
-                        .label_side(chrome::LabelSide::Left)
-                        .size(MechanismSize::Small)
-                        .show(ui);
+                    let guard = ui
+                        .add_enabled_ui(self.preferences.writable(), |ui| {
+                            chrome::Checkbox::new(&mut guarded, CONFIRM_DELETION.name())
+                                .label_side(chrome::LabelSide::Left)
+                                .size(MechanismSize::Small)
+                                .show(ui)
+                        })
+                        .inner;
                     brass_poolrooms::poolroom_anchor!(
                         ui,
                         HistoryTarget("preferences", "confirm-delete").to_string(),
                         guard.rect
                     );
                     self.water.checkbox(&guard);
-                    if guard.changed() {
-                        self.preferences.set_confirm_deletion(guarded);
+                    let changed = guard.changed();
+                    let _hint = guard
+                        .into_response()
+                        .on_hover_text(CONFIRM_DELETION.detail());
+                    if changed {
+                        let _revised = self.preferences.set_confirm_deletion(guarded);
                     }
                 }
             });
@@ -812,6 +875,65 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         });
     }
 
+    fn settings_sheet(&mut self, ctx: &egui::Context) {
+        let path = self.preferences.path().to_owned();
+        let fault = self
+            .preferences
+            .fault()
+            .map(|fault| fault.message().to_owned());
+        let file = fault.as_deref().map_or_else(
+            || SettingsFile::ready(&path),
+            |fault| SettingsFile::fault(&path, fault),
+        );
+        let file = file
+            .reloading(self.preferences.reload_pending())
+            .reloadable(self.preferences.fault().is_some() || self.preferences.settled());
+        let mut minimize = self.preferences.minimize_on_close();
+        let mut confirm = self.preferences.confirm_deletion();
+        let mut minimize_changed = false;
+        let mut confirm_changed = false;
+        let response = self.settings.show(ctx, &mut self.water, file, |ui| {
+            ui.section("BEHAVIOR");
+            minimize_changed = ui.boolean(MINIMIZE_ON_CLOSE, &mut minimize);
+            confirm_changed = ui.boolean(CONFIRM_DELETION, &mut confirm);
+        });
+        if minimize_changed {
+            let _revised = self.preferences.set_minimize_on_close(minimize);
+        }
+        if confirm_changed {
+            let _revised = self.preferences.set_confirm_deletion(confirm);
+        }
+        if response.reload_requested() {
+            let _requested = self.preferences.request_reload();
+        }
+    }
+
+    fn reconcile_configuration(&mut self, ui: &egui::Ui) -> bool {
+        let mut changed = self.preferences.absorb();
+        let fault = self
+            .preferences
+            .fault()
+            .map(|fault| fault.message().to_owned());
+        let new_fault = fault.is_some() && fault != self.configuration_fault_seen;
+        if fault != self.configuration_fault_seen {
+            self.configuration_fault_seen = fault;
+            changed = true;
+        }
+        if new_fault
+            && self.delete_target.is_none()
+            && self.transcript.is_none()
+            && !self.guide.is_open()
+        {
+            self.settings.require_attention(ui.ctx());
+        }
+        let focused = ui.input(|input| input.focused);
+        let regained = self.window_focused.replace(focused) == Some(false) && focused;
+        if regained && self.preferences.settled() {
+            let _requested = self.preferences.request_reload();
+        }
+        changed
+    }
+
     fn gallery_panel(
         &mut self,
         ui: &mut egui::Ui,
@@ -833,7 +955,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     self.search_field(ui, search_id);
                 }
                 ui.add_space(16.0);
-                let scroll = egui::ScrollArea::vertical()
+                let scroll = ScrewScroll::vertical()
                     .id_salt("codex-gallery")
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
@@ -936,7 +1058,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     ui.ctx().request_discard("Historical order changed");
                 }
                 ui.add_space(4.0);
-                let scroll = egui::ScrollArea::vertical()
+                let scroll = ScrewScroll::vertical()
                     .id_salt("codex-history")
                     .auto_shrink([false; 2])
                     .show_rows(
@@ -1451,6 +1573,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             } else {
                 GuideVisibility::Closed
             },
+            settings: SettingsObservation {
+                open: self.settings.is_open(),
+                fault: self.preferences.fault().is_some(),
+                settled: self.preferences.settled(),
+            },
             tab: self.page.into(),
             delete_guard: if self.preferences.confirm_deletion() {
                 DeleteGuard::Armed
@@ -1507,20 +1634,13 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
 
     fn draw(&mut self, ui: &mut egui::Ui) {
         let modifiers = ui.input(|input| input.modifiers);
-        // Bitmap cursors are sticky platform output. Modifier ownership is
-        // window-wide and each frame must earn it anew.
-        ui.ctx().set_cursor_image(if modifiers.ctrl {
-            Some(LonginusCursor::image())
-        } else if modifiers.alt {
-            Some(ForgePin::cursor_image())
-        } else {
-            None
-        });
+        set_tool_cursor(ui.ctx(), modifiers);
         self.kindle_if_summoned();
         self.hovered = None;
         self.history_hovered = None;
         self.reap_activation();
         let history_outcome = self.reap_history_outcomes() | self.reap_transcripts();
+        let configuration_changed = self.reconcile_configuration(ui);
         if self.visibility != GalleryVisibility::Visible {
             return;
         }
@@ -1534,6 +1654,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         let basin = ui.max_rect();
         let physical_mode = !modal_open
             && self.page == Page::Live
+            && !self.settings.is_open()
             && !self.guide.is_open()
             && !ui.ctx().text_edit_focused();
         let tile_tool = if !physical_mode {
@@ -1577,6 +1698,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         }
         self.deletion_modal(ui.ctx());
         self.transcript_modal(ui.ctx());
+        self.settings_sheet(ui.ctx());
         self.water.heave(ui.ctx(), heave);
         self.guide.show(
             ui.ctx(),
@@ -1587,13 +1709,18 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
                 Page::Historical => "HISTORICAL",
             },
             |_| CommandStatus::Enabled,
-            &[NAVIGATION_IDIOMS, TILE_IDIOMS, SCRY_IDIOMS],
+            &[
+                APPLICATION_IDIOMS,
+                NAVIGATION_IDIOMS,
+                TILE_IDIOMS,
+                SCRY_IDIOMS,
+            ],
         );
         let stable_pointer = match self.page {
             Page::Live => self.hovered.is_none(),
             Page::Historical => self.history_hovered.is_none(),
         };
-        let mut changed = history_outcome;
+        let mut changed = history_outcome | configuration_changed;
         if stable_pointer
             && !tile_tool.kinetic()
             && !self.search_focus.held()
@@ -1615,6 +1742,14 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         } else {
             CloseDisposition::Exit
         }
+    }
+
+    fn service_deadline(&self, _now: Instant) -> Option<Instant> {
+        self.preferences.deadline()
+    }
+
+    fn service_deadline_reached(&mut self, now: Instant) -> bool {
+        self.preferences.service_deadline_reached(now)
     }
 
     fn take_reveal_request(&mut self) -> bool {
@@ -1743,8 +1878,20 @@ fn page_tab(ui: &mut egui::Ui, page: Page, selected: bool) -> egui::Response {
     response
 }
 
+fn set_tool_cursor(ctx: &egui::Context, modifiers: egui::Modifiers) {
+    // Bitmap cursors are sticky platform output. Modifier ownership is
+    // window-wide and each frame must earn it anew.
+    ctx.set_cursor_image(if modifiers.ctrl {
+        Some(LonginusCursor::image())
+    } else if modifiers.alt {
+        Some(ForgePin::cursor_image())
+    } else {
+        None
+    });
+}
+
 fn transcript_turn(ui: &mut egui::Ui, turn: &HistoryTurn) {
-    let _scroll = egui::ScrollArea::vertical()
+    let _scroll = ScrewScroll::vertical()
         .id_salt("historical-transcript-turn")
         .auto_shrink([false; 2])
         .max_height(520.0)

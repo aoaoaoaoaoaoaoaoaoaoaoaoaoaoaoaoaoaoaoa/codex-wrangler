@@ -14,9 +14,9 @@ use brass_poolrooms::{
     egui::CustomCursorImage,
 };
 use egui_tester::{
-    AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key, Motion,
-    ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery, X11CursorImage,
-    X11Session, demand,
+    AppCommand, Application, Button, Condition, Error as TesterError, Graphics, Key, Modifiers,
+    Motion, ReactionBudget, Result, Story, Testbed, TestbedBuilder, Window, WindowQuery,
+    X11CursorImage, X11Session, demand,
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -314,7 +314,7 @@ fn verify_residency(
     let wrangler_id = story.session().window().id();
     let tray = wait_named_window(testbed, app, "Codex Wrangler tray", Duration::from_secs(8))?;
     let tray = verify_tray_recovery(testbed, app, &tray)?;
-    let _switched = story.session().key(Key::Function(2))?;
+    let _switched = story.session().key(Key::Function(10))?;
     app.wait_until(
         Duration::from_secs(8),
         "i3 to enter a different workspace",
@@ -1073,6 +1073,7 @@ fn verify_gallery(
     verify_census(&frame.state)?;
     verify_native_cursor_fields(story)?;
     enable_minimize_on_close(story, &fixture.preferences)?;
+    verify_configuration_preflight(story, &fixture.preferences)?;
     verify_search_and_help(story)?;
     verify_history(testbed, story, &fixture.index)?;
     verify_permission_title_events(testbed, story)?;
@@ -1321,13 +1322,75 @@ fn enable_minimize_on_close(
             "minimize-on-close latch to arm",
             |state: &Observation| state.close_preference == ClosePreference::Minimize,
         ))?;
+    let _sealed = story.wait_stable(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        "minimize-on-close configuration settlement",
+        |frame| (frame.state.settings.settled && preferences.is_file()).then_some(()),
+    )?;
+    let configuration =
+        fs::read_to_string(preferences).map_err(io_verdict("read close preference"))?;
     demand(
-        serde_json::from_slice::<Value>(
-            &fs::read(preferences).map_err(io_verdict("read close preference"))?,
-        )
-        .is_ok_and(|state| state["minimize_on_close"] == true),
-        "minimize-on-close did not seal its XDG preference",
+        configuration
+            .lines()
+            .any(|line| line.trim() == "minimize_on_close = true"),
+        "minimize-on-close did not seal its XDG configuration",
     )
+}
+
+fn verify_configuration_preflight(
+    story: &mut Story<'_, '_, Observation>,
+    configuration: &Path,
+) -> Result<()> {
+    let _settled = story.wait_stable(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        "configuration settlement",
+        |frame| frame.state.settings.settled.then_some(()),
+    )?;
+    let admitted =
+        fs::read_to_string(configuration).map_err(io_verdict("read admitted configuration"))?;
+    let poisoned = format!("{admitted}\nunknown_preference = true\n");
+    fs::write(configuration, &poisoned).map_err(io_verdict("poison configuration"))?;
+
+    let opened = story.session().key(Key::Function(2))?;
+    let _fault = story
+        .reaction(opened)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "unknown configuration key to raise settings preflight",
+            |state: &Observation| state.settings.open && state.settings.fault,
+        ))?;
+    demand(
+        fs::read_to_string(configuration).is_ok_and(|source| source == poisoned),
+        "configuration preflight modified the invalid source",
+    )?;
+
+    fs::write(configuration, admitted).map_err(io_verdict("repair configuration"))?;
+    let _reloaded = story
+        .tap(
+            "eternalist.settings.reload",
+            Button::Primary,
+            Motion::default(),
+        )?
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "repaired configuration to reload",
+            |state: &Observation| {
+                state.settings.open && !state.settings.fault && state.settings.settled
+            },
+        ))?;
+    let closed = story
+        .session()
+        .chord(Modifiers::CTRL, Key::Character(','))?;
+    let _closed = story
+        .reaction(closed)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "settings shortcut to close the repaired preflight",
+            |state: &Observation| !state.settings.open,
+        ))?;
+    Ok(())
 }
 
 fn verify_search_and_help(story: &mut Story<'_, '_, Observation>) -> Result<()> {
@@ -2377,7 +2440,7 @@ impl Fixture {
             "font pango:monospace 8\n\
              focus_follows_mouse no\n\
              workspace_layout tabbed\n\
-             bindsym F2 workspace number 8, exec --no-startup-id touch /test/workspace-proof\n\
+             bindsym F10 workspace number 8, exec --no-startup-id touch /test/workspace-proof\n\
              bindsym F3 kill\n\
              bindsym F4 workspace number 9, exec --no-startup-id touch /test/launch-workspace-proof\n\
              bindsym F5 floating disable, exec --no-startup-id touch /test/tiled-proof\n\
@@ -2437,7 +2500,7 @@ impl Fixture {
             floating_proof,
             state,
             roster,
-            preferences: testbed.private_path("xdg/state/codex-wrangler/preferences.json")?,
+            preferences: testbed.private_path("xdg/config/codex-wrangler/config.toml")?,
             pinboard: testbed.private_path("xdg/state/codex-wrangler/pinned-sessions.json")?,
             index: db_path,
             rotate_resume,

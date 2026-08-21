@@ -22,6 +22,7 @@ instrumentation = ["brass_poolrooms/instrumentation"]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 brass_poolrooms.workspace = true
+directories.workspace = true
 egui.workspace = true
 egui-tester-witness = { workspace = true, optional = true, features = ["egui"] }
 egui-wgpu.workspace = true

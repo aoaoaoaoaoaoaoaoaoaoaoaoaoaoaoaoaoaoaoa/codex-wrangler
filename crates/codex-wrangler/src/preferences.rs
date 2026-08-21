@@ -1,12 +1,37 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
 
+use anyhow::{Context as _, Result};
+use directories::ProjectDirs;
+use eternalist_apps::configuration::{Configuration, ConfigurationFault, ConfigurationLedger};
 use serde::{Deserialize, Serialize};
 
-const FILE: &str = "preferences.json";
-const VERSION: u8 = 1;
+const LEGACY_FILE: &str = "preferences.json";
+const LEGACY_VERSION: u8 = 1;
+const SETTLE: Duration = Duration::from_millis(350);
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
-struct State {
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+struct Values {
+    confirm_deletion: bool,
+    minimize_on_close: bool,
+}
+
+impl Default for Values {
+    fn default() -> Self {
+        Self {
+            confirm_deletion: true,
+            minimize_on_close: false,
+        }
+    }
+}
+
+impl Configuration for Values {}
+
+#[derive(Clone, Copy, Deserialize)]
+struct Legacy {
     version: u8,
     confirm_deletion: bool,
     #[serde(default)]
@@ -14,82 +39,115 @@ struct State {
 }
 
 pub struct Preferences {
-    path: Option<PathBuf>,
-    confirm_deletion: bool,
-    minimize_on_close: bool,
+    ledger: ConfigurationLedger<Values>,
 }
 
 impl Preferences {
-    pub fn restore() -> Self {
-        let path = match crate::state::path(FILE) {
-            Ok(path) => path,
-            Err(error) => {
-                eprintln!("codex-wrangler cannot resolve its preferences: {error:#}");
-                return Self {
-                    path: None,
-                    confirm_deletion: true,
-                    minimize_on_close: false,
-                };
+    pub fn raise(ctx: &egui::Context) -> Result<Self> {
+        let project = ProjectDirs::from("moe", "Eternalist", "codex-wrangler")
+            .context("cannot resolve the platform configuration directory")?;
+        let path = project.config_dir().join("config.toml");
+        let fallback = match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                legacy().unwrap_or_else(|error| {
+                    eprintln!("codex-wrangler cannot migrate its former preferences: {error:#}");
+                    Values::default()
+                })
             }
+            Ok(_) | Err(_) => Values::default(),
         };
-        let restored = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<State>(&bytes)
-                .ok()
-                .filter(|state| state.version == VERSION),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                eprintln!(
-                    "codex-wrangler cannot read preferences from `{}`: {error}",
-                    path.display()
-                );
-                None
-            }
-        };
-        Self {
-            path: Some(path),
-            confirm_deletion: restored.is_none_or(|state| state.confirm_deletion),
-            minimize_on_close: restored.is_some_and(|state| state.minimize_on_close),
-        }
+        let ledger = ConfigurationLedger::raise_with_fallback(
+            "codex-wrangler-configuration",
+            ctx,
+            path,
+            SETTLE,
+            fallback,
+        )?;
+        Ok(Self { ledger })
     }
 
     pub const fn confirm_deletion(&self) -> bool {
-        self.confirm_deletion
+        self.ledger.live().confirm_deletion
     }
 
-    pub fn set_confirm_deletion(&mut self, confirm: bool) {
-        if self.confirm_deletion == confirm {
-            return;
-        }
-        self.confirm_deletion = confirm;
-        self.persist();
+    pub fn set_confirm_deletion(&mut self, confirm: bool) -> bool {
+        self.ledger
+            .revise(|values| values.confirm_deletion = confirm)
+            .unwrap_or_else(|error| {
+                eprintln!("codex-wrangler cannot revise delete confirmation: {error:#}");
+                false
+            })
     }
 
     pub const fn minimize_on_close(&self) -> bool {
-        self.minimize_on_close
+        self.ledger.live().minimize_on_close
     }
 
-    pub fn set_minimize_on_close(&mut self, minimize: bool) {
-        if self.minimize_on_close == minimize {
-            return;
-        }
-        self.minimize_on_close = minimize;
-        self.persist();
+    pub fn set_minimize_on_close(&mut self, minimize: bool) -> bool {
+        self.ledger
+            .revise(|values| values.minimize_on_close = minimize)
+            .unwrap_or_else(|error| {
+                eprintln!("codex-wrangler cannot revise close behavior: {error:#}");
+                false
+            })
     }
 
-    fn persist(&self) {
-        let Some(path) = &self.path else {
-            return;
-        };
-        let state = State {
-            version: VERSION,
-            confirm_deletion: self.confirm_deletion,
-            minimize_on_close: self.minimize_on_close,
-        };
-        let result = serde_json::to_vec(&state)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| crate::state::seal(path, &bytes));
-        if let Err(error) = result {
-            eprintln!("codex-wrangler cannot save its preferences: {error:#}");
-        }
+    pub const fn writable(&self) -> bool {
+        self.ledger.writable()
     }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.ledger.path()
+    }
+
+    pub const fn fault(&self) -> Option<&ConfigurationFault> {
+        self.ledger.fault()
+    }
+
+    pub const fn reload_pending(&self) -> bool {
+        self.ledger.reload_pending()
+    }
+
+    pub fn settled(&self) -> bool {
+        self.ledger.settled()
+    }
+
+    pub fn request_reload(&mut self) -> bool {
+        self.ledger.request_reload().unwrap_or_else(|error| {
+            eprintln!("codex-wrangler cannot reload its configuration: {error:#}");
+            false
+        })
+    }
+
+    pub fn absorb(&mut self) -> bool {
+        self.ledger.absorb()
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.ledger.deadline()
+    }
+
+    pub fn service_deadline_reached(&mut self, now: Instant) -> bool {
+        self.ledger.service_deadline_reached(now)
+    }
+}
+
+fn legacy() -> Result<Values> {
+    let path = crate::state::path(LEGACY_FILE)?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Values::default()),
+        Err(error) => return Err(error).with_context(|| format!("read `{}`", path.display())),
+    };
+    let legacy = serde_json::from_slice::<Legacy>(&bytes)
+        .with_context(|| format!("decode `{}`", path.display()))?;
+    anyhow::ensure!(
+        legacy.version == LEGACY_VERSION,
+        "unsupported legacy preference version {}",
+        legacy.version
+    );
+    Ok(Values {
+        confirm_deletion: legacy.confirm_deletion,
+        minimize_on_close: legacy.minimize_on_close,
+    })
 }

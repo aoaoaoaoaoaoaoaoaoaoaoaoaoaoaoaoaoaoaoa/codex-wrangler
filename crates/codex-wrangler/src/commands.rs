@@ -2,7 +2,10 @@ use std::sync::OnceLock;
 
 use eternalist_apps::{
     command_guide::{GuideGesture, GuideSection},
-    commands::{CommandCanon, CommandScope, CommandSpec, Shortcut, ShortcutKey, ShortcutModifiers},
+    commands::{
+        CommandCanon, CommandScope, CommandSpec, SETTINGS_SHORTCUTS, Shortcut, ShortcutKey,
+        ShortcutModifiers,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +21,11 @@ pub enum Realm {
 const SCRY_KEYS: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Slash)];
 const TAB: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Tab)];
 const ESCAPE: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Escape)];
+const APPLICATION_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
+    "Open settings",
+    "Opens Wrangler's complete configuration surface.",
+    &SETTINGS_SHORTCUTS,
+)];
 const NAVIGATION_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
     "Switch tab",
     "Cycles Live and Historical.",
@@ -42,6 +50,8 @@ const TILE_GESTURES: [GuideGesture; 2] = [
 ];
 
 pub const NAVIGATION_IDIOMS: GuideSection = GuideSection::new("NAVIGATION", &NAVIGATION_GESTURES);
+pub const APPLICATION_IDIOMS: GuideSection =
+    GuideSection::new("APPLICATION", &APPLICATION_GESTURES);
 pub const SCRY_IDIOMS: GuideSection = GuideSection::new("SEARCH", &SCRY_GESTURES);
 pub const TILE_IDIOMS: GuideSection = GuideSection::new("TILES", &TILE_GESTURES);
 
