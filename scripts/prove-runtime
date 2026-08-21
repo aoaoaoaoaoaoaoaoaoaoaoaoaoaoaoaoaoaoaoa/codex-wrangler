@@ -6,7 +6,9 @@ cell=$(mktemp -d "${TMPDIR:-/tmp}/codex-wrangler-lifecycle.XXXXXX")
 trap 'rm -rf -- "$cell"' EXIT HUP INT TERM
 cd "$root"
 
-cargo install --locked --force --features egui-test --path crates/codex-wrangler --root "$cell/prefix"
+# Cargo ignores a binary package's lockfile by default. Exercise that ordinary
+# consumer resolution so every version admitted by Cargo.toml must compose.
+cargo install --force --features egui-test --path crates/codex-wrangler --root "$cell/prefix"
 binary=$cell/prefix/bin/codex-wrangler
 test -x "$binary"
 CODEX_WRANGLER_ACCEPTANCE_BINARY=$binary \

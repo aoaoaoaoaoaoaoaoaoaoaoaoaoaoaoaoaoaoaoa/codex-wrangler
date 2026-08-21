@@ -18,10 +18,22 @@ jobs:
       contents: read
     uses: aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/eternalist-foundry/.github/workflows/pipeline.yml@60b1a58738060867d10097825ed0c3ee64a808e4
 
+  registry:
+    name: Registry
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: foundry
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require Cargo publication
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: cargo info --registry crates-io "codex-wrangler@${VERSION#v}" >/dev/null
+
   release:
     name: Release
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    needs: foundry
+    needs: [foundry, registry]
     permissions:
       contents: write
     uses: aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/eternalist-foundry/.github/workflows/publish.yml@60b1a58738060867d10097825ed0c3ee64a808e4
