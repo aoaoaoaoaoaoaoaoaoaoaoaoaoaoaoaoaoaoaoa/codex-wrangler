@@ -929,7 +929,10 @@ fn seize_card(
             .within(ReactionBudget::functional(Duration::from_secs(2)))
             .until(condition)
         {
-            Ok(_) => return Ok(point),
+            Ok(_) => {
+                story.session().focus()?;
+                return Ok(point);
+            }
             Err(TesterError::Condition { .. }) if attempt < ATTEMPTS => attempt += 1,
             Err(error) => return Err(error),
         }
