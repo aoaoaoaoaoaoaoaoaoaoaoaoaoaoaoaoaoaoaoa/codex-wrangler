@@ -3321,7 +3321,9 @@ fn demand_native_cursor_released(
 fn native_cursor_pixels(cursor: &CustomCursorImage) -> Vec<u32> {
     cursor
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| {
             u32::from(pixel[3]) << 24
                 | u32::from(pixel[0]) << 16
