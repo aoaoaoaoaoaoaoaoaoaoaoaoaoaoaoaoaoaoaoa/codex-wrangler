@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "codex-census"
-version = "1.3.11"
+version = "1.3.12"
 dependencies = [
  "anyhow",
  "uuid",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler"
-version = "1.3.11"
+version = "1.3.12"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler-acceptance"
-version = "1.3.11"
+version = "1.3.12"
 dependencies = [
  "brass_poolrooms",
  "egui-tester",
