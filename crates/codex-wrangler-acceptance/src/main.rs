@@ -61,6 +61,7 @@ const APPLICATION_APPEARANCE_CEILING: Duration = Duration::from_millis(
     FIXTURE_POLL_INTERVAL_MILLIS * (I3_READINESS_POLLS + TERMINAL_READINESS_POLLS)
         + APPLICATION_STARTUP_ALLOWANCE_MILLIS,
 );
+const APPLICATION_RUNTIME: Duration = Duration::from_mins(3);
 const RETAINED_FAILURE_ARTIFACTS: usize = 3;
 
 fn main() -> Result<()> {
@@ -154,7 +155,7 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
             .graphics(Graphics::Host)
             .private_env("CODEX_HOME", "home/.codex")
             .witness("probes/wrangler")
-            .runtime(Duration::from_secs(90)),
+            .runtime(APPLICATION_RUNTIME),
     )?;
     let wrangler = wait_named_window(
         testbed,
