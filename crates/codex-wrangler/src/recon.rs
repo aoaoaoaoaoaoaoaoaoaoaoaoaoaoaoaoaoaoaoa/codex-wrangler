@@ -1001,10 +1001,15 @@ impl Codex {
         );
         let rollout = thread.rollout.clone();
         let preview = snip(&summary.preview, 280);
+        let live_cwd = if thread.git_origin.is_some() && thread.git_origin == process.git_origin {
+            &process.cwd
+        } else {
+            &thread.cwd
+        };
         self.roster.sight(SessionSighting {
             thread: &thread.id,
             name: name.as_deref(),
-            cwd: &thread.cwd,
+            cwd: live_cwd,
             preview: &preview,
             updated_at_ms: thread.updated_at_ms,
             workspace,
@@ -1016,7 +1021,7 @@ impl Codex {
                 harness: Harness::Codex,
                 thread: thread.id,
                 name,
-                cwd: compact_path(&thread.cwd, process.home.as_deref()),
+                cwd: compact_path(live_cwd, process.home.as_deref()),
                 tile_preview: preview,
                 work,
                 window: Some(window),
@@ -1160,17 +1165,12 @@ impl Codex {
             {
                 continue;
             }
-            let Some(started_at) = process.started_at else {
-                continue;
-            };
             let Some(prior) = process.app_server_claim.as_deref() else {
                 continue;
             };
-            let candidate = claims.iter().position(|candidate| {
-                candidate.claim.thread == prior
-                    && candidate.thread.cwd == process.cwd
-                    && candidate.claim.acquired_at >= started_at
-            });
+            let candidate = claims
+                .iter()
+                .position(|candidate| candidate.claim.thread == prior);
             if let Some(candidate) = candidate {
                 let candidate = claims.swap_remove(candidate);
                 let _prior = assigned.insert(process.key, candidate.claim.thread);
@@ -1205,6 +1205,15 @@ impl Codex {
                         .cmp(&(right.claim.acquired_at, &right.claim.thread))
                 })
                 .map(|(index, _)| index);
+            let candidate = candidate.or_else(|| {
+                if !process.bare_codex_resume() {
+                    return None;
+                }
+                let origin = process.git_origin.as_ref()?;
+                unique_candidate(claims.iter().enumerate().filter_map(|(index, candidate)| {
+                    (candidate.thread.git_origin.as_ref() == Some(origin)).then_some(index)
+                }))
+            });
             if let Some(candidate) = candidate {
                 let candidate = claims.swap_remove(candidate);
                 let _prior = assigned.insert(process.key, candidate.claim.thread);
@@ -1237,7 +1246,8 @@ impl Codex {
             .db
             .query_row(
                 "SELECT id, NULLIF(TRIM(name), ''), cwd, updated_at_ms, \
-                 thread_source, agent_role, rollout_path, cli_version \
+                 thread_source, agent_role, rollout_path, cli_version, \
+                 NULLIF(TRIM(git_origin_url), '') \
                  FROM threads WHERE id = ?1",
                 params![id],
                 |row| {
@@ -1250,13 +1260,23 @@ impl Codex {
                         row.get::<_, Option<String>>(5)?,
                         PathBuf::from(row.get::<_, String>(6)?),
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?.map(GitOrigin),
                     ))
                 },
             )
             .optional()
             .with_context(|| format!("query Codex thread `{id}`"))?;
-        let Some((id, name, cwd, updated_at_ms, thread_source, agent_role, rollout, cli_version)) =
-            thread
+        let Some((
+            id,
+            name,
+            cwd,
+            updated_at_ms,
+            thread_source,
+            agent_role,
+            rollout,
+            cli_version,
+            git_origin,
+        )) = thread
         else {
             return Ok(None);
         };
@@ -1270,6 +1290,7 @@ impl Codex {
             updated_at_ms,
             rollout,
             cli_version: (!cli_version.trim().is_empty()).then_some(cli_version),
+            git_origin,
         }))
     }
 }
@@ -1350,7 +1371,11 @@ struct Thread {
     updated_at_ms: i64,
     rollout: PathBuf,
     cli_version: Option<String>,
+    git_origin: Option<GitOrigin>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitOrigin(String);
 
 #[derive(Clone)]
 struct AppServerWriterClaim {
@@ -1414,6 +1439,7 @@ struct Process {
     app_server_claim: Option<String>,
     binding: Arc<OnceLock<ThreadBinding>>,
     cwd: PathBuf,
+    git_origin: Option<GitOrigin>,
     environment: HashMap<String, OsString>,
     home: Option<PathBuf>,
     goal: bool,
@@ -1498,6 +1524,12 @@ impl Process {
         (self.harness == Harness::Codex)
             .then(|| codex_resumed_thread(&self.argv))
             .flatten()
+    }
+
+    fn bare_codex_resume(&self) -> bool {
+        self.harness == Harness::Codex
+            && self.argv.iter().any(|arg| arg == OsStr::new("resume"))
+            && self.resumed_thread().is_none()
     }
 }
 
@@ -1607,7 +1639,11 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         }
         process.transcripts = transcripts;
         process.codex_claims = claims;
-        process.cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| process.cwd.clone());
+        let cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| process.cwd.clone());
+        if cwd != process.cwd {
+            process.git_origin = git_origin(harness, &cwd);
+            process.cwd = cwd;
+        }
         let _prior = cache.insert(key, process.clone());
         return Some(process);
     }
@@ -1642,6 +1678,7 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         codex_claims,
         app_server_claim: None,
         binding,
+        git_origin: git_origin(harness, &cwd),
         cwd,
         environment,
         home,
@@ -1652,6 +1689,25 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
     };
     let _prior = cache.insert(key, process.clone());
     Some(process)
+}
+
+fn git_origin(harness: Harness, cwd: &Path) -> Option<GitOrigin> {
+    if harness != Harness::Codex {
+        return None;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["config", "--get", "remote.origin.url"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let origin = std::str::from_utf8(&output.stdout).ok()?.trim();
+    (!origin.is_empty()).then(|| GitOrigin(origin.to_owned()))
 }
 
 fn harness_argv(argv: &[OsString]) -> Option<Harness> {

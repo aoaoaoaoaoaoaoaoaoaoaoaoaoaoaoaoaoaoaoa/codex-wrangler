@@ -2539,16 +2539,40 @@ fn forge_goals(testbed: &Testbed) -> Result<PathBuf> {
 }
 
 fn forge_workdirs(testbed: &Testbed) -> Result<()> {
-    for work in ["turn", "rotate", "dormant", "done", "fresh", "history"] {
+    let _old_writer_lock =
+        testbed.write_private(format!("home/.codex/thread-writer-locks/{FRESH}.lock"), b"")?;
+    for work in [
+        "turn",
+        "rotate",
+        "dormant",
+        "done",
+        "fresh-transplanted",
+        "history",
+    ] {
         let _work = testbed.create_private_dir(format!("work/{work}"))?;
     }
+    let _git = testbed.create_private_dir("work/fresh-transplanted/.git")?;
+    let _objects = testbed.create_private_dir("work/fresh-transplanted/.git/objects")?;
+    let _heads = testbed.create_private_dir("work/fresh-transplanted/.git/refs/heads")?;
+    let _head = testbed.write_private(
+        "work/fresh-transplanted/.git/HEAD",
+        b"ref: refs/heads/main\n",
+    )?;
+    let _config = testbed.write_private(
+        "work/fresh-transplanted/.git/config",
+        b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n\
+          [remote \"origin\"]\n\turl = fixture://transplanted\n",
+    )?;
     Ok(())
 }
 
 fn forge_fake_harness(testbed: &Testbed) -> Result<PathBuf> {
     testbed.write_private(
         "fake-session.bash",
-        br#"rollout=$1
+        br#"if [ "${1:-}" = resume ]; then
+  shift
+fi
+rollout=$1
 proof=$2
 claim=${3:-$rollout}
 if [ "$claim" = legacy ]; then
@@ -2617,8 +2641,8 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<
          \"$terminal\" --class NeutralTerminal --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof /test/home/.codex/thread-writer-locks/{TURN}.lock' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
-         \"$terminal\" --working-directory /test/work/fresh --class NeutralTerminal --title 'Fresh Codex' -o 'window.position={{x=1500,y=300}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/fresh-proof none' &\n\
+         \"$terminal\" --working-directory /test/work/fresh-transplanted --class NeutralTerminal --title 'Fresh Codex' -o 'window.position={{x=1500,y=300}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex bash /test/fake-session.bash resume /test/home/.codex/sessions/2026/08/03/{} /test/fresh-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
@@ -2944,6 +2968,7 @@ fn seed_index(path: &Path) -> Result<()> {
            updated_at_ms INTEGER NOT NULL, thread_source TEXT, source TEXT NOT NULL,
            agent_role TEXT, rollout_path TEXT NOT NULL,
            cli_version TEXT NOT NULL DEFAULT '0.147.0',
+           git_origin_url TEXT,
            archived INTEGER NOT NULL DEFAULT 0
          );",
     )
@@ -2955,7 +2980,11 @@ fn seed_index(path: &Path) -> Result<()> {
     )
     .map_err(verdict("seed superseded Codex version"))?;
     db.execute(
-        "UPDATE threads SET source = 'vscode', cli_version = '0.149.0' WHERE id = ?1",
+        "UPDATE threads
+         SET source = 'vscode', cli_version = '0.149.0',
+             cwd = '/test/work/fresh-before-transplant',
+             git_origin_url = 'fixture://transplanted'
+         WHERE id = ?1",
         params![FRESH],
     )
     .map_err(verdict("seed contradictory 0.149 TUI provenance"))?;
