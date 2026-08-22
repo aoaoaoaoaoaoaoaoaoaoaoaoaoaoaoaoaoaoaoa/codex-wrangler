@@ -142,11 +142,16 @@ pub fn writer_lock_sessions(pid: u32) -> Vec<SessionId> {
     sessions
 }
 
+/// Primary session asserted by an eligible top-level Codex process.
+#[must_use]
+pub fn session(pid: u32) -> Option<SessionId> {
+    is_top_level_codex(pid)
+        .then(|| primary_session(pid))
+        .flatten()
+}
+
 fn inspect(pid: u32) -> Option<Seat> {
-    if !is_top_level_codex(pid) {
-        return None;
-    }
-    let session = primary_session(pid)?;
+    let session = session(pid)?;
     Some(Seat {
         session,
         process: ProcessKey::sight(pid).ok()?,
@@ -162,7 +167,7 @@ fn primary_session(pid: u32) -> Option<SessionId> {
         .and_then(|pair| std::str::from_utf8(&pair[1]).ok())
         .and_then(|argument| Uuid::parse_str(argument).ok());
     if let Some(session) = resumed
-        && claims.iter().any(|(_descriptor, claim)| *claim == session)
+        && (claims.is_empty() || claims.iter().any(|(_descriptor, claim)| *claim == session))
     {
         return Some(session);
     }
