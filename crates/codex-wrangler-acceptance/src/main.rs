@@ -213,11 +213,17 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
 }
 
 fn verify_application_header(story: &mut Story<'_, '_, Observation>) -> Result<()> {
+    let header = story.anchor("eternalist.application.header")?.rect;
     let name = story.anchor("eternalist.application.name")?.rect;
     let help = story.anchor("eternalist.application.help")?.rect;
     let settings = story.anchor("eternalist.settings.open")?.rect;
     demand(
-        name[0] < help[0] && help[0] < settings[0] && name[1] <= help[3] && help[1] <= name[3],
+        header[0] <= name[0]
+            && name[2] < help[0]
+            && help[2] <= settings[0]
+            && settings[2] >= header[2] - 0.5
+            && name[1] <= help[3]
+            && help[1] <= name[3],
         "application header did not present NAME, Help, Settings in canonical order",
     )
 }

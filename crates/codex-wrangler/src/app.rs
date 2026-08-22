@@ -772,9 +772,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
+        self.application_header(ui);
+        ui.add_space(5.0);
         let _heading = ui.horizontal(|ui| {
-            self.application_header(ui);
-            ui.add_space(8.0);
             let (label, valid) = match self.page {
                 Page::Live => (self.census_label.as_str(), self.scry.valid()),
                 Page::Historical => (self.history_scry.label(), self.history_scry.valid()),
