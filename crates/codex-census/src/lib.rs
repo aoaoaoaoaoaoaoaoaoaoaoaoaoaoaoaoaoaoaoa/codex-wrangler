@@ -133,12 +133,9 @@ pub fn is_top_level_codex(pid: u32) -> bool {
 /// Writer-lock session claims currently held open by `pid`.
 #[must_use]
 pub fn writer_lock_sessions(pid: u32) -> Vec<SessionId> {
-    let mut sessions = fs::read_dir(proc_path(pid).join("fd"))
+    let mut sessions = writer_lock_claims(pid)
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| fs::read_link(entry.path()).ok())
-        .filter_map(|target| writer_lock_session(&target))
+        .map(|(_descriptor, session)| session)
         .collect::<Vec<_>>();
     sessions.sort_unstable();
     sessions.dedup();
@@ -149,15 +146,52 @@ fn inspect(pid: u32) -> Option<Seat> {
     if !is_top_level_codex(pid) {
         return None;
     }
-    let sessions = writer_lock_sessions(pid);
-    let [session] = sessions.as_slice() else {
-        return None;
-    };
+    let session = primary_session(pid)?;
     Some(Seat {
-        session: *session,
+        session,
         process: ProcessKey::sight(pid).ok()?,
         cwd: fs::read_link(proc_path(pid).join("cwd")).ok(),
     })
+}
+
+fn primary_session(pid: u32) -> Option<SessionId> {
+    let claims = writer_lock_claims(pid);
+    let resumed = command_arguments(pid)
+        .windows(2)
+        .find(|pair| pair[0] == b"resume")
+        .and_then(|pair| std::str::from_utf8(&pair[1]).ok())
+        .and_then(|argument| Uuid::parse_str(argument).ok());
+    if let Some(session) = resumed
+        && claims.iter().any(|(_descriptor, claim)| *claim == session)
+    {
+        return Some(session);
+    }
+    claims.first().map(|(_descriptor, session)| *session)
+}
+
+fn writer_lock_claims(pid: u32) -> Vec<(u32, SessionId)> {
+    let mut claims = fs::read_dir(proc_path(pid).join("fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let descriptor = entry.file_name().to_str()?.parse().ok()?;
+            let target = fs::read_link(entry.path()).ok()?;
+            Some((descriptor, writer_lock_session(&target)?))
+        })
+        .collect::<Vec<_>>();
+    claims.sort_unstable_by_key(|(descriptor, _session)| *descriptor);
+    claims.dedup_by_key(|(_descriptor, session)| *session);
+    claims
+}
+
+fn command_arguments(pid: u32) -> Vec<Vec<u8>> {
+    fs::read(proc_path(pid).join("cmdline"))
+        .unwrap_or_default()
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
 }
 
 fn has_codex_ancestor(mut pid: u32) -> bool {
