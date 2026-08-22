@@ -1,0 +1,6 @@
+[Unit]
+Description=Adopt the installed Codex app-server release
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user try-restart codex-app-server.service

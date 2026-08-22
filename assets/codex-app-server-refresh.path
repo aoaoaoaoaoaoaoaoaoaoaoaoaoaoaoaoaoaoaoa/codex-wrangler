@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the system Codex release
+
+[Path]
+PathChanged=/usr/bin/codex
+Unit=codex-app-server-refresh.service
+
+[Install]
+WantedBy=default.target

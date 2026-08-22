@@ -1,0 +1,13 @@
+[Unit]
+Description=Shared Codex app server
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/codex app-server --listen unix://
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=1h
+UMask=0077
+
+[Install]
+WantedBy=default.target

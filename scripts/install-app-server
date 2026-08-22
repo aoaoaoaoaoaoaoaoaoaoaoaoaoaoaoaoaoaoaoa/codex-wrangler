@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+unit_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
+install -d -m 0700 "$unit_dir"
+for unit in \
+    codex-app-server.service \
+    codex-app-server-refresh.path \
+    codex-app-server-refresh.service
+do
+    install -m 0600 "assets/$unit" "$unit_dir/$unit"
+done
+systemctl --user daemon-reload
+systemctl --user enable --now codex-app-server.service codex-app-server-refresh.path
