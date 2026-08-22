@@ -25,7 +25,7 @@ use egui::{
     text::{LayoutJob, TextFormat},
 };
 use eternalist_apps::{
-    CloseDisposition, LivingWait, NativeApp, NativeWake, WindowSpec,
+    ApplicationHeader, CloseDisposition, LivingWait, NativeApp, NativeWake, WindowSpec,
     command_guide::CommandGuide,
     commands::{CommandDispatch, CommandStatus},
     settings::{SettingSpec, SettingsFile, SettingsSheet},
@@ -761,22 +761,19 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         }
     }
 
-    fn application_menus(&mut self, ui: &mut egui::Ui) {
+    fn application_header(&mut self, ui: &mut egui::Ui) {
         let was_open = self.settings.is_open();
-        let settings = self
-            .settings
-            .activator(ui, self.preferences.fault().is_some());
-        self.water.monoglyph(&settings);
+        let _header = ApplicationHeader::new("CODEX WRANGLER")
+            .settings_attention(self.preferences.fault().is_some())
+            .show(ui, &mut self.guide, &mut self.settings, &mut self.water);
         if !was_open && self.settings.is_open() && self.preferences.settled() {
             let _requested = self.preferences.request_reload();
         }
-        let help = self.guide.activator(ui);
-        self.water.monoglyph(&help);
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
         let _heading = ui.horizontal(|ui| {
-            let _title = ui.label(chrome::title("CODEX WRANGLER").size(18.0));
+            self.application_header(ui);
             ui.add_space(8.0);
             let (label, valid) = match self.page {
                 Page::Live => (self.census_label.as_str(), self.scry.valid()),
@@ -789,8 +786,6 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             };
             let _count = ui.label(count);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.application_menus(ui);
-                ui.add_space(8.0);
                 self.close_preference(ui);
                 ui.add_space(8.0);
                 if self.page == Page::Live {

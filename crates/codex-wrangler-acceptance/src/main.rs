@@ -180,6 +180,7 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
     )?;
     verify_window_posture(testbed, &fixture, wrangler.id(), "floating")?;
     verify_gallery(testbed, &mut story, &fixture)?;
+    verify_application_header(&mut story)?;
 
     let target = story.anchor(CardTarget(Harness::Codex, GOAL))?;
     let _clicked = story
@@ -209,6 +210,16 @@ fn story(testbed: &Testbed, binary: &Path) -> Result<()> {
         "the activated terminal did not receive native keyboard input",
     )?;
     verify_residency(testbed, binary, &app, &mut story, &fixture)
+}
+
+fn verify_application_header(story: &mut Story<'_, '_, Observation>) -> Result<()> {
+    let name = story.anchor("eternalist.application.name")?.rect;
+    let help = story.anchor("eternalist.application.help")?.rect;
+    let settings = story.anchor("eternalist.settings.open")?.rect;
+    demand(
+        name[0] < help[0] && help[0] < settings[0] && name[1] <= help[3] && help[1] <= name[3],
+        "application header did not present NAME, Help, Settings in canonical order",
+    )
 }
 
 fn verify_hidden_cpu(app: &Application<'_>) -> Result<()> {
