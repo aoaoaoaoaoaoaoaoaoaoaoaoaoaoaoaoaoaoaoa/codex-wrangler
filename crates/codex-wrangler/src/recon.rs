@@ -5,7 +5,10 @@ use std::{
     io::{Read as _, Write as _},
     os::{
         fd::AsFd as _,
-        unix::{ffi::OsStringExt as _, net::UnixStream},
+        unix::{
+            ffi::{OsStrExt as _, OsStringExt as _},
+            net::UnixStream,
+        },
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -14,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context as _, Result};
@@ -358,7 +361,20 @@ fn desktop_demand(signals: &HashSet<DesktopSignal>) -> DesktopDemand {
 
 fn reap_watchfire(recon: &mut Recon) -> bool {
     match recon.watchfire.reap() {
-        Ok(flare) => flare.overflowed || !flare.paths.is_empty(),
+        Ok(flare) => {
+            if let Some(codex) = &mut recon.codex {
+                let lock_directory = codex.writer_lock_directory();
+                if flare.overflowed
+                    || flare
+                        .paths
+                        .iter()
+                        .any(|path| path.starts_with(&lock_directory))
+                {
+                    codex.refresh_app_server_writers();
+                }
+            }
+            flare.overflowed || !flare.paths.is_empty()
+        }
         Err(error) => {
             eprintln!("codex-wrangler file watch failed: {error:#}");
             true
@@ -456,7 +472,16 @@ impl Recon {
 
     fn refresh_forest(&mut self) -> Result<bool> {
         let windows = self.desktop.windows_by_pid()?;
-        let sightings = manual_harnesses(&windows, &mut self.process_cache);
+        let mut sightings = manual_harnesses(&windows, &mut self.process_cache);
+        if let Some(codex) = &mut self.codex {
+            codex.refresh_app_server_writers();
+            codex.reconcile_app_server_claims(&mut sightings)?;
+            for sighting in &sightings {
+                let _prior = self
+                    .process_cache
+                    .insert(sighting.process.key, sighting.process.clone());
+            }
+        }
         self.desktop
             .watch_terminals(sightings.iter().map(|sighting| sighting.window))?;
         let changed = sightings != self.sightings;
@@ -467,6 +492,12 @@ impl Recon {
     fn project(&mut self, now: Instant) -> Result<()> {
         if let Some(codex) = &mut self.codex {
             codex.refresh_names()?;
+            codex.reconcile_app_server_claims(&mut self.sightings)?;
+            for sighting in &self.sightings {
+                let _prior = self
+                    .process_cache
+                    .insert(sighting.process.key, sighting.process.clone());
+            }
         }
         let workspaces = self
             .desktop
@@ -877,6 +908,7 @@ struct Codex {
     names: NameIndex,
     rollouts: Rollouts,
     roster: Roster,
+    app_server_writers: Vec<AppServerWriterClaim>,
 }
 
 impl Codex {
@@ -907,6 +939,7 @@ impl Codex {
                 .context("open Codex goal ledger")
             })
             .transpose()?;
+        let app_server_writers = app_server_writer_claims(&home);
         Ok(Some(Self {
             home,
             db,
@@ -914,6 +947,7 @@ impl Codex {
             names: NameIndex::default(),
             rollouts: Rollouts::default(),
             roster: Roster::restore().context("restore known Codex sessions")?,
+            app_server_writers,
         }))
     }
 
@@ -928,6 +962,7 @@ impl Codex {
             "state_5.sqlite-wal",
             "goals_1.sqlite",
             "goals_1.sqlite-wal",
+            "thread-writer-locks",
         ]
         .into_iter()
         .map(|name| self.home.join(name))
@@ -1013,6 +1048,14 @@ impl Codex {
             .collect()
     }
 
+    fn writer_lock_directory(&self) -> PathBuf {
+        self.home.join("thread-writer-locks")
+    }
+
+    fn refresh_app_server_writers(&mut self) {
+        self.app_server_writers = app_server_writer_claims(&self.home);
+    }
+
     fn commit(&mut self) -> Result<()> {
         self.roster.commit()
     }
@@ -1035,7 +1078,7 @@ impl Codex {
 
     fn current_thread(&self, process: &Process) -> Result<Option<Thread>> {
         if let Some(binding) = process.binding.get() {
-            if !binding.held_by(&process.codex_claims)
+            if !binding.held_by(&process.codex_claims, process.app_server_claim.as_deref())
                 && process.resumed_thread() != Some(binding.id.as_str())
             {
                 return Ok(None);
@@ -1047,6 +1090,11 @@ impl Codex {
 
         let mut locked = Vec::new();
         let mut legacy = Vec::new();
+        if let Some(id) = &process.app_server_claim
+            && let Some(thread) = self.thread_by_id(id)?
+        {
+            locked.push(thread);
+        }
         for claim in &process.codex_claims {
             match claim {
                 CodexClaim::WriterLock(id) => {
@@ -1079,6 +1127,98 @@ impl Codex {
             .set(binding)
             .expect("single reconnaissance thread binds each process once");
         Ok(Some(thread))
+    }
+
+    fn reconcile_app_server_claims(&self, sightings: &mut [Sighting]) -> Result<()> {
+        let mut reserved = sightings
+            .iter()
+            .filter(|sighting| sighting.process.harness == Harness::Codex)
+            .flat_map(|sighting| sighting.process.physical_threads())
+            .collect::<HashSet<_>>();
+        reserved.extend(
+            sightings
+                .iter()
+                .filter_map(|sighting| sighting.process.resumed_thread().map(str::to_owned)),
+        );
+
+        let mut claims = Vec::new();
+        for claim in self.app_server_writers.iter().cloned() {
+            if reserved.contains(&claim.thread) {
+                continue;
+            }
+            if let Some(thread) = self.thread_by_id(&claim.thread)? {
+                claims.push(AppServerThread { claim, thread });
+            }
+        }
+
+        let mut assigned = HashMap::new();
+        for sighting in sightings.iter() {
+            let process = &sighting.process;
+            if process.harness != Harness::Codex
+                || !process.codex_claims.is_empty()
+                || process.resumed_thread().is_some()
+            {
+                continue;
+            }
+            let Some(started_at) = process.started_at else {
+                continue;
+            };
+            let Some(prior) = process.app_server_claim.as_deref() else {
+                continue;
+            };
+            let candidate = claims.iter().position(|candidate| {
+                candidate.claim.thread == prior
+                    && candidate.thread.cwd == process.cwd
+                    && candidate.claim.acquired_at >= started_at
+            });
+            if let Some(candidate) = candidate {
+                let candidate = claims.swap_remove(candidate);
+                let _prior = assigned.insert(process.key, candidate.claim.thread);
+            }
+        }
+
+        let mut order = (0..sightings.len()).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|index| {
+            let process = &sightings[*index].process;
+            std::cmp::Reverse((process.started_at, process.pid))
+        });
+        for index in order {
+            let process = &sightings[index].process;
+            let Some(started_at) = process.started_at else {
+                continue;
+            };
+            if process.harness != Harness::Codex
+                || !process.codex_claims.is_empty()
+                || process.resumed_thread().is_some()
+                || assigned.contains_key(&process.key)
+            {
+                continue;
+            }
+            let candidate = claims
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    candidate.thread.cwd == process.cwd && candidate.claim.acquired_at >= started_at
+                })
+                .max_by(|(_, left), (_, right)| {
+                    (left.claim.acquired_at, &left.claim.thread)
+                        .cmp(&(right.claim.acquired_at, &right.claim.thread))
+                })
+                .map(|(index, _)| index);
+            if let Some(candidate) = candidate {
+                let candidate = claims.swap_remove(candidate);
+                let _prior = assigned.insert(process.key, candidate.claim.thread);
+            }
+        }
+
+        for sighting in sightings {
+            let claim = assigned.remove(&sighting.process.key);
+            if sighting.process.app_server_claim != claim {
+                sighting.process.binding = Arc::new(OnceLock::new());
+                sighting.process.app_server_claim = claim;
+            }
+        }
+        Ok(())
     }
 
     fn thread(&self, rollout: &Path) -> Result<Option<Thread>> {
@@ -1212,6 +1352,17 @@ struct Thread {
     cli_version: Option<String>,
 }
 
+#[derive(Clone)]
+struct AppServerWriterClaim {
+    thread: String,
+    acquired_at: SystemTime,
+}
+
+struct AppServerThread {
+    claim: AppServerWriterClaim,
+    thread: Thread,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ThreadBinding {
     id: String,
@@ -1219,11 +1370,12 @@ struct ThreadBinding {
 }
 
 impl ThreadBinding {
-    fn held_by(&self, claims: &[CodexClaim]) -> bool {
-        claims.iter().any(|claim| match claim {
-            CodexClaim::WriterLock(thread) => thread == &self.id,
-            CodexClaim::WritableRollout(rollout) => rollout == &self.rollout,
-        })
+    fn held_by(&self, claims: &[CodexClaim], app_server_claim: Option<&str>) -> bool {
+        app_server_claim == Some(self.id.as_str())
+            || claims.iter().any(|claim| match claim {
+                CodexClaim::WriterLock(thread) => thread == &self.id,
+                CodexClaim::WritableRollout(rollout) => rollout == &self.rollout,
+            })
     }
 }
 
@@ -1259,11 +1411,13 @@ struct Process {
     argv: Vec<OsString>,
     transcripts: Vec<PathBuf>,
     codex_claims: Vec<CodexClaim>,
+    app_server_claim: Option<String>,
     binding: Arc<OnceLock<ThreadBinding>>,
     cwd: PathBuf,
     environment: HashMap<String, OsString>,
     home: Option<PathBuf>,
     goal: bool,
+    started_at: Option<SystemTime>,
 }
 
 /// A live Codex process's claim to one thread.
@@ -1278,9 +1432,21 @@ enum CodexClaim {
 
 impl Process {
     fn holds_writer_lock(&self, thread: &str) -> bool {
+        self.app_server_claim.as_deref() == Some(thread)
+            || self
+                .codex_claims
+                .iter()
+                .any(|claim| matches!(claim, CodexClaim::WriterLock(claimed) if claimed == thread))
+    }
+
+    fn physical_threads(&self) -> Vec<String> {
         self.codex_claims
             .iter()
-            .any(|claim| matches!(claim, CodexClaim::WriterLock(claimed) if claimed == thread))
+            .filter_map(|claim| match claim {
+                CodexClaim::WriterLock(thread) => Some(thread.clone()),
+                CodexClaim::WritableRollout(rollout) => rollout_id(rollout).map(str::to_owned),
+            })
+            .collect()
     }
 
     fn explicit_name(&self) -> Option<String> {
@@ -1474,11 +1640,15 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         argv,
         transcripts,
         codex_claims,
+        app_server_claim: None,
         binding,
         cwd,
         environment,
         home,
         goal,
+        started_at: fs::metadata(&root)
+            .and_then(|metadata| metadata.modified())
+            .ok(),
     };
     let _prior = cache.insert(key, process.clone());
     Some(process)
@@ -1628,6 +1798,62 @@ fn codex_claims(root: &Path) -> (Vec<PathBuf>, Vec<CodexClaim>) {
     claims.sort_unstable();
     claims.dedup();
     (rollouts, claims)
+}
+
+fn app_server_writer_claims(home: &Path) -> Vec<AppServerWriterClaim> {
+    let lock_directory = home.join("thread-writer-locks");
+    let mut claims = proc_pids()
+        .into_iter()
+        .filter_map(|pid| {
+            let root = PathBuf::from(format!("/proc/{pid}"));
+            app_server_process(&root).then_some(root)
+        })
+        .flat_map(|root| {
+            fs::read_dir(root.join("fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let target = fs::read_link(entry.path()).ok()?;
+                    (target.parent() == Some(lock_directory.as_path())).then_some(())?;
+                    let thread = writer_lock_thread(&target)?.to_owned();
+                    let acquired_at = fs::metadata(target).ok()?.modified().ok()?;
+                    Some(AppServerWriterClaim {
+                        thread,
+                        acquired_at,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    claims.sort_unstable_by(|left, right| {
+        (&left.thread, left.acquired_at).cmp(&(&right.thread, right.acquired_at))
+    });
+    claims.dedup_by(|left, right| left.thread == right.thread);
+    claims
+}
+
+fn app_server_process(root: &Path) -> bool {
+    let Ok(bytes) = fs::read(root.join("cmdline")) else {
+        return false;
+    };
+    let argv = bytes
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(OsStr::from_bytes)
+        .collect::<Vec<_>>();
+    let Some(program) = argv
+        .first()
+        .and_then(|argument| Path::new(argument).file_name())
+    else {
+        return false;
+    };
+    program == OsStr::new("codex-app-server")
+        || (program == OsStr::new("codex")
+            && argv
+                .iter()
+                .skip(1)
+                .any(|argument| *argument == OsStr::new("app-server")))
 }
 
 fn writer_lock_thread(path: &Path) -> Option<&str> {
@@ -2045,12 +2271,15 @@ mod tests {
             id: "thread".to_owned(),
             rollout: PathBuf::from("/sessions/current.jsonl"),
         };
-        assert!(binding.held_by(&[
-            CodexClaim::WritableRollout(PathBuf::from("/sessions/other.jsonl")),
-            CodexClaim::WritableRollout(binding.rollout.clone()),
-        ]));
-        assert!(binding.held_by(&[CodexClaim::WriterLock("thread".to_owned())]));
-        assert!(!binding.held_by(&[CodexClaim::WriterLock("replacement".to_owned())]));
+        assert!(binding.held_by(
+            &[
+                CodexClaim::WritableRollout(PathBuf::from("/sessions/other.jsonl")),
+                CodexClaim::WritableRollout(binding.rollout.clone()),
+            ],
+            None,
+        ));
+        assert!(binding.held_by(&[CodexClaim::WriterLock("thread".to_owned())], None,));
+        assert!(!binding.held_by(&[CodexClaim::WriterLock("replacement".to_owned())], None,));
     }
 
     #[test]

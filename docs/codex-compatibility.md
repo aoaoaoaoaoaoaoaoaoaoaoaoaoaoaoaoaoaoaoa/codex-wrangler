@@ -6,7 +6,7 @@ Live discovery detects capabilities, never version strings. This table is the su
 | --- | --- | --- | --- | --- |
 | 0.146.x | Writable rollout JSONL descriptors; newest lawful main-thread claim wins | `task_*`, legacy messages | `Goal Codex` owns two main rollouts | `CodexClaim::WritableRollout`, `writable_access` |
 | 0.147.x | Open `thread-writer-locks/<id>.lock`, resolved through `threads.rollout_path`; dominates legacy claims | `turn_*`, paginated `item_completed`, legacy records accepted; rollout may be absent before the first turn | `Turn Codex` owns only a writer lock; `Fresh Codex` has no rollout artifact | `CodexClaim::WriterLock`, `writer_lock_thread`, `RolloutSummary::quiescent` |
-| 0.149.x | Same writer-lock identity; `threads.source` may contradict the TUI originator and is not live-session authority | 0.147 vocabulary retained | `Fresh Codex` is a foreground TUI whose row falsely says `source = 'vscode'` | `primary_codex_thread` |
+| 0.149.x | Persistent `codex app-server` owns writer locks and rollouts; a bare foreground TUI receives the newest unclaimed primary lock whose cwd matches and whose acquisition follows that PID incarnation | 0.147 vocabulary retained | `Fresh Codex` owns no claim or rollout; a detached app-server owns its lock and its row falsely says `source = 'vscode'` | `app_server_writer_claims`, `Process::app_server_claim` |
 
 All supported lines require `state_5.sqlite` and the UUID forms of `codex resume`
 and `codex fork`. They also provide app-server `thread/name/set` for unloaded,
@@ -17,11 +17,14 @@ updates their canonical `threads.name` field directly through the
 `CodexLaunch`. Delete a row only when its fixture, claim variant, parser arm,
 and named removal seam leave in the same change.
 
-Live admission trusts the foreground terminal process, its exact thread claim,
-`thread_source = 'user'`, and the absence of an agent role. It does not consult
-`threads.source`. Historical enumeration retains `source = 'cli'` because no
-live process exists to supply the stronger proof; every anomalous 0.149 TUI row
-enters Wrangler's roster while live and remains a closed session thereafter.
+Live admission trusts the foreground terminal process, an exact direct claim or
+a temporally and spatially reconciled app-server claim, `thread_source = 'user'`,
+and the absence of an agent role. Established app-server bindings remain fixed
+while their locks survive; a closing terminal cannot donate its lingering lock
+to another TUI. Live admission does not consult `threads.source`. Historical
+enumeration retains `source = 'cli'` because no live process exists to supply
+the stronger proof; every anomalous 0.149 TUI row enters Wrangler's roster while
+live and remains a closed session thereafter.
 
 Historical turn tallies count persisted `user_message` and paginated
 `item_completed/UserMessage` records. Compressed history accepts Zstandard

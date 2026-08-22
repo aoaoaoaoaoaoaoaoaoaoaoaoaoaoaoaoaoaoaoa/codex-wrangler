@@ -2426,7 +2426,8 @@ impl Fixture {
         let roster = seed_roster(testbed)?;
         forge_workdirs(testbed)?;
         let (claude, prime) = seed_foreign_transcripts(testbed)?;
-        let fake = forge_fake_harness(testbed)?;
+        let _fake = forge_fake_harness(testbed)?;
+        let _fake_app_server = forge_fake_app_server(testbed)?;
         let fake_cli = forge_fake_cli(testbed)?;
         forge_zstd_guard(testbed)?;
         let replaceable_alacritty = forge_replaceable_alacritty(testbed)?;
@@ -2480,7 +2481,6 @@ impl Fixture {
         arm_executable(&focus_probe, "make focus probe executable")?;
         arm_executable(&desktop_recorder, "make desktop recorder executable")?;
         arm_executable(&posture_probe, "make posture probe executable")?;
-        demand(fake.is_file(), "fake Codex script was not created")?;
         demand(
             replaceable_alacritty.is_file(),
             "replaceable Alacritty fixture was not created",
@@ -2522,7 +2522,7 @@ fn forge_goals(testbed: &Testbed) -> Result<PathBuf> {
 }
 
 fn forge_workdirs(testbed: &Testbed) -> Result<()> {
-    for work in ["turn", "rotate", "dormant", "done", "history"] {
+    for work in ["turn", "rotate", "dormant", "done", "fresh", "history"] {
         let _work = testbed.create_private_dir(format!("work/{work}"))?;
     }
     Ok(())
@@ -2537,7 +2537,9 @@ claim=${3:-$rollout}
 if [ "$claim" = legacy ]; then
   claim=$rollout
 fi
-exec 9>>"$claim"
+if [ "$claim" != none ]; then
+  exec 9>>"$claim"
+fi
 if [ -n "${4:-}" ]; then
   exec 8>>"$4"
 fi
@@ -2548,6 +2550,16 @@ esac
 xprop -id "$WINDOWID" -f _NET_WM_DESKTOP 32c -set _NET_WM_DESKTOP 0
 IFS= read -r -n 1 key
 [ -z "$key" ] || printf '%s\n' "$key" > "$proof"
+sleep 90
+"#,
+    )
+}
+
+fn forge_fake_app_server(testbed: &Testbed) -> Result<PathBuf> {
+    testbed.write_private(
+        "fake-app-server.bash",
+        br#"[ "$1" = app-server ] || exit 64
+exec 9>>"$2"
 sleep 90
 "#,
     )
@@ -2588,8 +2600,8 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<
          \"$terminal\" --class NeutralTerminal --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof /test/home/.codex/thread-writer-locks/{TURN}.lock' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
-         \"$terminal\" --class NeutralTerminal --title 'Fresh Codex' -o 'window.position={{x=1500,y=300}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/fresh-proof /test/home/.codex/thread-writer-locks/{FRESH}.lock' &\n\
+         \"$terminal\" --working-directory /test/work/fresh --class NeutralTerminal --title 'Fresh Codex' -o 'window.position={{x=1500,y=300}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
+           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/fresh-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
@@ -2632,6 +2644,7 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<
            i3-msg -t get_tree | jq -c '[.. | objects | select(.window? != null) | .name]' >&2\n\
            exit 70\n\
          fi\n\
+         bash -c 'exec -a codex bash /test/fake-app-server.bash app-server /test/home/.codex/thread-writer-locks/{FRESH}.lock' &\n\
          mv -f \"$terminal.next\" \"$terminal\"\n\
          for pid in $terminal_pids; do\n\
            case $(readlink \"/proc/$pid/exe\" 2>/dev/null) in\n\
@@ -3012,7 +3025,7 @@ fn seed_thread_rows(db: &Connection) -> Result<()> {
             FRESH,
             "Fresh thread",
             Some("Empty vessel"),
-            "/work/fresh",
+            "/test/work/fresh",
             70,
             rollout_test_path(FRESH, "fresh"),
         ),
