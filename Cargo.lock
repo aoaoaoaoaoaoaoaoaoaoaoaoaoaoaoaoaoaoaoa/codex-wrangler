@@ -225,15 +225,15 @@ dependencies = [
 
 [[package]]
 name = "brass_foundry"
-version = "0.13.18"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a9b9ccc4853533ca714bbb5f35df962e8d3856a943d9387399511548d28fe01"
+checksum = "ce56acf00bd1a8696d088e40b776e06476ea1c056a2ca8b4d718092b1551255b"
 
 [[package]]
 name = "brass_poolrooms"
-version = "0.13.18"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f259ee044669ebd039b026fc01250bc4cc9e5f1f921419ee63f9a77461ddff0"
+checksum = "a5daa0cc4b70b32026dc953529149c4be67768cd685cc5dae7852cf371568db5"
 dependencies = [
  "anyhow",
  "brass_foundry",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler"
-version = "1.3.10"
+version = "1.3.11"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler-acceptance"
-version = "1.3.10"
+version = "1.3.11"
 dependencies = [
  "brass_poolrooms",
  "egui-tester",
@@ -850,9 +850,9 @@ checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
 
 [[package]]
 name = "eternalist-apps"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bccf52f3d1429079deef31be4dad68066c56fc97989c5760898f3b376d15552c"
+checksum = "13ad86c78234a33c52dd3807b3ae90b162e78b6705382200ca3b378a7d1cc172"
 dependencies = [
  "anyhow",
  "atomic-write-file",
