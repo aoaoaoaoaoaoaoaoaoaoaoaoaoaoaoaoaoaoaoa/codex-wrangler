@@ -2925,6 +2925,11 @@ fn seed_index(path: &Path) -> Result<()> {
     )
     .map_err(verdict("seed superseded Codex version"))?;
     db.execute(
+        "UPDATE threads SET source = 'vscode', cli_version = '0.149.0' WHERE id = ?1",
+        params![FRESH],
+    )
+    .map_err(verdict("seed contradictory 0.149 TUI provenance"))?;
+    db.execute(
         "UPDATE threads SET archived = 1 WHERE id = ?1",
         params![DORMANT],
     )

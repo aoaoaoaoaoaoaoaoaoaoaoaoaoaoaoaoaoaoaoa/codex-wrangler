@@ -1097,7 +1097,7 @@ impl Codex {
             .db
             .query_row(
                 "SELECT id, NULLIF(TRIM(name), ''), cwd, updated_at_ms, \
-                 thread_source, source, agent_role, rollout_path, cli_version \
+                 thread_source, agent_role, rollout_path, cli_version \
                  FROM threads WHERE id = ?1",
                 params![id],
                 |row| {
@@ -1107,30 +1107,20 @@ impl Codex {
                         PathBuf::from(row.get::<_, String>(2)?),
                         row.get::<_, i64>(3)?,
                         row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        PathBuf::from(row.get::<_, String>(7)?),
-                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(5)?,
+                        PathBuf::from(row.get::<_, String>(6)?),
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
             .optional()
             .with_context(|| format!("query Codex thread `{id}`"))?;
-        let Some((
-            id,
-            name,
-            cwd,
-            updated_at_ms,
-            thread_source,
-            source,
-            agent_role,
-            rollout,
-            cli_version,
-        )) = thread
+        let Some((id, name, cwd, updated_at_ms, thread_source, agent_role, rollout, cli_version)) =
+            thread
         else {
             return Ok(None);
         };
-        if thread_source.as_deref() != Some("user") || source != "cli" || agent_role.is_some() {
+        if !primary_codex_thread(thread_source.as_deref(), agent_role.as_deref()) {
             return Ok(None);
         }
         Ok(Some(Thread {
@@ -1142,6 +1132,10 @@ impl Codex {
             cli_version: (!cli_version.trim().is_empty()).then_some(cli_version),
         }))
     }
+}
+
+fn primary_codex_thread(thread_source: Option<&str>, agent_role: Option<&str>) -> bool {
+    thread_source == Some("user") && agent_role.is_none()
 }
 
 fn newest_thread(mut candidates: Vec<Thread>) -> Option<Thread> {
