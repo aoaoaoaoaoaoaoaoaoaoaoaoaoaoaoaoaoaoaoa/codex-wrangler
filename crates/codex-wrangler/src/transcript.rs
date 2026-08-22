@@ -338,7 +338,7 @@ fn assign_text(slot: &mut String, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Seek as _, Write as _};
+    use std::io::Write as _;
 
     use super::*;
 
