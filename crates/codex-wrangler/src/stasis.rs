@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+pub use codex_census::ProcessKey;
 
 use crate::contract::Work;
 
@@ -27,25 +28,6 @@ const UNIT_PREFIX: &str = "codex-wrangler-";
 const MANAGER_SERVICE: &str = "org.freedesktop.systemd1";
 const MANAGER_PATH: &str = "/org/freedesktop/systemd1";
 const MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ProcessKey {
-    pub pid: u32,
-    start_ticks: u64,
-}
-
-impl ProcessKey {
-    pub fn sight(pid: u32) -> Result<Self> {
-        Ok(Self {
-            pid,
-            start_ticks: start_ticks(pid)?,
-        })
-    }
-
-    pub fn alive(self) -> bool {
-        start_ticks(self.pid).is_ok_and(|start| start == self.start_ticks)
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Quarry {
@@ -416,7 +398,8 @@ impl Unit {
     fn for_process(process: ProcessKey) -> Self {
         Self(format!(
             "{UNIT_PREFIX}{}-{}.scope",
-            process.pid, process.start_ticks
+            process.pid,
+            process.start_ticks()
         ))
     }
 
@@ -430,10 +413,10 @@ impl Unit {
         let text = self.0.as_str();
         let core = text.strip_prefix(UNIT_PREFIX)?.strip_suffix(".scope")?;
         let (pid, start) = core.split_once('-')?;
-        Some(ProcessKey {
-            pid: pid.parse().ok()?,
-            start_ticks: start.parse().ok()?,
-        })
+        Some(ProcessKey::from_parts(
+            pid.parse().ok()?,
+            start.parse().ok()?,
+        ))
     }
 }
 
@@ -855,22 +838,6 @@ pub fn children(pid: u32) -> Vec<u32> {
         .collect()
 }
 
-fn start_ticks(pid: u32) -> Result<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
-        .with_context(|| format!("read identity of process {pid}"))?;
-    let fields = stat
-        .rsplit_once(") ")
-        .context("malformed /proc process stat")?
-        .1
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>();
-    fields
-        .get(19)
-        .context("process stat omits start time")?
-        .parse()
-        .context("decode process start time")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,10 +876,7 @@ mod tests {
         }
     }
 
-    const PROCESS: ProcessKey = ProcessKey {
-        pid: 17,
-        start_ticks: 29,
-    };
+    const PROCESS: ProcessKey = ProcessKey::from_parts(17, 29);
     const WINDOW: u32 = 41;
 
     fn quarry(work: Work) -> [Quarry; 1] {

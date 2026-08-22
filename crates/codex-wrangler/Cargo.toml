@@ -20,6 +20,7 @@ instrumentation = ["brass_poolrooms/instrumentation"]
 
 [dependencies]
 anyhow.workspace = true
+codex-census.workspace = true
 crossbeam-channel.workspace = true
 brass_poolrooms.workspace = true
 directories.workspace = true

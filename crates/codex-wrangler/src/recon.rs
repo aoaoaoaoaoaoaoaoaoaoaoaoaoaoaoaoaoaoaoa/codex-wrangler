@@ -1451,8 +1451,10 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         let _prior = cache.insert(key, process.clone());
         return Some(process);
     }
-    if !foreground_tty(&root) {
-        return None;
+    match harness {
+        Harness::Codex if !codex_census::is_top_level_codex(pid) => return None,
+        Harness::ClaudeCode | Harness::PrimeAgent if !foreground_tty(&root) => return None,
+        Harness::Codex | Harness::ClaudeCode | Harness::PrimeAgent => {}
     }
     let environment = process_environment(&root);
     let home = environment
@@ -1604,7 +1606,15 @@ fn process_descriptors(root: &Path, harness: Harness) -> (Vec<PathBuf>, Vec<Code
 
 fn codex_claims(root: &Path) -> (Vec<PathBuf>, Vec<CodexClaim>) {
     let mut rollouts = Vec::new();
-    let mut claims = Vec::new();
+    let mut claims = root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|pid| pid.parse().ok())
+        .map(codex_census::writer_lock_sessions)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|session| CodexClaim::WriterLock(session.to_string()))
+        .collect::<Vec<_>>();
     for entry in fs::read_dir(root.join("fd"))
         .into_iter()
         .flatten()
@@ -1613,8 +1623,10 @@ fn codex_claims(root: &Path) -> (Vec<PathBuf>, Vec<CodexClaim>) {
         let Ok(target) = fs::read_link(entry.path()) else {
             continue;
         };
-        if let Some(thread) = writer_lock_thread(&target) {
-            claims.push(CodexClaim::WriterLock(thread.to_owned()));
+        if target
+            .parent()
+            .is_some_and(|parent| parent.file_name() == Some(OsStr::new("thread-writer-locks")))
+        {
             continue;
         }
         if !jsonl(&target) {
@@ -1634,12 +1646,6 @@ fn codex_claims(root: &Path) -> (Vec<PathBuf>, Vec<CodexClaim>) {
     claims.sort_unstable();
     claims.dedup();
     (rollouts, claims)
-}
-
-fn writer_lock_thread(path: &Path) -> Option<&str> {
-    (path.parent()?.file_name() == Some(OsStr::new("thread-writer-locks")))
-        .then(|| path.file_stem()?.to_str().filter(|stem| uuid_literal(stem)))
-        .flatten()
 }
 
 fn open_jsonls(root: &Path) -> Vec<PathBuf> {

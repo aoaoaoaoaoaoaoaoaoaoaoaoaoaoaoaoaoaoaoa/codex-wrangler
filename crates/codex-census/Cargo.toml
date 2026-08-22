@@ -1,0 +1,16 @@
+[package]
+name = "codex-census"
+version.workspace = true
+description = "Volatile Linux process census for interactive Codex sessions"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
