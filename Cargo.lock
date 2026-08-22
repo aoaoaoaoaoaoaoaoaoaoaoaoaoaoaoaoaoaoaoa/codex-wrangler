@@ -401,7 +401,6 @@ version = "1.3.12"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
- "codex-census",
  "crossbeam-channel",
  "directories",
  "egui",
