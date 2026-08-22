@@ -127,7 +127,7 @@ pub fn is_top_level_codex(pid: u32) -> bool {
         && stat.process_group == stat.foreground_group
         && stdio_is_terminal(pid)
         && is_codex_program(pid)
-        && !has_codex_ancestor(stat.parent)
+        && !has_codex_ancestor(stat.parent, stat.tty)
 }
 
 /// Writer-lock session claims currently held open by `pid`.
@@ -199,17 +199,20 @@ fn command_arguments(pid: u32) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn has_codex_ancestor(mut pid: u32) -> bool {
+fn has_codex_ancestor(mut pid: u32, tty: i64) -> bool {
     for _ in 0..MAX_ANCESTORS {
         if pid <= 1 {
+            return false;
+        }
+        let Ok(stat) = process_stat(pid) else {
+            return false;
+        };
+        if stat.tty != tty {
             return false;
         }
         if is_codex_program(pid) {
             return true;
         }
-        let Ok(stat) = process_stat(pid) else {
-            return false;
-        };
         pid = stat.parent;
     }
     true
