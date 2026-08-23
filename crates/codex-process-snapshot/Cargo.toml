@@ -1,7 +1,7 @@
 [package]
-name = "codex-census"
+name = "codex-process-snapshot"
 version.workspace = true
-description = "Volatile Linux process census for interactive Codex sessions"
+description = "Volatile Linux process snapshot for interactive Codex sessions"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::contract::{Harness, Work};
+use codex_wrangler_contract::{Harness, Work};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Card {
@@ -76,7 +76,7 @@ const fn rank(work: Work) -> u8 {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Census {
+pub struct LiveSnapshot {
     pub cards: Vec<Card>,
     pub fault: Option<String>,
 }

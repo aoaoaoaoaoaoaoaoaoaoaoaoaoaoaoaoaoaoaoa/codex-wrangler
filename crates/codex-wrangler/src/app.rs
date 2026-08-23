@@ -7,19 +7,20 @@ use std::{
     time::Instant,
 };
 
-#[cfg(feature = "egui-test")]
-use crate::contract::{
-    CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, ForkField,
-    GuideVisibility, HistoryObservation, HistoryRenameObservation, HistorySortObservation,
-    HistorySortTarget, HistoryTarget, HistoryTranscriptObservation, Observation, PinField,
-    PreferenceTarget, SearchObservation, SearchTarget, SettingsObservation, Tab, TabTarget,
-    UI_FINGERPRINT, WorkspaceTarget,
-};
 use brass_poolrooms::{
     chrome,
     chrome::{ForgePin, LonginusCursor, MechanismSize, ScrewScroll, SortDetent, SortToggle},
     water::{Domain, Floor, Frame as WaterFrame, Poke, Radiator, Surface, Wetness},
 };
+#[cfg(feature = "egui-test")]
+use codex_wrangler_contract::{
+    CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, ForkField,
+    GuideVisibility, HistoryObservation, HistoryRenameObservation, HistorySortObservation,
+    HistorySortTarget, HistoryTarget, HistoryTranscriptObservation, Observation, PinField,
+    SearchObservation, SearchTarget, SettingTarget, SettingsObservation, Tab, TabTarget,
+    UI_FINGERPRINT, WorkspaceTarget,
+};
+use codex_wrangler_contract::{Harness, HistoryColumn, HistoryOperation, SortDirection, Work};
 use egui::{
     Color32, RichText, Sense, Stroke, StrokeKind, Vec2,
     text::{LayoutJob, TextFormat},
@@ -33,19 +34,19 @@ use eternalist_apps::{
 
 use crate::{
     commands::{
-        APPLICATION_IDIOMS, Edict, NAVIGATION_IDIOMS, Realm, SCRY_IDIOMS, TILE_IDIOMS, canon,
+        APPLICATION_GUIDE_GROUP, Context, Edict, NAVIGATION_GUIDE_GROUP, SEARCH_GUIDE_GROUP,
+        TILE_GUIDE_GROUP, canon,
     },
-    contract::{Harness, HistoryColumn, HistoryOperation, SortDirection, Work},
+    configuration::Configuration,
     history::{
-        Census as HistoryCensus, Nexus as HistoryNexus, Order as HistoryOrder,
-        Session as HistorySession, Turn as HistoryTurn, spawn as spawn_history,
+        HistorySnapshot, HistoryWorker, Order as HistoryOrder, Session as HistorySession,
+        Turn as HistoryTurn, spawn as spawn_history,
     },
     instance::{Incumbent, NO_DESKTOP},
-    model::{Card, Census},
+    model::{Card, LiveSnapshot},
     posture::{Ledger, Posture},
-    preferences::Preferences,
-    recon::{Intent, Nexus, Strike, spawn},
-    scry::{HistoryHit, HistoryScry, Hit, Scry},
+    recon::{Intent, LiveWorker, Strike, spawn},
+    search::{HistoryHit, HistorySearch, Hit, Search},
     tray::{Signal as TraySignal, Tray},
 };
 
@@ -222,11 +223,11 @@ impl HistoryLease {
         }
     }
 
-    fn settled(&self, thread: &str, census: &HistoryCensus) -> bool {
+    fn settled(&self, thread: &str, snapshot: &HistorySnapshot) -> bool {
         if self.phase != HistoryPhase::Acknowledged {
             return false;
         }
-        let session = census
+        let session = snapshot
             .sessions
             .iter()
             .find(|session| session.thread == thread);
@@ -284,11 +285,11 @@ struct Wrangler<const START_FLOATING: bool> {
     water: Surface,
     resting_ior_spread: f32,
     living_wait: LivingWait,
-    nexus: Nexus,
-    historian: HistoryNexus,
-    census: Option<Census>,
-    history: Option<HistoryCensus>,
-    census_label: String,
+    live_worker: LiveWorker,
+    history_worker: HistoryWorker,
+    live_snapshot: Option<LiveSnapshot>,
+    history_snapshot: Option<HistorySnapshot>,
+    live_snapshot_label: String,
     first_frame_presented: bool,
     summon: Arc<AtomicU64>,
     summon_generation: u32,
@@ -301,8 +302,8 @@ struct Wrangler<const START_FLOATING: bool> {
     search_focus: SearchFocus,
     tile_tool: TileTool,
     jolts: JoltLedger,
-    scry: Scry,
-    history_scry: HistoryScry,
+    search: Search,
+    history_search: HistorySearch,
     history_requested: HashSet<(String, i64)>,
     history_pending: HashMap<String, HistoryLease>,
     history_error: Option<String>,
@@ -310,7 +311,7 @@ struct Wrangler<const START_FLOATING: bool> {
     delete_target: Option<String>,
     transcript: Option<TranscriptView>,
     page: Page,
-    preferences: Preferences,
+    configuration: Configuration,
     settings: SettingsSheet,
     guide: CommandGuide,
     window_focused: Option<bool>,
@@ -342,8 +343,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     fn raise(ctx: &egui::Context, incumbent: Incumbent, ledger: Ledger) -> anyhow::Result<Self> {
         lift_typography(ctx);
         let wake = NativeWake::from_context(ctx);
-        let nexus = spawn(wake.clone());
-        let historian = spawn_history(wake.clone());
+        let live_worker = spawn(wake.clone());
+        let history_worker = spawn_history(wake.clone());
         let summon = Arc::new(AtomicU64::new(pack_summon(1, incumbent.launch_desktop())));
         let tray_summon = Arc::clone(&summon);
         let quit = Arc::new(AtomicBool::new(false));
@@ -375,16 +376,16 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         .ok();
         let water = Surface::new(Wetness::Wet);
         let resting_ior_spread = water.chemistry().ior_spread;
-        let preferences = Preferences::raise(ctx)?;
+        let configuration = Configuration::raise(ctx)?;
         Ok(Self {
             water,
             resting_ior_spread,
             living_wait: LivingWait::default(),
-            nexus,
-            historian,
-            census: None,
-            history: None,
-            census_label: "DISCOVERING MANUAL THREADS".to_owned(),
+            live_worker,
+            history_worker,
+            live_snapshot: None,
+            history_snapshot: None,
+            live_snapshot_label: "DISCOVERING MANUAL THREADS".to_owned(),
             first_frame_presented: false,
             summon,
             summon_generation: 0,
@@ -397,8 +398,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             search_focus: SearchFocus::Idle,
             tile_tool: TileTool::Rest,
             jolts: JoltLedger::new(),
-            scry: Scry::default(),
-            history_scry: HistoryScry::default(),
+            search: Search::default(),
+            history_search: HistorySearch::default(),
             history_requested: HashSet::new(),
             history_pending: HashMap::new(),
             history_error: None,
@@ -406,7 +407,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             delete_target: None,
             transcript: None,
             page: Page::Live,
-            preferences,
+            configuration,
             settings: SettingsSheet::default(),
             guide: CommandGuide::default(),
             window_focused: None,
@@ -441,7 +442,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         {
             return;
         }
-        let Some(activation) = self.nexus.take_activation() else {
+        let Some(activation) = self.live_worker.take_activation() else {
             return;
         };
         if self
@@ -479,22 +480,22 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         if !self.first_frame_presented {
             return false;
         }
-        let Some(census) = self.nexus.take_census() else {
+        let Some(snapshot) = self.live_worker.take_snapshot() else {
             return false;
         };
-        self.scry.reconcile(&census.cards);
-        self.census_label = self.scry.label().to_owned();
-        self.census = Some(census);
-        self.reconcile_history_scry();
+        self.search.reconcile(&snapshot.cards);
+        self.live_snapshot_label = self.search.label().to_owned();
+        self.live_snapshot = Some(snapshot);
+        self.reconcile_history_search();
         true
     }
 
     fn drain_history(&mut self) -> bool {
-        if let Some(census) = self.historian.take_census() {
+        if let Some(snapshot) = self.history_worker.take_snapshot() {
             self.history_pending
-                .retain(|thread, lease| !lease.settled(thread, &census));
-            self.history = Some(census);
-            self.reconcile_history_scry();
+                .retain(|thread, lease| !lease.settled(thread, &snapshot));
+            self.history_snapshot = Some(snapshot);
+            self.reconcile_history_search();
             return true;
         }
         false
@@ -502,7 +503,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn reap_history_outcomes(&mut self) -> bool {
         let mut changed = false;
-        for outcome in self.historian.take_outcomes() {
+        for outcome in self.history_worker.take_outcomes() {
             let thread = outcome.order.thread();
             let operation = outcome.order.operation();
             if let Some(error) = outcome.error {
@@ -513,7 +514,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     outcome.order.thread()
                 ));
             } else {
-                let census = self.history.as_ref();
+                let snapshot = self.history_snapshot.as_ref();
                 let settled = self.history_pending.get_mut(thread).is_some_and(|lease| {
                     assert_eq!(
                         lease.operation(),
@@ -521,7 +522,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                         "history outcome crossed its resource lease"
                     );
                     lease.phase = HistoryPhase::Acknowledged;
-                    census.is_some_and(|census| lease.settled(thread, census))
+                    snapshot.is_some_and(|snapshot| lease.settled(thread, snapshot))
                 });
                 if settled {
                     let _prior = self.history_pending.remove(thread);
@@ -535,7 +536,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn reap_transcripts(&mut self) -> bool {
         let mut changed = false;
-        for outcome in self.historian.take_transcripts() {
+        for outcome in self.history_worker.take_transcripts() {
             let Some(view) = self
                 .transcript
                 .as_mut()
@@ -557,39 +558,39 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         changed
     }
 
-    fn reconcile_history_scry(&mut self) {
-        let Some(live) = live_codex_threads(self.census.as_ref()) else {
-            self.history_scry.reconcile(&[], &HashSet::new());
+    fn reconcile_history_search(&mut self) {
+        let Some(live) = live_codex_threads(self.live_snapshot.as_ref()) else {
+            self.history_search.reconcile(&[], &HashSet::new());
             return;
         };
         let sessions = self
-            .history
+            .history_snapshot
             .as_ref()
-            .map_or(&[][..], |census| census.sessions.as_slice());
-        self.history_scry.reconcile(sessions, &live);
+            .map_or(&[][..], |snapshot| snapshot.sessions.as_slice());
+        self.history_search.reconcile(sessions, &live);
     }
 
     fn clear_search(&mut self) {
         match self.page {
             Page::Live => {
                 let cards = self
-                    .census
+                    .live_snapshot
                     .as_ref()
-                    .map_or(&[][..], |census| census.cards.as_slice());
-                self.scry.clear(cards);
-                if self.census.is_some() {
-                    self.census_label = self.scry.label().to_owned();
+                    .map_or(&[][..], |snapshot| snapshot.cards.as_slice());
+                self.search.clear(cards);
+                if self.live_snapshot.is_some() {
+                    self.live_snapshot_label = self.search.label().to_owned();
                 }
             }
             Page::Historical => {
-                if let Some(live) = live_codex_threads(self.census.as_ref()) {
+                if let Some(live) = live_codex_threads(self.live_snapshot.as_ref()) {
                     let sessions = self
-                        .history
+                        .history_snapshot
                         .as_ref()
-                        .map_or(&[][..], |census| census.sessions.as_slice());
-                    self.history_scry.clear(sessions, &live);
+                        .map_or(&[][..], |snapshot| snapshot.sessions.as_slice());
+                    self.history_search.clear(sessions, &live);
                 } else {
-                    self.history_scry.clear(&[], &HashSet::new());
+                    self.history_search.clear(&[], &HashSet::new());
                 }
             }
         }
@@ -616,8 +617,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let settings_was_open = self.settings.is_open();
         let settings_invoked =
             !modal_open && !self.guide.is_open() && self.settings.take_shortcut(ui.ctx());
-        if !settings_was_open && self.settings.is_open() && self.preferences.settled() {
-            let _requested = self.preferences.request_reload();
+        if !settings_was_open && self.settings.is_open() && self.configuration.settled() {
+            let _requested = self.configuration.request_reload();
         }
         let help_invoked = !modal_open
             && !settings_invoked
@@ -627,8 +628,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             && !self.settings.is_open()
             && !help_invoked
             && !self.guide.is_open()
-            && let Some(CommandDispatch::Invoke(Edict::Scry)) =
-                canon().route(ui.ctx(), &[Realm::Gallery], |_| CommandStatus::Enabled)
+            && let Some(CommandDispatch::Invoke(Edict::Search)) =
+                canon().route(ui.ctx(), &[Context::Gallery], |_| CommandStatus::Enabled)
         {
             self.search_focus = SearchFocus::Seeking;
         }
@@ -658,10 +659,14 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     fn live_search_field(&mut self, ui: &mut egui::Ui, id: egui::Id) {
-        let before = self.scry.query().to_owned();
-        let color = if self.scry.valid() { chrome::TEXT } else { RED };
+        let before = self.search.query().to_owned();
+        let color = if self.search.valid() {
+            chrome::TEXT
+        } else {
+            RED
+        };
         let response = ui.add(
-            egui::TextEdit::singleline(self.scry.edit())
+            egui::TextEdit::singleline(self.search.edit())
                 .id(id)
                 .hint_text("CASE-INSENSITIVE REGEXP · TITLES OR NAMELESS PATHS")
                 .text_color(color)
@@ -681,28 +686,28 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         }
         if response.changed() {
             let cards = self
-                .census
+                .live_snapshot
                 .as_ref()
-                .map_or(&[][..], |census| census.cards.as_slice());
-            self.scry.revise(cards);
-            if self.census.is_some() {
-                self.census_label = self.scry.label().to_owned();
+                .map_or(&[][..], |snapshot| snapshot.cards.as_slice());
+            self.search.revise(cards);
+            if self.live_snapshot.is_some() {
+                self.live_snapshot_label = self.search.label().to_owned();
             }
         }
-        if let Some(wake) = chrome::text_wake(ui, &response, &before, self.scry.query()) {
+        if let Some(wake) = chrome::text_wake(ui, &response, &before, self.search.query()) {
             self.water.text(wake);
         }
     }
 
     fn history_search_field(&mut self, ui: &mut egui::Ui, id: egui::Id) {
-        let before = self.history_scry.query().to_owned();
-        let color = if self.history_scry.valid() {
+        let before = self.history_search.query().to_owned();
+        let color = if self.history_search.valid() {
             chrome::TEXT
         } else {
             RED
         };
         let response = ui.add(
-            egui::TextEdit::singleline(self.history_scry.edit())
+            egui::TextEdit::singleline(self.history_search.edit())
                 .id(id)
                 .hint_text("CASE-INSENSITIVE REGEXP · SESSION NAMES OR IDS")
                 .text_color(color)
@@ -721,25 +726,25 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             ui.ctx().request_discard("Search editor submitted");
         }
         if response.changed() {
-            if let Some(live) = live_codex_threads(self.census.as_ref()) {
+            if let Some(live) = live_codex_threads(self.live_snapshot.as_ref()) {
                 let sessions = self
-                    .history
+                    .history_snapshot
                     .as_ref()
-                    .map_or(&[][..], |census| census.sessions.as_slice());
-                self.history_scry.revise(sessions, &live);
+                    .map_or(&[][..], |snapshot| snapshot.sessions.as_slice());
+                self.history_search.revise(sessions, &live);
             } else {
-                self.history_scry.revise(&[], &HashSet::new());
+                self.history_search.revise(&[], &HashSet::new());
             }
         }
-        if let Some(wake) = chrome::text_wake(ui, &response, &before, self.history_scry.query()) {
+        if let Some(wake) = chrome::text_wake(ui, &response, &before, self.history_search.query()) {
             self.water.text(wake);
         }
     }
 
     fn close_preference(&mut self, ui: &mut egui::Ui) {
-        let mut minimize = self.preferences.minimize_on_close();
+        let mut minimize = self.configuration.minimize_on_close();
         let latch = ui
-            .add_enabled_ui(self.preferences.writable(), |ui| {
+            .add_enabled_ui(self.configuration.writable(), |ui| {
                 chrome::Checkbox::new(&mut minimize, MINIMIZE_ON_CLOSE.name())
                     .label_side(chrome::LabelSide::Left)
                     .size(MechanismSize::Small)
@@ -748,7 +753,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             .inner;
         brass_poolrooms::poolroom_anchor!(
             ui,
-            PreferenceTarget("minimize-on-close").to_string(),
+            SettingTarget("minimize-on-close").to_string(),
             latch.rect
         );
         self.water.checkbox(&latch);
@@ -757,17 +762,17 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             .into_response()
             .on_hover_text(MINIMIZE_ON_CLOSE.detail());
         if changed {
-            let _revised = self.preferences.set_minimize_on_close(minimize);
+            let _revised = self.configuration.set_minimize_on_close(minimize);
         }
     }
 
     fn application_header(&mut self, ui: &mut egui::Ui) {
         let was_open = self.settings.is_open();
         let _header = ApplicationHeader::new("CODEX WRANGLER")
-            .settings_attention(self.preferences.fault().is_some())
+            .settings_attention(self.configuration.fault().is_some())
             .show(ui, &mut self.guide, &mut self.settings, &mut self.water);
-        if !was_open && self.settings.is_open() && self.preferences.settled() {
-            let _requested = self.preferences.request_reload();
+        if !was_open && self.settings.is_open() && self.configuration.settled() {
+            let _requested = self.configuration.request_reload();
         }
     }
 
@@ -776,8 +781,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         ui.add_space(5.0);
         let _heading = ui.horizontal(|ui| {
             let (label, valid) = match self.page {
-                Page::Live => (self.census_label.as_str(), self.scry.valid()),
-                Page::Historical => (self.history_scry.label(), self.history_scry.valid()),
+                Page::Live => (self.live_snapshot_label.as_str(), self.search.valid()),
+                Page::Historical => (self.history_search.label(), self.history_search.valid()),
             };
             let count = if valid {
                 chrome::muted(label).size(13.0)
@@ -797,9 +802,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     legend(ui, "INPUT", Work::Input);
                     legend(ui, "ERROR", Work::Error);
                 } else {
-                    let mut guarded = self.preferences.confirm_deletion();
+                    let mut guarded = self.configuration.confirm_deletion();
                     let guard = ui
-                        .add_enabled_ui(self.preferences.writable(), |ui| {
+                        .add_enabled_ui(self.configuration.writable(), |ui| {
                             chrome::Checkbox::new(&mut guarded, CONFIRM_DELETION.name())
                                 .label_side(chrome::LabelSide::Left)
                                 .size(MechanismSize::Small)
@@ -808,7 +813,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                         .inner;
                     brass_poolrooms::poolroom_anchor!(
                         ui,
-                        HistoryTarget("preferences", "confirm-delete").to_string(),
+                        SettingTarget("confirm-delete").to_string(),
                         guard.rect
                     );
                     self.water.checkbox(&guard);
@@ -817,7 +822,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                         .into_response()
                         .on_hover_text(CONFIRM_DELETION.detail());
                     if changed {
-                        let _revised = self.preferences.set_confirm_deletion(guarded);
+                        let _revised = self.configuration.set_confirm_deletion(guarded);
                     }
                 }
             });
@@ -841,8 +846,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 }
             }
             let (query, valid) = match self.page {
-                Page::Live => (self.scry.query(), self.scry.valid()),
-                Page::Historical => (self.history_scry.query(), self.history_scry.valid()),
+                Page::Live => (self.search.query(), self.search.valid()),
+                Page::Historical => (self.history_search.query(), self.history_search.valid()),
             };
             if !self.search_focus.editing() && !query.is_empty() {
                 ui.add_space(10.0);
@@ -871,9 +876,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     fn settings_sheet(&mut self, ctx: &egui::Context) {
-        let path = self.preferences.path().to_owned();
+        let path = self.configuration.path().to_owned();
         let fault = self
-            .preferences
+            .configuration
             .fault()
             .map(|fault| fault.message().to_owned());
         let file = fault.as_deref().map_or_else(
@@ -881,10 +886,10 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             |fault| SettingsFile::fault(&path, fault),
         );
         let file = file
-            .reloading(self.preferences.reload_pending())
-            .reloadable(self.preferences.fault().is_some() || self.preferences.settled());
-        let mut minimize = self.preferences.minimize_on_close();
-        let mut confirm = self.preferences.confirm_deletion();
+            .reloading(self.configuration.reload_pending())
+            .reloadable(self.configuration.fault().is_some() || self.configuration.settled());
+        let mut minimize = self.configuration.minimize_on_close();
+        let mut confirm = self.configuration.confirm_deletion();
         let mut minimize_changed = false;
         let mut confirm_changed = false;
         let response = self.settings.show(ctx, &mut self.water, file, |ui| {
@@ -893,20 +898,20 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             confirm_changed = ui.boolean(CONFIRM_DELETION, &mut confirm);
         });
         if minimize_changed {
-            let _revised = self.preferences.set_minimize_on_close(minimize);
+            let _revised = self.configuration.set_minimize_on_close(minimize);
         }
         if confirm_changed {
-            let _revised = self.preferences.set_confirm_deletion(confirm);
+            let _revised = self.configuration.set_confirm_deletion(confirm);
         }
         if response.reload_requested() {
-            let _requested = self.preferences.request_reload();
+            let _requested = self.configuration.request_reload();
         }
     }
 
     fn reconcile_configuration(&mut self, ui: &egui::Ui) -> bool {
-        let mut changed = self.preferences.absorb();
+        let mut changed = self.configuration.absorb();
         let fault = self
-            .preferences
+            .configuration
             .fault()
             .map(|fault| fault.message().to_owned());
         let new_fault = fault.is_some() && fault != self.configuration_fault_seen;
@@ -923,8 +928,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         }
         let focused = ui.input(|input| input.focused);
         let regained = self.window_focused.replace(focused) == Some(false) && focused;
-        if regained && self.preferences.settled() {
-            let _requested = self.preferences.request_reload();
+        if regained && self.configuration.settled() {
+            let _requested = self.configuration.request_reload();
         }
         changed
     }
@@ -955,34 +960,34 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        if self.census.is_none() {
+                        if self.live_snapshot.is_none() {
                             let arena = ui.max_rect();
                             let _bouncer = self.living_wait.bouncer(ui, arena);
                         } else if let Some(fault) = self
-                            .census
+                            .live_snapshot
                             .as_ref()
-                            .and_then(|census| census.fault.as_deref())
+                            .and_then(|snapshot| snapshot.fault.as_deref())
                         {
                             let _fault = ui.label(RichText::new(fault).color(Color32::LIGHT_RED));
                         } else if self
-                            .census
+                            .live_snapshot
                             .as_ref()
-                            .is_some_and(|census| census.cards.is_empty())
+                            .is_some_and(|snapshot| snapshot.cards.is_empty())
                         {
                             let _empty = ui.centered_and_justified(|ui| {
                                 ui.label(
                                     chrome::muted("NO MANUAL HARNESS TERMINALS FOUND").size(13.0),
                                 )
                             });
-                        } else if self.scry.hits().is_empty() {
+                        } else if self.search.hits().is_empty() {
                             let _empty = ui.centered_and_justified(|ui| {
                                 ui.label(chrome::muted("NO MATCHING SESSIONS").size(13.0))
                             });
-                        } else if let Some(census) = &self.census {
+                        } else if let Some(snapshot) = &self.live_snapshot {
                             selected = gallery(
                                 ui,
-                                &census.cards,
-                                self.scry.hits(),
+                                &snapshot.cards,
+                                self.search.hits(),
                                 &mut CardPhysics {
                                     tool,
                                     recoiling,
@@ -1029,8 +1034,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 if self.history_barrier(ui) {
                     return 0.0;
                 }
-                if self.history_scry.hits().is_empty() {
-                    let message = if self.history_scry.query().is_empty() {
+                if self.history_search.hits().is_empty() {
+                    let message = if self.history_search.query().is_empty() {
                         "NO HISTORICAL SESSIONS"
                     } else {
                         "NO MATCHING HISTORICAL SESSIONS"
@@ -1044,12 +1049,16 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 if let Some(column) = history_header(
                     ui,
                     columns,
-                    &self.history_scry,
+                    &self.history_search,
                     self.history_rename.is_none(),
                     &mut self.water,
                 ) {
-                    let sessions = &self.history.as_ref().expect("history exists").sessions;
-                    self.history_scry.cycle(column, sessions);
+                    let sessions = &self
+                        .history_snapshot
+                        .as_ref()
+                        .expect("history exists")
+                        .sessions;
+                    self.history_search.cycle(column, sessions);
                     ui.ctx().request_discard("Historical order changed");
                 }
                 ui.add_space(4.0);
@@ -1059,13 +1068,17 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     .show_rows(
                         ui,
                         HISTORY_ROW,
-                        self.history_scry.hits().len(),
+                        self.history_search.hits().len(),
                         |ui, rows| {
-                            let sessions = &self.history.as_ref().expect("history exists").sessions;
+                            let sessions = &self
+                                .history_snapshot
+                                .as_ref()
+                                .expect("history exists")
+                                .sessions;
                             let result = history_rows(
                                 ui,
                                 sessions,
-                                self.history_scry.hits(),
+                                self.history_search.hits(),
                                 rows,
                                 columns,
                                 &self.history_pending,
@@ -1079,8 +1092,13 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     );
                 scroll.state.offset.y
             });
+        self.request_history_tallies(tally);
+        (action, panel.inner)
+    }
+
+    fn request_history_tallies(&mut self, tally: Vec<String>) {
         let stamps = self
-            .history
+            .history_snapshot
             .iter()
             .flat_map(|history| &history.sessions)
             .map(|session| (session.thread.as_str(), session.updated_at_ms))
@@ -1094,26 +1112,25 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 })
             })
             .collect::<Vec<_>>();
-        if !novel.is_empty() && self.historian.courier().tally(novel.clone()).is_err() {
+        if !novel.is_empty() && self.history_worker.courier().tally(novel.clone()).is_err() {
             for thread in novel {
                 if let Some(updated_at_ms) = stamps.get(thread.as_str()) {
                     let _removed = self.history_requested.remove(&(thread, *updated_at_ms));
                 }
             }
         }
-        (action, panel.inner)
     }
 
     fn history_barrier(&mut self, ui: &mut egui::Ui) -> bool {
-        if self.history.is_none() || self.census.is_none() {
+        if self.history_snapshot.is_none() || self.live_snapshot.is_none() {
             let arena = ui.max_rect();
             let _bouncer = self.living_wait.bouncer(ui, arena);
             return true;
         }
         if let Some(fault) = self
-            .census
+            .live_snapshot
             .as_ref()
-            .and_then(|census| census.fault.as_deref())
+            .and_then(|snapshot| snapshot.fault.as_deref())
         {
             let _fault = ui.label(
                 RichText::new(format!("COULD NOT PARTITION LIVE SESSIONS · {fault}"))
@@ -1122,7 +1139,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             return true;
         }
         if let Some(fault) = self
-            .history
+            .history_snapshot
             .as_ref()
             .and_then(|history| history.fault.as_deref())
         {
@@ -1141,7 +1158,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let operation = lease.operation();
         let prior = self.history_pending.insert(thread.clone(), lease);
         assert!(prior.is_none(), "history resource admitted two leases");
-        if self.historian.courier().order(order).is_ok() {
+        if self.history_worker.courier().order(order).is_ok() {
             self.history_error = None;
         } else {
             let _lease = self.history_pending.remove(&thread);
@@ -1158,7 +1175,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         }
         self.summon_attempts = None;
         self.sight_posture();
-        if self.nexus.strike.try_send(strike.clone()).is_ok() {
+        if self.live_worker.strike.try_send(strike.clone()).is_ok() {
             self.pending_activation = Some(ActivationFlight::launch(strike));
         }
     }
@@ -1189,7 +1206,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     fn accept_history_gesture(&mut self, gesture: HistoryGesture) {
-        if gesture.operation == HistoryOperation::Delete && self.preferences.confirm_deletion() {
+        if gesture.operation == HistoryOperation::Delete && self.configuration.confirm_deletion() {
             self.delete_target = Some(gesture.thread);
         } else {
             self.submit_history(HistoryOrder::operate(gesture.thread, gesture.operation));
@@ -1197,7 +1214,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     fn request_transcript(&mut self, thread: String) {
-        let name = self.history.as_ref().and_then(|history| {
+        let name = self.history_snapshot.as_ref().and_then(|history| {
             history
                 .sessions
                 .iter()
@@ -1209,7 +1226,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             name,
             state: TranscriptState::Loading,
         });
-        if self.historian.courier().transcript(thread).is_err()
+        if self.history_worker.courier().transcript(thread).is_err()
             && let Some(view) = &mut self.transcript
         {
             view.state = TranscriptState::Failed("history reader is unavailable".to_owned());
@@ -1322,7 +1339,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             return;
         };
         let name = self
-            .history
+            .history_snapshot
             .as_ref()
             .and_then(|history| {
                 history
@@ -1358,7 +1375,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                         .color(RED),
                 );
                 ui.add_space(10.0);
-                let mut guarded = self.preferences.confirm_deletion();
+                let mut guarded = self.configuration.confirm_deletion();
                 let guard = chrome::Checkbox::new(&mut guarded, "CONFIRM FUTURE DELETIONS")
                     .size(MechanismSize::Small)
                     .show(ui);
@@ -1369,7 +1386,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 );
                 self.water.checkbox(&guard);
                 if guard.changed() {
-                    self.preferences.set_confirm_deletion(guarded);
+                    self.configuration.set_confirm_deletion(guarded);
                 }
                 ui.add_space(12.0);
                 let _buttons = ui.horizontal(|ui| {
@@ -1428,8 +1445,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     #[cfg(feature = "egui-test")]
     fn search_observation(&self) -> SearchObservation {
         let (query, valid) = match self.page {
-            Page::Live => (self.scry.query(), self.scry.valid()),
-            Page::Historical => (self.history_scry.query(), self.history_scry.valid()),
+            Page::Live => (self.search.query(), self.search.valid()),
+            Page::Historical => (self.history_search.query(), self.history_search.valid()),
         };
         SearchObservation {
             query: query.to_owned(),
@@ -1498,9 +1515,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     #[cfg(feature = "egui-test")]
     fn card_observations(&self) -> Vec<CardObservation> {
-        self.census
+        self.live_snapshot
             .iter()
-            .flat_map(|census| &census.cards)
+            .flat_map(|snapshot| &snapshot.cards)
             .map(|card| CardObservation {
                 harness: card.harness,
                 name: card.name.clone(),
@@ -1514,9 +1531,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     #[cfg(feature = "egui-test")]
     fn observation(&self, text_edit_focused: bool) -> Observation {
-        let live = live_codex_threads(self.census.as_ref());
+        let live = live_codex_threads(self.live_snapshot.as_ref());
         let history = live.as_ref().map_or_else(Vec::new, |live| {
-            self.history
+            self.history_snapshot
                 .iter()
                 .flat_map(|history| &history.sessions)
                 .filter(|session| !live.contains(&session.thread))
@@ -1533,27 +1550,30 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 })
                 .collect()
         });
-        let history_order = self.history.as_ref().map_or_else(Vec::new, |history| {
-            self.history_scry
-                .hits()
-                .iter()
-                .filter_map(|hit| history.sessions.get(hit.session()))
-                .map(|session| session.thread.clone())
-                .collect()
-        });
+        let history_order = self
+            .history_snapshot
+            .as_ref()
+            .map_or_else(Vec::new, |history| {
+                self.history_search
+                    .hits()
+                    .iter()
+                    .filter_map(|hit| history.sessions.get(hit.session()))
+                    .map(|session| session.thread.clone())
+                    .collect()
+            });
         Observation {
             fingerprint: UI_FINGERPRINT.to_owned(),
             summoning: self.summon_attempts.is_some(),
             hovered: self.hovered.and_then(|index| {
-                self.census
+                self.live_snapshot
                     .as_ref()
-                    .and_then(|census| census.cards.get(index))
+                    .and_then(|snapshot| snapshot.cards.get(index))
                     .map(|card| CardKey {
                         harness: card.harness,
                         thread: card.thread.clone(),
                     })
             }),
-            loading: self.census.is_none(),
+            loading: self.live_snapshot.is_none(),
             jiggling: matches!(self.tile_tool, TileTool::Dismiss),
             fork_field: self.fork_field(),
             pin_field: self.pin_field(),
@@ -1570,29 +1590,29 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             },
             settings: SettingsObservation {
                 open: self.settings.is_open(),
-                fault: self.preferences.fault().is_some(),
-                settled: self.preferences.settled(),
+                fault: self.configuration.fault().is_some(),
+                settled: self.configuration.settled(),
             },
             tab: self.page.into(),
-            delete_guard: if self.preferences.confirm_deletion() {
+            delete_guard: if self.configuration.confirm_deletion() {
                 DeleteGuard::Armed
             } else {
                 DeleteGuard::Bypassed
             },
-            close_preference: if self.preferences.minimize_on_close() {
+            close_preference: if self.configuration.minimize_on_close() {
                 ClosePreference::Minimize
             } else {
                 ClosePreference::Exit
             },
             delete_prompt: self.delete_target.clone(),
             visible: self
-                .census
+                .live_snapshot
                 .iter()
-                .flat_map(|census| {
-                    self.scry
+                .flat_map(|snapshot| {
+                    self.search
                         .hits()
                         .iter()
-                        .filter_map(|hit| census.cards.get(hit.card()))
+                        .filter_map(|hit| snapshot.cards.get(hit.card()))
                 })
                 .map(|card| CardKey {
                     harness: card.harness,
@@ -1605,7 +1625,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             history_transcript: self.transcript_observation(),
             history_order,
             history_sorts: self
-                .history_scry
+                .history_search
                 .sorts()
                 .map(|(column, direction)| HistorySortObservation { column, direction })
                 .collect(),
@@ -1698,17 +1718,17 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         self.guide.show(
             ui.ctx(),
             canon(),
-            &[Realm::Gallery],
+            &[Context::Gallery],
             |_| match self.page {
                 Page::Live => "LIVE",
                 Page::Historical => "HISTORICAL",
             },
             |_| CommandStatus::Enabled,
             &[
-                APPLICATION_IDIOMS,
-                NAVIGATION_IDIOMS,
-                TILE_IDIOMS,
-                SCRY_IDIOMS,
+                APPLICATION_GUIDE_GROUP,
+                NAVIGATION_GUIDE_GROUP,
+                TILE_GUIDE_GROUP,
+                SEARCH_GUIDE_GROUP,
             ],
         );
         let stable_pointer = match self.page {
@@ -1730,7 +1750,8 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
     }
 
     fn close_requested(&mut self) -> CloseDisposition {
-        if self.preferences.minimize_on_close() && self.tray.as_ref().is_some_and(Tray::available) {
+        if self.configuration.minimize_on_close() && self.tray.as_ref().is_some_and(Tray::available)
+        {
             self.sight_posture();
             self.quench();
             CloseDisposition::HideOrExit
@@ -1740,11 +1761,11 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
     }
 
     fn service_deadline(&self, _now: Instant) -> Option<Instant> {
-        self.preferences.deadline()
+        self.configuration.deadline()
     }
 
     fn service_deadline_reached(&mut self, now: Instant) -> bool {
-        self.preferences.service_deadline_reached(now)
+        self.configuration.service_deadline_reached(now)
     }
 
     fn take_reveal_request(&mut self) -> bool {
@@ -1844,10 +1865,10 @@ impl From<Page> for Tab {
     }
 }
 
-fn live_codex_threads(census: Option<&Census>) -> Option<HashSet<String>> {
-    let census = census.filter(|census| census.fault.is_none())?;
+fn live_codex_threads(snapshot: Option<&LiveSnapshot>) -> Option<HashSet<String>> {
+    let snapshot = snapshot.filter(|snapshot| snapshot.fault.is_none())?;
     Some(
-        census
+        snapshot
             .cards
             .iter()
             .filter(|card| card.harness == Harness::Codex)
@@ -1952,7 +1973,7 @@ struct HistoryRows {
 fn history_header(
     ui: &mut egui::Ui,
     columns: HistoryColumns,
-    scry: &HistoryScry,
+    search: &HistorySearch,
     enabled: bool,
     water: &mut Surface,
 ) -> Option<HistoryColumn> {
@@ -1979,7 +2000,7 @@ fn history_header(
             width,
             label,
             column,
-            scry.direction(column),
+            search.direction(column),
             enabled,
             water,
         ) {

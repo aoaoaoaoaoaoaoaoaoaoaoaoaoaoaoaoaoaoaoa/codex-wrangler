@@ -21,6 +21,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use codex_wrangler_contract::{Harness, Work};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use eternalist_apps::NativeWake;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -29,9 +30,8 @@ use semver::Version;
 
 use crate::{
     codex_rpc::CodexRpc,
-    contract::{Harness, Work},
     desktop::{Desktop, DesktopSignal},
-    model::{Card, Census, snip},
+    model::{Card, LiveSnapshot, snip},
     names::NameIndex,
     pinboard::Pinboard,
     rollout::{RolloutSummary, Rollouts, TurnState},
@@ -83,8 +83,8 @@ pub struct Activation {
     pub conceal: bool,
 }
 
-pub struct Nexus {
-    latest: Arc<Mutex<Option<Census>>>,
+pub struct LiveWorker {
+    latest: Arc<Mutex<Option<LiveSnapshot>>>,
     activation: Arc<Mutex<Option<Activation>>>,
     pub strike: Striker,
     alive: Arc<AtomicBool>,
@@ -105,8 +105,8 @@ impl Striker {
     }
 }
 
-impl Nexus {
-    pub fn take_census(&self) -> Option<Census> {
+impl LiveWorker {
+    pub fn take_snapshot(&self) -> Option<LiveSnapshot> {
         self.latest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -121,7 +121,7 @@ impl Nexus {
     }
 }
 
-impl Drop for Nexus {
+impl Drop for LiveWorker {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
         let _woken = self.wake.write_all(&[0]);
@@ -131,7 +131,7 @@ impl Drop for Nexus {
     }
 }
 
-pub fn spawn(repaint: NativeWake) -> Nexus {
+pub fn spawn(repaint: NativeWake) -> LiveWorker {
     let latest = Arc::new(Mutex::new(None));
     let activation = Arc::new(Mutex::new(None));
     let (strike, strike_rx) = bounded(16);
@@ -159,7 +159,7 @@ pub fn spawn(repaint: NativeWake) -> Nexus {
             );
         })
         .expect("spawn reconnaissance worker");
-    Nexus {
+    LiveWorker {
         latest,
         activation,
         strike: Striker {
@@ -174,7 +174,7 @@ pub fn spawn(repaint: NativeWake) -> Nexus {
 
 fn raid(
     repaint: &NativeWake,
-    latest: &Mutex<Option<Census>>,
+    latest: &Mutex<Option<LiveSnapshot>>,
     activation: &Mutex<Option<Activation>>,
     strikes: &Receiver<Strike>,
     wake: &UnixStream,
@@ -186,7 +186,7 @@ fn raid(
             publish(
                 repaint,
                 latest,
-                Census {
+                LiveSnapshot {
                     cards: Vec::new(),
                     fault: Some(format!("Could not arm reconnaissance: {error:#}")),
                 },
@@ -201,7 +201,7 @@ fn raid(
     {
         publish_fault(repaint, latest, &error);
     } else {
-        publish_changed(repaint, latest, &mut prior, recon.census());
+        publish_changed(repaint, latest, &mut prior, recon.snapshot());
     }
     let mut forest_audit = Instant::now() + FOREST_AUDIT;
     let mut integrity_audit = Instant::now() + INTEGRITY_AUDIT;
@@ -256,7 +256,7 @@ fn raid(
         }
         if dirty {
             match recon.project(now) {
-                Ok(()) => publish_changed(repaint, latest, &mut prior, recon.census()),
+                Ok(()) => publish_changed(repaint, latest, &mut prior, recon.snapshot()),
                 Err(error) => publish_fault(repaint, latest, &error),
             }
         }
@@ -268,7 +268,7 @@ fn raid(
             recon.refresh_focus(now);
             recon.stasis.freeze_due(now);
             recon.refresh_focus(Instant::now());
-            publish_changed(repaint, latest, &mut prior, recon.census());
+            publish_changed(repaint, latest, &mut prior, recon.snapshot());
         }
     }
 }
@@ -394,31 +394,35 @@ fn drain_wake(mut wake: &UnixStream) {
 
 fn publish_changed(
     repaint: &NativeWake,
-    latest: &Mutex<Option<Census>>,
-    prior: &mut Option<Census>,
-    census: Census,
+    latest: &Mutex<Option<LiveSnapshot>>,
+    prior: &mut Option<LiveSnapshot>,
+    snapshot: LiveSnapshot,
 ) {
-    if prior.as_ref() != Some(&census) {
-        *prior = Some(census.clone());
-        publish(repaint, latest, census);
+    if prior.as_ref() != Some(&snapshot) {
+        *prior = Some(snapshot.clone());
+        publish(repaint, latest, snapshot);
     }
 }
 
-fn publish_fault(repaint: &NativeWake, latest: &Mutex<Option<Census>>, error: &anyhow::Error) {
+fn publish_fault(
+    repaint: &NativeWake,
+    latest: &Mutex<Option<LiveSnapshot>>,
+    error: &anyhow::Error,
+) {
     publish(
         repaint,
         latest,
-        Census {
+        LiveSnapshot {
             cards: Vec::new(),
             fault: Some(format!("Could not inspect harnesses: {error:#}")),
         },
     );
 }
 
-fn publish(repaint: &NativeWake, latest: &Mutex<Option<Census>>, census: Census) {
+fn publish(repaint: &NativeWake, latest: &Mutex<Option<LiveSnapshot>>, snapshot: LiveSnapshot) {
     *latest
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(census);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     let _repaint = repaint.request_repaint();
 }
 
@@ -593,7 +597,7 @@ impl Recon {
         }
     }
 
-    fn census(&self) -> Census {
+    fn snapshot(&self) -> LiveSnapshot {
         let mut cards = self.semantic.clone();
         for card in &mut cards {
             if card
@@ -604,7 +608,7 @@ impl Recon {
             }
         }
         cards.sort();
-        Census { cards, fault: None }
+        LiveSnapshot { cards, fault: None }
     }
 
     fn execute(&mut self, strike: &Strike, now: Instant) -> Result<bool> {
@@ -819,11 +823,13 @@ impl Recon {
                 .context("switch to remembered Codex workspace")?;
             anyhow::ensure!(status.success(), "i3 rejected workspace `{workspace}`");
         }
+        let path = codex_launch_path()?;
         let mut child = Command::new("alacritty")
             .arg("--working-directory")
             .arg(cwd)
             .args(["-e", "codex", launch.verb(), thread_id])
             .env("CODEX_HOME", home)
+            .env("PATH", path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -858,6 +864,15 @@ impl Recon {
         let codex = self.codex.as_ref()?;
         inspect_account(&codex.home, operation)
     }
+}
+
+fn codex_launch_path() -> Result<OsString> {
+    let home = std::env::var_os("HOME").context("HOME is absent")?;
+    let bin = PathBuf::from(home).join("bin");
+    let inherited = std::env::var_os("PATH").context("PATH is absent")?;
+    let paths = std::iter::once(bin.clone())
+        .chain(std::env::split_paths(&inherited).filter(|entry| entry != &bin));
+    std::env::join_paths(paths).context("forge Codex launch PATH")
 }
 
 fn inspect_account(home: &Path, operation: &str) -> Option<AccountMark> {

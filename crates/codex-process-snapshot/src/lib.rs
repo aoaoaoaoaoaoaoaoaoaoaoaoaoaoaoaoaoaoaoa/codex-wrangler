@@ -66,15 +66,15 @@ pub struct Seat {
 
 /// A point-in-time projection of unambiguous live Codex seats.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Census {
+pub struct ProcessSnapshot {
     seats: BTreeMap<SessionId, Seat>,
     conflicts: BTreeSet<SessionId>,
 }
 
-impl Census {
+impl ProcessSnapshot {
     /// Scan the host process table without retaining lifecycle state.
     pub fn scan() -> Result<Self> {
-        let mut census = Self::default();
+        let mut snapshot = Self::default();
         for entry in fs::read_dir(PROC)
             .context("read Linux process table")?
             .flatten()
@@ -89,15 +89,15 @@ impl Census {
             let Some(seat) = inspect(pid) else {
                 continue;
             };
-            if census.conflicts.contains(&seat.session) {
+            if snapshot.conflicts.contains(&seat.session) {
                 continue;
             }
-            if census.seats.insert(seat.session, seat.clone()).is_some() {
-                census.seats.remove(&seat.session);
-                census.conflicts.insert(seat.session);
+            if snapshot.seats.insert(seat.session, seat.clone()).is_some() {
+                snapshot.seats.remove(&seat.session);
+                snapshot.conflicts.insert(seat.session);
             }
         }
-        Ok(census)
+        Ok(snapshot)
     }
 
     /// The sole live seat for a session, excluding ambiguous ownership.

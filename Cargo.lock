@@ -388,7 +388,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-census"
+name = "codex-process-snapshot"
 version = "1.3.18"
 dependencies = [
  "anyhow",
@@ -401,6 +401,7 @@ version = "1.3.18"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
+ "codex-wrangler-contract",
  "crossbeam-channel",
  "directories",
  "egui",
@@ -425,12 +426,20 @@ name = "codex-wrangler-acceptance"
 version = "1.3.18"
 dependencies = [
  "brass_poolrooms",
+ "codex-wrangler-contract",
  "egui-tester",
  "nix",
  "rusqlite",
  "serde",
  "serde_json",
  "x11rb 0.14.0",
+]
+
+[[package]]
+name = "codex-wrangler-contract"
+version = "1.3.18"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

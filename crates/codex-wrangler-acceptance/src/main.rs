@@ -24,13 +24,11 @@ use serde_json::Value;
 mod showcase;
 mod terminal_fixture;
 
-#[path = "../../codex-wrangler/src/contract.rs"]
-mod contract;
-use contract::{
-    CardKey, CardTarget, ClosePreference, DeleteGuard, Flight, ForkField, GuideVisibility, Harness,
-    HistoryColumn, HistoryOperation, HistorySortTarget, HistoryTarget, Observation, PinField,
-    PreferenceTarget, SearchTarget, SortDirection, Tab, TabTarget, UI_FINGERPRINT, Work,
-    WorkspaceTarget,
+use codex_wrangler_contract::{
+    CardKey, CardObservation, CardTarget, ClosePreference, DeleteGuard, Flight, ForkField,
+    GuideVisibility, Harness, HistoryColumn, HistoryOperation, HistorySortTarget, HistoryTarget,
+    Observation, PinField, SearchTarget, SettingTarget, SortDirection, Tab, TabTarget,
+    UI_FINGERPRINT, Work, WorkspaceTarget,
 };
 
 const GOAL: &str = "10000000-0000-7000-8000-000000000001";
@@ -960,8 +958,8 @@ fn seize_card(
 fn wait_card(
     story: &mut Story<'_, '_, Observation>,
     thread: &str,
-    predicate: impl Fn(&contract::CardObservation) -> bool,
-) -> Result<contract::CardObservation> {
+    predicate: impl Fn(&CardObservation) -> bool,
+) -> Result<CardObservation> {
     let thread = thread.to_owned();
     let sought = thread.clone();
     let frame = story.wait_stable(
@@ -1072,7 +1070,7 @@ fn verify_gallery(
 ) -> Result<()> {
     vacate_gallery(
         story,
-        "pointer to vacate the gallery before the initial census",
+        "pointer to vacate the gallery before the initial snapshot",
     )?;
     let frame = story.wait_stable(
         Duration::from_secs(30),
@@ -1091,10 +1089,10 @@ fn verify_gallery(
             .then(|| frame.state.cards.clone())
         },
     )?;
-    verify_census(&frame.state)?;
+    verify_snapshot(&frame.state)?;
     verify_native_cursor_fields(story)?;
-    enable_minimize_on_close(story, &fixture.preferences)?;
-    verify_configuration_preflight(story, &fixture.preferences)?;
+    enable_minimize_on_close(story, &fixture.configuration_path)?;
+    verify_configuration_preflight(story, &fixture.configuration_path)?;
     verify_search_and_help(story)?;
     verify_history(testbed, story, &fixture.index)?;
     verify_permission_title_events(testbed, story)?;
@@ -1226,12 +1224,14 @@ fn cross_card_with_native_cursor(
     demand_native_cursor(label, cursor, story.session())
 }
 
-fn verify_census(state: &Observation) -> Result<()> {
+type CardSnapshot<'a> = BTreeSet<(Harness, &'a str, Work, Option<&'a str>, Option<u32>)>;
+
+fn verify_snapshot(state: &Observation) -> Result<()> {
     demand(
         state.fingerprint == UI_FINGERPRINT,
         "Codex Wrangler witness fingerprint drifted",
     )?;
-    demand(!state.loading, "settled census still reports loading")?;
+    demand(!state.loading, "settled snapshot still reports loading")?;
     demand(
         state.search.query.is_empty()
             && state.search.valid
@@ -1245,7 +1245,7 @@ fn verify_census(state: &Observation) -> Result<()> {
         state.close_preference == ClosePreference::Exit,
         "minimize-on-close did not begin disabled",
     )?;
-    let states = state
+    let snapshot = state
         .cards
         .iter()
         .map(|card| {
@@ -1257,8 +1257,15 @@ fn verify_census(state: &Observation) -> Result<()> {
                 card.workspace,
             )
         })
-        .collect::<BTreeSet<_>>();
-    let expected = BTreeSet::from([
+        .collect::<CardSnapshot<'_>>();
+    demand(
+        snapshot == expected_card_snapshot(),
+        format!("wrong card snapshot: {snapshot:?}"),
+    )
+}
+
+fn expected_card_snapshot() -> CardSnapshot<'static> {
+    BTreeSet::from([
         (
             Harness::Codex,
             ERROR,
@@ -1324,17 +1331,16 @@ fn verify_census(state: &Observation) -> Result<()> {
             Some("Butterfly engine"),
             Some(7),
         ),
-    ]);
-    demand(states == expected, format!("wrong card census: {states:?}"))
+    ])
 }
 
 fn enable_minimize_on_close(
     story: &mut Story<'_, '_, Observation>,
-    preferences: &Path,
+    configuration_path: &Path,
 ) -> Result<()> {
     let _enabled = story
         .tap(
-            PreferenceTarget("minimize-on-close"),
+            SettingTarget("minimize-on-close"),
             Button::Primary,
             Motion::default(),
         )?
@@ -1347,10 +1353,10 @@ fn enable_minimize_on_close(
         Duration::from_secs(5),
         Duration::from_millis(50),
         "minimize-on-close configuration settlement",
-        |frame| (frame.state.settings.settled && preferences.is_file()).then_some(()),
+        |frame| (frame.state.settings.settled && configuration_path.is_file()).then_some(()),
     )?;
     let configuration =
-        fs::read_to_string(preferences).map_err(io_verdict("read close preference"))?;
+        fs::read_to_string(configuration_path).map_err(io_verdict("read close setting"))?;
     demand(
         configuration
             .lines()
@@ -1641,7 +1647,7 @@ fn verify_history_rename(story: &mut Story<'_, '_, Observation>, index: &Path) -
     let _latched = story.wait_stable(
         Duration::from_secs(10),
         Duration::from_millis(150),
-        "successful rename to remain inert until authoritative census reconciliation",
+        "successful rename to remain inert until authoritative snapshot reconciliation",
         |frame| {
             (thread_name(index, UNSEEN).as_deref() == Some(RENAMED_HISTORY)
                 && frame
@@ -1825,7 +1831,7 @@ fn verify_history_sorting(story: &mut Story<'_, '_, Observation>) -> Result<()> 
         HistoryColumn::SessionId,
         Vec::new(),
         vec![UNSEEN, COLD],
-        "final sort to switch off and restore census order",
+        "final sort to switch off and restore snapshot order",
     )
 }
 
@@ -2020,7 +2026,7 @@ fn verify_history_deletion(story: &mut Story<'_, '_, Observation>, index: &Path)
     let _latched = story.wait_stable(
         Duration::from_secs(10),
         Duration::from_millis(150),
-        "successful deletion to remain inert beneath the pointer until census reconciliation",
+        "successful deletion to remain inert beneath the pointer until snapshot reconciliation",
         |frame| {
             (thread_archived(index, COLD).is_none()
                 && frame
@@ -2047,7 +2053,17 @@ fn verify_history_deletion(story: &mut Story<'_, '_, Observation>, index: &Path)
             .then_some(())
         },
     )?;
-    click_history(story, "preferences", "confirm-delete")?;
+    let _rearmed = story
+        .tap(
+            SettingTarget("confirm-delete"),
+            Button::Primary,
+            Motion::default(),
+        )?
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "delete confirmation setting to reach the application",
+            |state: &Observation| state.tab == Tab::Historical,
+        ))?;
     let _reguarded = story.wait(Condition::new(
         "delete confirmation to remain reversibly configurable",
         |state: &Observation| state.delete_guard == DeleteGuard::Armed,
@@ -2306,12 +2322,12 @@ fn verify_hover_lock(story: &mut Story<'_, '_, Observation>, rollout: &Path) -> 
         },
     )?;
 
-    vacate_gallery(story, "pointer to vacate its tile and release the census")?;
+    vacate_gallery(story, "pointer to vacate its tile and release the snapshot")?;
     wait_for_work(
         story,
         INPUT,
         Work::Turn,
-        "released census to admit the resolved input",
+        "released snapshot to admit the resolved input",
     )?;
 
     append_rollout(
@@ -2343,14 +2359,14 @@ fn vacate_gallery(story: &mut Story<'_, '_, Observation>, description: &'static 
             frame
                 .anchors
                 .iter()
-                .any(|anchor| anchor.name.ends_with("/activate"))
+                .any(|anchor| anchor.name.starts_with(CardTarget::PREFIX))
                 .then_some(())
         },
     )?;
     let card = frame
         .anchors
         .iter()
-        .filter(|anchor| anchor.name.ends_with("/activate"))
+        .filter(|anchor| anchor.name.starts_with(CardTarget::PREFIX))
         .min_by(|left, right| left.rect[1].total_cmp(&right.rect[1]))
         .ok_or_else(|| TesterError::Verdict {
             detail: "gallery vacancy requires a live card anchor".to_owned(),
@@ -2418,7 +2434,7 @@ struct Fixture {
     floating_proof: PathBuf,
     state: PathBuf,
     roster: PathBuf,
-    preferences: PathBuf,
+    configuration_path: PathBuf,
     pinboard: PathBuf,
     index: PathBuf,
     rotate_resume: PathBuf,
@@ -2521,7 +2537,7 @@ impl Fixture {
             floating_proof,
             state,
             roster,
-            preferences: testbed.private_path("xdg/config/codex-wrangler/config.toml")?,
+            configuration_path: testbed.private_path("xdg/config/codex-wrangler/config.toml")?,
             pinboard: testbed.private_path("xdg/state/codex-wrangler/pinned-sessions.json")?,
             index: db_path,
             rotate_resume,

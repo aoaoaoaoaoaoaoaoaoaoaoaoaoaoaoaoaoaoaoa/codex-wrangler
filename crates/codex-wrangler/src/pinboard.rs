@@ -5,9 +5,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use codex_wrangler_contract::Harness;
 use serde::{Deserialize, Serialize};
 
-use crate::{contract::Harness, state};
+use crate::state;
 
 const FILE: &str = "pinned-sessions.json";
 const VERSION: u8 = 1;

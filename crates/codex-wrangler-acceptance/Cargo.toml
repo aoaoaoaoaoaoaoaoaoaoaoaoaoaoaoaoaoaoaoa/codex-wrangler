@@ -13,6 +13,7 @@ egui-test = []
 
 [dependencies]
 brass_poolrooms.workspace = true
+codex-wrangler-contract = { workspace = true, features = ["egui-test"] }
 egui-tester.workspace = true
 nix = { workspace = true, features = ["term"] }
 rusqlite.workspace = true

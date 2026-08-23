@@ -17,6 +17,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use codex_wrangler_contract::HistoryOperation as Operation;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use eternalist_apps::NativeWake;
 use memchr::memmem;
@@ -25,21 +26,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    codex_rpc::CodexRpc, contract::HistoryOperation as Operation, names::NameIndex, state,
-    watchfire::Watchfire,
-};
-
-impl Operation {
-    pub const fn present_participle(self) -> &'static str {
-        match self {
-            Self::Archive => "ARCHIVING…",
-            Self::Unarchive => "UNARCHIVING…",
-            Self::Delete => "DELETING…",
-            Self::Rename => "RENAMING…",
-        }
-    }
-}
+use crate::{codex_rpc::CodexRpc, names::NameIndex, state, watchfire::Watchfire};
 
 const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 const LEDGER_SETTLE: Duration = Duration::from_secs(2);
@@ -63,7 +50,7 @@ pub struct Session {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Census {
+pub struct HistorySnapshot {
     pub sessions: Vec<Session>,
     pub fault: Option<String>,
 }
@@ -128,8 +115,8 @@ pub struct Outcome {
     pub error: Option<String>,
 }
 
-pub struct Nexus {
-    latest: Arc<Mutex<Option<Census>>>,
+pub struct HistoryWorker {
+    latest: Arc<Mutex<Option<HistorySnapshot>>>,
     outcomes: Arc<Mutex<Vec<Outcome>>>,
     transcripts: Arc<Mutex<Vec<TranscriptOutcome>>>,
     courier: Courier,
@@ -233,8 +220,8 @@ impl Courier {
     }
 }
 
-impl Nexus {
-    pub fn take_census(&self) -> Option<Census> {
+impl HistoryWorker {
+    pub fn take_snapshot(&self) -> Option<HistorySnapshot> {
         self.latest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -264,7 +251,7 @@ impl Nexus {
     }
 }
 
-impl Drop for Nexus {
+impl Drop for HistoryWorker {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
         let _woken = self.wake.write_all(&[0]);
@@ -274,7 +261,7 @@ impl Drop for Nexus {
     }
 }
 
-pub fn spawn(repaint: NativeWake) -> Nexus {
+pub fn spawn(repaint: NativeWake) -> HistoryWorker {
     let latest = Arc::new(Mutex::new(None));
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let transcripts = Arc::new(Mutex::new(Vec::new()));
@@ -326,7 +313,7 @@ pub fn spawn(repaint: NativeWake) -> Nexus {
         })
         .expect("spawn Codex historian");
 
-    Nexus {
+    HistoryWorker {
         latest,
         outcomes,
         transcripts,
@@ -343,7 +330,7 @@ pub fn spawn(repaint: NativeWake) -> Nexus {
 #[allow(clippy::too_many_arguments)]
 fn raid(
     repaint: &NativeWake,
-    latest: &Mutex<Option<Census>>,
+    latest: &Mutex<Option<HistorySnapshot>>,
     outcomes: &Mutex<Vec<Outcome>>,
     transcripts: &Mutex<Vec<TranscriptOutcome>>,
     intents: &Receiver<Intent>,
@@ -356,7 +343,7 @@ fn raid(
     let mut historian = match Historian::raise() {
         Ok(Some(historian)) => historian,
         Ok(None) => {
-            publish(repaint, latest, Census::default());
+            publish(repaint, latest, HistorySnapshot::default());
             return;
         }
         Err(error) => {
@@ -368,7 +355,7 @@ fn raid(
     if let Err(error) = historian.refresh() {
         publish_fault(repaint, latest, &error);
     } else {
-        publish_changed(repaint, latest, &mut prior, historian.census());
+        publish_changed(repaint, latest, &mut prior, historian.snapshot());
     }
     let mut integrity_audit = Instant::now() + INTEGRITY_AUDIT;
 
@@ -427,7 +414,7 @@ fn raid(
         }
         if dirty {
             match historian.refresh() {
-                Ok(()) => publish_changed(repaint, latest, &mut prior, historian.census()),
+                Ok(()) => publish_changed(repaint, latest, &mut prior, historian.snapshot()),
                 Err(error) => publish_fault(repaint, latest, &error),
             }
         }
@@ -526,31 +513,39 @@ fn drain_wake(mut wake: &UnixStream) {
 
 fn publish_changed(
     repaint: &NativeWake,
-    latest: &Mutex<Option<Census>>,
-    prior: &mut Option<Census>,
-    census: Census,
+    latest: &Mutex<Option<HistorySnapshot>>,
+    prior: &mut Option<HistorySnapshot>,
+    snapshot: HistorySnapshot,
 ) {
-    if prior.as_ref() != Some(&census) {
-        *prior = Some(census.clone());
-        publish(repaint, latest, census);
+    if prior.as_ref() != Some(&snapshot) {
+        *prior = Some(snapshot.clone());
+        publish(repaint, latest, snapshot);
     }
 }
 
-fn publish_fault(repaint: &NativeWake, latest: &Mutex<Option<Census>>, error: &anyhow::Error) {
+fn publish_fault(
+    repaint: &NativeWake,
+    latest: &Mutex<Option<HistorySnapshot>>,
+    error: &anyhow::Error,
+) {
     publish(
         repaint,
         latest,
-        Census {
+        HistorySnapshot {
             sessions: Vec::new(),
             fault: Some(format!("Could not inspect Codex history: {error:#}")),
         },
     );
 }
 
-fn publish(repaint: &NativeWake, latest: &Mutex<Option<Census>>, census: Census) {
+fn publish(
+    repaint: &NativeWake,
+    latest: &Mutex<Option<HistorySnapshot>>,
+    snapshot: HistorySnapshot,
+) {
     *latest
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(census);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     let _repaint = repaint.request_repaint();
 }
 
@@ -659,8 +654,8 @@ impl Historian {
         Ok(())
     }
 
-    fn census(&self) -> Census {
-        Census {
+    fn snapshot(&self) -> HistorySnapshot {
+        HistorySnapshot {
             sessions: self.sessions.clone(),
             fault: None,
         }

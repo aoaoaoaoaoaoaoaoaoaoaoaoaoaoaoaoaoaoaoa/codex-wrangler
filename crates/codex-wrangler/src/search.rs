@@ -1,12 +1,9 @@
 use std::{cmp::Ordering, collections::HashSet, ops::Range};
 
+use codex_wrangler_contract::{HistoryColumn, SortDirection};
 use regex::{Regex, RegexBuilder};
 
-use crate::{
-    contract::{HistoryColumn, SortDirection},
-    history::Session,
-    model::Card,
-};
+use crate::{history::Session, model::Card};
 
 #[derive(Debug)]
 pub struct Hit {
@@ -24,7 +21,7 @@ impl Hit {
     }
 }
 
-pub struct Scry {
+pub struct Search {
     query: String,
     matcher: Option<Regex>,
     valid: bool,
@@ -32,7 +29,7 @@ pub struct Scry {
     label: String,
 }
 
-impl Default for Scry {
+impl Default for Search {
     fn default() -> Self {
         Self {
             query: String::new(),
@@ -44,7 +41,7 @@ impl Default for Scry {
     }
 }
 
-impl Scry {
+impl Search {
     pub fn query(&self) -> &str {
         &self.query
     }
@@ -138,7 +135,7 @@ impl HistoryHit {
     }
 }
 
-pub struct HistoryScry {
+pub struct HistorySearch {
     query: String,
     matcher: Option<Regex>,
     valid: bool,
@@ -153,7 +150,7 @@ struct HistorySort {
     direction: SortDirection,
 }
 
-impl Default for HistoryScry {
+impl Default for HistorySearch {
     fn default() -> Self {
         Self {
             query: String::new(),
@@ -166,7 +163,7 @@ impl Default for HistoryScry {
     }
 }
 
-impl HistoryScry {
+impl HistorySearch {
     pub fn query(&self) -> &str {
         &self.query
     }

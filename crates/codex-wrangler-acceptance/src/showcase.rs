@@ -20,7 +20,7 @@ use super::{
     TERMINAL_READINESS_POLLS, arm_executable, forge_fake_cli, forge_replaceable_alacritty,
     io_verdict, vacate_gallery, wait_named_window,
 };
-use crate::contract::{Observation, Work};
+use codex_wrangler_contract::{Observation, Work};
 
 const CORPUS: &str = include_str!("../../../fixtures/showcase.json");
 
@@ -108,8 +108,8 @@ pub fn story(testbed: &Testbed, binary: &Path, destination: &Path) -> Result<()>
     let _settled = story.wait_stable(
         Duration::from_secs(30),
         Duration::from_millis(500),
-        "the five-state synthetic showcase census",
-        |frame| census(&frame.state).eq(&fixture.expected).then_some(()),
+        "the five-state synthetic showcase snapshot",
+        |frame| snapshot(&frame.state).eq(&fixture.expected).then_some(()),
     )?;
     vacate_gallery(&mut story, "pointer to vacate every showcase card")?;
     let _calm = story.wait_stable(
@@ -418,7 +418,7 @@ fn rollout_test_path(session: &Session) -> String {
     )
 }
 
-fn census(state: &Observation) -> BTreeSet<(String, Work, String, u32)> {
+fn snapshot(state: &Observation) -> BTreeSet<(String, Work, String, u32)> {
     state
         .cards
         .iter()

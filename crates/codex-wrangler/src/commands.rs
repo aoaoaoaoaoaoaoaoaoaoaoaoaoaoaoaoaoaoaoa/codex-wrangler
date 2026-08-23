@@ -10,15 +10,15 @@ use eternalist_apps::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Edict {
-    Scry,
+    Search,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Realm {
+pub enum Context {
     Gallery,
 }
 
-const SCRY_KEYS: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Slash)];
+const SEARCH_KEYS: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Slash)];
 const TAB: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Tab)];
 const ESCAPE: [Shortcut; 1] = [Shortcut::new(ShortcutModifiers::NONE, ShortcutKey::Escape)];
 const APPLICATION_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
@@ -31,7 +31,7 @@ const NAVIGATION_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
     "Cycles Live and Historical.",
     &TAB,
 )];
-const SCRY_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
+const SEARCH_GESTURES: [GuideGesture; 1] = [GuideGesture::new(
     "Clear search",
     "Clears the current tab's filter without hiding Wrangler.",
     &ESCAPE,
@@ -49,24 +49,25 @@ const TILE_GESTURES: [GuideGesture; 2] = [
     ),
 ];
 
-pub const NAVIGATION_IDIOMS: GuideSection = GuideSection::new("NAVIGATION", &NAVIGATION_GESTURES);
-pub const APPLICATION_IDIOMS: GuideSection =
+pub const NAVIGATION_GUIDE_GROUP: GuideSection =
+    GuideSection::new("NAVIGATION", &NAVIGATION_GESTURES);
+pub const APPLICATION_GUIDE_GROUP: GuideSection =
     GuideSection::new("APPLICATION", &APPLICATION_GESTURES);
-pub const SCRY_IDIOMS: GuideSection = GuideSection::new("SEARCH", &SCRY_GESTURES);
-pub const TILE_IDIOMS: GuideSection = GuideSection::new("TILES", &TILE_GESTURES);
+pub const SEARCH_GUIDE_GROUP: GuideSection = GuideSection::new("SEARCH", &SEARCH_GESTURES);
+pub const TILE_GUIDE_GROUP: GuideSection = GuideSection::new("TILES", &TILE_GESTURES);
 
-const EDICTS: [CommandSpec<Edict, Realm>; 1] = [CommandSpec::new(
-    Edict::Scry,
+const EDICTS: [CommandSpec<Edict, Context>; 1] = [CommandSpec::new(
+    Edict::Search,
     "gallery.search",
     "Search current tab",
-    CommandScope::Context(Realm::Gallery),
+    CommandScope::Context(Context::Gallery),
 )
 .with_detail(
     "Case-insensitive regexp. Live searches names or nameless paths; Historical searches names and session IDs.",
 )
-.with_default_shortcuts(&SCRY_KEYS)];
+.with_default_shortcuts(&SEARCH_KEYS)];
 
-pub fn canon() -> &'static CommandCanon<Edict, Realm> {
-    static CANON: OnceLock<CommandCanon<Edict, Realm>> = OnceLock::new();
+pub fn canon() -> &'static CommandCanon<Edict, Context> {
+    static CANON: OnceLock<CommandCanon<Edict, Context>> = OnceLock::new();
     CANON.get_or_init(|| CommandCanon::new(&EDICTS))
 }

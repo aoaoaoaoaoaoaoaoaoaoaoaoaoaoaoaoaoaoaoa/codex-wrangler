@@ -1,0 +1,20 @@
+[package]
+name = "codex-wrangler-contract"
+version.workspace = true
+description = "Tester-independent native UI contract for Codex Wrangler"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+keywords = ["codex", "egui", "testing"]
+categories = ["gui"]
+
+[features]
+egui-test = []
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

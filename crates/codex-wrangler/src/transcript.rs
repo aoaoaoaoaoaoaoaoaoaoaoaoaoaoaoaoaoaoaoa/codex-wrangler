@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::Value;
 
-use crate::contract::{Harness, Work};
+use codex_wrangler_contract::{Harness, Work};
 
 const SCAN_LIMIT: u64 = 4 << 20;
 const RECORD_LIMIT: usize = 1 << 20;

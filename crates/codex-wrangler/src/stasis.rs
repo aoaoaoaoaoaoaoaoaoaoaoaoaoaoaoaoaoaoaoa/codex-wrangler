@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::contract::Work;
+use codex_wrangler_contract::Work;
 
 const IDLE_GRACE: Duration = Duration::from_secs(30);
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);

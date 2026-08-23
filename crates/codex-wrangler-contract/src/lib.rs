@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "egui-test")]
-pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/27";
+pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/28";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -17,6 +17,7 @@ pub enum Harness {
 }
 
 impl Harness {
+    #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Codex => "codex",
@@ -63,6 +64,19 @@ pub enum HistoryOperation {
     Unarchive,
     Delete,
     Rename,
+}
+
+impl HistoryOperation {
+    /// Present-progress label for an operation awaiting durable convergence.
+    #[must_use]
+    pub const fn present_participle(self) -> &'static str {
+        match self {
+            Self::Archive => "ARCHIVING…",
+            Self::Unarchive => "UNARCHIVING…",
+            Self::Delete => "DELETING…",
+            Self::Rename => "RENAMING…",
+        }
+    }
 }
 
 #[cfg(feature = "egui-test")]
@@ -224,6 +238,11 @@ pub struct CardKey {
 pub struct CardTarget<'a>(pub Harness, pub &'a str);
 
 #[cfg(feature = "egui-test")]
+impl CardTarget<'_> {
+    pub const PREFIX: &'static str = "wrangler.card.activate/";
+}
+
+#[cfg(feature = "egui-test")]
 pub struct WorkspaceTarget<'a>(pub Harness, pub &'a str);
 
 #[cfg(feature = "egui-test")]
@@ -239,7 +258,7 @@ pub enum SearchTarget {
 pub struct HistorySortTarget(pub HistoryColumn);
 
 #[cfg(feature = "egui-test")]
-pub struct PreferenceTarget(pub &'static str);
+pub struct SettingTarget(pub &'static str);
 
 #[cfg(feature = "egui-test")]
 pub struct HistoryTarget<'a>(pub &'a str, pub &'static str);
@@ -247,14 +266,16 @@ pub struct HistoryTarget<'a>(pub &'a str, pub &'static str);
 #[cfg(feature = "egui-test")]
 impl fmt::Display for CardTarget<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/{}/activate", self.0.slug(), self.1)
+        write!(formatter, "{}{}/", Self::PREFIX, self.0.slug())?;
+        write_identity(formatter, self.1)
     }
 }
 
 #[cfg(feature = "egui-test")]
 impl fmt::Display for WorkspaceTarget<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/{}/workspace", self.0.slug(), self.1)
+        write!(formatter, "wrangler.card.workspace/{}/", self.0.slug())?;
+        write_identity(formatter, self.1)
     }
 }
 
@@ -263,7 +284,7 @@ impl fmt::Display for TabTarget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "tab/{}",
+            "wrangler.tab.select/{}",
             match self.0 {
                 Tab::Live => "live",
                 Tab::Historical => "historical",
@@ -276,8 +297,8 @@ impl fmt::Display for TabTarget {
 impl fmt::Display for SearchTarget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Editor => "search/editor",
-            Self::Filter => "search/filter",
+            Self::Editor => "wrangler.search.editor",
+            Self::Filter => "wrangler.search.filter",
         })
     }
 }
@@ -287,7 +308,7 @@ impl fmt::Display for HistorySortTarget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "history/sort/{}",
+            "wrangler.history.sort/{}",
             match self.0 {
                 HistoryColumn::SessionId => "session-id",
                 HistoryColumn::Name => "name",
@@ -301,15 +322,33 @@ impl fmt::Display for HistorySortTarget {
 }
 
 #[cfg(feature = "egui-test")]
-impl fmt::Display for PreferenceTarget {
+impl fmt::Display for SettingTarget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "preferences/{}", self.0)
+        write!(formatter, "wrangler.settings.{}", self.0)
     }
 }
 
 #[cfg(feature = "egui-test")]
 impl fmt::Display for HistoryTarget<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "history/{}/{}", self.0, self.1)
+        write!(formatter, "wrangler.history.{}/", self.1)?;
+        write_identity(formatter, self.0)
     }
+}
+
+#[cfg(feature = "egui-test")]
+fn write_identity(formatter: &mut fmt::Formatter<'_>, identity: &str) -> fmt::Result {
+    use fmt::Write as _;
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in identity.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            formatter.write_char(char::from(byte))?;
+        } else {
+            formatter.write_char('%')?;
+            formatter.write_char(char::from(HEX[usize::from(byte >> 4)]))?;
+            formatter.write_char(char::from(HEX[usize::from(byte & 0x0f)]))?;
+        }
+    }
+    Ok(())
 }

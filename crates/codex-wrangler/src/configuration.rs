@@ -5,7 +5,9 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use directories::ProjectDirs;
-use eternalist_apps::configuration::{Configuration, ConfigurationFault, ConfigurationLedger};
+use eternalist_apps::configuration::{
+    Configuration as ConfigurationContract, ConfigurationFault, ConfigurationLedger,
+};
 use serde::{Deserialize, Serialize};
 
 const LEGACY_FILE: &str = "preferences.json";
@@ -14,12 +16,12 @@ const SETTLE: Duration = Duration::from_millis(350);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
-struct Values {
+struct ConfigurationValues {
     confirm_deletion: bool,
     minimize_on_close: bool,
 }
 
-impl Default for Values {
+impl Default for ConfigurationValues {
     fn default() -> Self {
         Self {
             confirm_deletion: true,
@@ -28,7 +30,7 @@ impl Default for Values {
     }
 }
 
-impl Configuration for Values {}
+impl ConfigurationContract for ConfigurationValues {}
 
 #[derive(Clone, Copy, Deserialize)]
 struct Legacy {
@@ -38,11 +40,11 @@ struct Legacy {
     minimize_on_close: bool,
 }
 
-pub struct Preferences {
-    ledger: ConfigurationLedger<Values>,
+pub struct Configuration {
+    ledger: ConfigurationLedger<ConfigurationValues>,
 }
 
-impl Preferences {
+impl Configuration {
     pub fn raise(ctx: &egui::Context) -> Result<Self> {
         let project = ProjectDirs::from("moe", "Eternalist", "codex-wrangler")
             .context("cannot resolve the platform configuration directory")?;
@@ -51,10 +53,10 @@ impl Preferences {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 legacy().unwrap_or_else(|error| {
                     eprintln!("codex-wrangler cannot migrate its former preferences: {error:#}");
-                    Values::default()
+                    ConfigurationValues::default()
                 })
             }
-            Ok(_) | Err(_) => Values::default(),
+            Ok(_) | Err(_) => ConfigurationValues::default(),
         };
         let ledger = ConfigurationLedger::raise_with_fallback(
             "codex-wrangler-configuration",
@@ -132,11 +134,13 @@ impl Preferences {
     }
 }
 
-fn legacy() -> Result<Values> {
+fn legacy() -> Result<ConfigurationValues> {
     let path = crate::state::path(LEGACY_FILE)?;
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Values::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfigurationValues::default());
+        }
         Err(error) => return Err(error).with_context(|| format!("read `{}`", path.display())),
     };
     let legacy = serde_json::from_slice::<Legacy>(&bytes)
@@ -146,7 +150,7 @@ fn legacy() -> Result<Values> {
         "unsupported legacy preference version {}",
         legacy.version
     );
-    Ok(Values {
+    Ok(ConfigurationValues {
         confirm_deletion: legacy.confirm_deletion,
         minimize_on_close: legacy.minimize_on_close,
     })

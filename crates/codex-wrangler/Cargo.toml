@@ -12,6 +12,7 @@ categories = ["gui"]
 
 [features]
 egui-test = [
+  "codex-wrangler-contract/egui-test",
   "dep:egui-tester-witness",
   "instrumentation",
   "eternalist-apps/egui-test",
@@ -21,6 +22,7 @@ instrumentation = ["brass_poolrooms/instrumentation"]
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
+codex-wrangler-contract.workspace = true
 brass_poolrooms.workspace = true
 directories.workspace = true
 egui.workspace = true
