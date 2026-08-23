@@ -225,15 +225,15 @@ dependencies = [
 
 [[package]]
 name = "brass_foundry"
-version = "0.14.1"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1df00c9ab30334ab31d375ffb073f718d52998c94837e658b72809c094a8b8b9"
+checksum = "9827891155160d0d42f077f193924dfb3e1a39129dbb443e8cebacbd7da4bed4"
 
 [[package]]
 name = "brass_poolrooms"
-version = "0.14.1"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4ed7f6c5b09ba28cb67c1a39bdca97c523ed26d74e643c219913449553f0b3b"
+checksum = "0b2ccb78e9150c6f65ec37ea2dfb9cfee81629df82e887c1c73167f2fdba69c4"
 dependencies = [
  "anyhow",
  "brass_foundry",
