@@ -1013,6 +1013,7 @@ impl Codex {
             summary.state,
             self.goal_active(&thread.id)?,
             summary.waiting_for_input,
+            summary.delegated_turn,
         );
         let rollout = thread.rollout.clone();
         let preview = snip(&summary.preview, 280);
@@ -1369,13 +1370,19 @@ fn foreign_card(
     (card, path)
 }
 
-const fn classify_work(state: TurnState, goal_active: bool, waiting_for_input: bool) -> Work {
-    match (state, waiting_for_input, goal_active) {
-        (TurnState::Error, _, _) | (TurnState::Unknown, false, _) => Work::Error,
-        (_, true, _) => Work::Input,
-        (TurnState::Running, false, true) => Work::Goal,
-        (TurnState::Running, false, false) => Work::Turn,
-        (TurnState::Done, false, _) => Work::Done,
+const fn classify_work(
+    state: TurnState,
+    goal_active: bool,
+    waiting_for_input: bool,
+    delegated_turn: bool,
+) -> Work {
+    match (state, waiting_for_input, goal_active, delegated_turn) {
+        (TurnState::Error, _, _, _) | (TurnState::Unknown, false, _, _) => Work::Error,
+        (_, true, _, _) => Work::Input,
+        (TurnState::Running, false, true, _) => Work::Goal,
+        (TurnState::Running, false, false, true) => Work::Delegated,
+        (TurnState::Running, false, false, false) => Work::Turn,
+        (TurnState::Done, false, _, _) => Work::Done,
     }
 }
 
@@ -2171,15 +2178,38 @@ mod tests {
 
     #[test]
     fn work_state_has_one_lawful_precedence() {
-        assert_eq!(classify_work(TurnState::Running, true, false), Work::Goal);
-        assert_eq!(classify_work(TurnState::Running, false, false), Work::Turn);
-        assert_eq!(classify_work(TurnState::Done, true, false), Work::Done);
-        assert_eq!(classify_work(TurnState::Done, false, false), Work::Done);
-        assert_eq!(classify_work(TurnState::Running, true, true), Work::Input);
-        assert_eq!(classify_work(TurnState::Unknown, false, false), Work::Error);
-        assert_eq!(classify_work(TurnState::Unknown, false, true), Work::Input);
-        assert_eq!(classify_work(TurnState::Error, false, false), Work::Error);
-        assert_eq!(classify_work(TurnState::Error, false, true), Work::Error);
+        assert_eq!(
+            classify_work(TurnState::Running, true, false, true),
+            Work::Goal
+        );
+        assert_eq!(
+            classify_work(TurnState::Running, false, false, true),
+            Work::Delegated
+        );
+        assert_eq!(
+            classify_work(TurnState::Running, false, false, false),
+            Work::Turn
+        );
+        assert_eq!(
+            classify_work(TurnState::Done, true, false, true),
+            Work::Done
+        );
+        assert_eq!(
+            classify_work(TurnState::Running, true, true, true),
+            Work::Input
+        );
+        assert_eq!(
+            classify_work(TurnState::Unknown, false, false, true),
+            Work::Error
+        );
+        assert_eq!(
+            classify_work(TurnState::Unknown, false, true, true),
+            Work::Input
+        );
+        assert_eq!(
+            classify_work(TurnState::Error, false, true, true),
+            Work::Error
+        );
     }
 
     #[test]

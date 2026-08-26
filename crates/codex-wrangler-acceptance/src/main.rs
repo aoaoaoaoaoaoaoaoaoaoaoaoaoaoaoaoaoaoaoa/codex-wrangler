@@ -679,9 +679,9 @@ fn fork_and_return(
         fs::read_to_string(&fixture.fork_launch).is_ok_and(|proof| proof.trim() == "fork 7"),
         "forked session did not launch on its source terminal workspace",
     )?;
-    let original = wait_card(story, TURN, |card| card.work == Work::Turn)?;
+    let original = wait_card(story, TURN, |card| card.work == Work::Delegated)?;
     demand(
-        original.work == Work::Turn,
+        original.work == Work::Delegated,
         "forking a session displaced its original live terminal",
     )?;
     Ok(())
@@ -1287,7 +1287,7 @@ fn expected_card_snapshot() -> CardSnapshot<'static> {
             Some("Violet frontier"),
             Some(7),
         ),
-        (Harness::Codex, TURN, Work::Turn, None, Some(7)),
+        (Harness::Codex, TURN, Work::Delegated, None, Some(7)),
         (
             Harness::Codex,
             DONE,
@@ -3219,13 +3219,13 @@ fn seed_rollouts(directory: &Path) -> Result<[PathBuf; 8]> {
     fs::write(
         &turn,
         concat!(
-            r#"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"00000000-0000-0000-0000-000000000002","turn_id":"turn-fixture","item":{"type":"UserMessage","id":"user-fixture","content":[{"type":"text","text":"Cut the ordinary task through a deliberately immense preview which must remain imprisoned inside the card. It keeps going through several clauses, several sentences, and enough visual matter to expose any label whose clip rectangle is merely aspirational rather than real. None of this text may trespass into the next row, however narrow the window becomes.","text_elements":[]}]},"started_at_ms":1,"completed_at_ms":1}}"#,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            r#"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"00000000-0000-0000-0000-000000000002","turn_id":"turn-fixture","item":{"type":"UserMessage","id":"user-fixture","client_id":"wire-peer/post-fixture","content":[{"type":"text","text":"Cut the delegated task through a deliberately immense preview which must remain imprisoned inside the card. It keeps going through several clauses, several sentences, and enough visual matter to expose any label whose clip rectangle is merely aspirational rather than real. None of this text may trespass into the next row, however narrow the window becomes.","text_elements":[]}]},"started_at_ms":1,"completed_at_ms":1}}"#,
             "\n",
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"status\":\"active\"}}}\n",
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"status\":\"active\"}}}\n"
         ),
     )
-    .map_err(io_verdict("write running rollout"))?;
+    .map_err(io_verdict("write delegated rollout"))?;
     fs::write(
         &done,
         concat!(

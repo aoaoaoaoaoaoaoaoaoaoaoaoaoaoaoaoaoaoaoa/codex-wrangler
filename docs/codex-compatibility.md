@@ -28,7 +28,8 @@ the stronger proof; every anomalous 0.149 TUI row enters Wrangler's roster while
 live and remains a closed session thereafter.
 
 Historical turn tallies count persisted `user_message` and paginated
-`item_completed/UserMessage` records. Compressed history accepts Zstandard
+`item_completed/UserMessage` records. A running message whose `client_id` begins
+with `wire-peer/` is delegated work. Compressed history accepts Zstandard
 long-window frames; external archival pipelines may legitimately produce them.
 
 Stopped-session rollover compares the launcher's `codex --version` with the

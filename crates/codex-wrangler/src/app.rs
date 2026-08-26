@@ -54,6 +54,7 @@ const TILE_MIN: f32 = 300.0;
 const TILE_HEIGHT: f32 = 185.0;
 const GAP: f32 = 12.0;
 const GREEN: Color32 = Color32::from_rgb(91, 218, 146);
+const BLUE: Color32 = Color32::from_rgb(94, 164, 236);
 const VIOLET: Color32 = Color32::from_rgb(178, 115, 238);
 const ORANGE: Color32 = Color32::from_rgb(235, 158, 74);
 const RED: Color32 = Color32::from_rgb(236, 91, 91);
@@ -798,6 +799,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     legend(ui, "SLEEP", Work::Sleep);
                     legend(ui, "CLOSED", Work::Closed);
                     legend(ui, "GOAL", Work::Goal);
+                    legend(ui, "DELEGATED", Work::Delegated);
                     legend(ui, "WORKING", Work::Turn);
                     legend(ui, "INPUT", Work::Input);
                     legend(ui, "ERROR", Work::Error);
@@ -2873,7 +2875,7 @@ fn paint_work(painter: &egui::Painter, center: egui::Pos2, radius: f32, work: Wo
     }
     let color = work_color(work);
     match work {
-        Work::Goal | Work::Turn => {
+        Work::Goal | Work::Delegated | Work::Turn => {
             painter.circle_filled(center, radius, color);
         }
         Work::Error | Work::Input | Work::Sleep | Work::Done => {
@@ -2932,6 +2934,7 @@ const fn work_color(work: Work) -> Color32 {
         Work::Error => RED,
         Work::Input => ORANGE,
         Work::Goal => VIOLET,
+        Work::Delegated => BLUE,
         Work::Turn => GREEN,
         Work::Sleep => ASH,
         Work::Done => WHITE,
@@ -2976,6 +2979,7 @@ mod tests {
     #[test]
     fn work_palette_is_exact() {
         assert_eq!(work_color(Work::Turn), GREEN);
+        assert_eq!(work_color(Work::Delegated), BLUE);
         assert_eq!(work_color(Work::Goal), VIOLET);
         assert_eq!(work_color(Work::Input), ORANGE);
         assert_eq!(work_color(Work::Error), RED);
@@ -3027,6 +3031,7 @@ mod tests {
         assert!(!dismissible(Harness::Codex, Work::Error));
         assert!(!dismissible(Harness::Codex, Work::Input));
         assert!(!dismissible(Harness::Codex, Work::Goal));
+        assert!(!dismissible(Harness::Codex, Work::Delegated));
         assert!(!dismissible(Harness::Codex, Work::Turn));
         assert!(!dismissible(Harness::ClaudeCode, Work::Done));
         assert!(!dismissible(Harness::PrimeAgent, Work::Sleep));

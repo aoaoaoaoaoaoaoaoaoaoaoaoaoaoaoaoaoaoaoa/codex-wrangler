@@ -69,9 +69,10 @@ const fn rank(work: Work) -> u8 {
         Work::Error => 0,
         Work::Input => 1,
         Work::Goal => 2,
-        Work::Turn => 3,
-        Work::Sleep | Work::Done => 4,
-        Work::Closed => 5,
+        Work::Delegated => 3,
+        Work::Turn => 4,
+        Work::Sleep | Work::Done => 5,
+        Work::Closed => 6,
     }
 }
 

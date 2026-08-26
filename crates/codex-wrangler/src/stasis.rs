@@ -406,7 +406,10 @@ impl<D: Glacier> Drop for Dominion<D> {
 }
 
 const fn freeze_veto(work: Work) -> bool {
-    matches!(work, Work::Error | Work::Input | Work::Goal | Work::Turn)
+    matches!(
+        work,
+        Work::Error | Work::Input | Work::Goal | Work::Delegated | Work::Turn
+    )
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -941,7 +944,13 @@ mod tests {
     #[test]
     fn every_active_or_attention_state_is_an_absolute_freeze_veto() {
         let epoch = Instant::now();
-        for work in [Work::Error, Work::Input, Work::Goal, Work::Turn] {
+        for work in [
+            Work::Error,
+            Work::Input,
+            Work::Goal,
+            Work::Delegated,
+            Work::Turn,
+        ] {
             let mut dominion = Dominion::new(Mock::default());
             dominion.observe(epoch, None, &quarry(work));
             dominion.freeze_due(epoch + IDLE_GRACE);

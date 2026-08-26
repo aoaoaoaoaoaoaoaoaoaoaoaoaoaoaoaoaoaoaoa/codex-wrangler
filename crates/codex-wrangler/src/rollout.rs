@@ -15,6 +15,7 @@ const ACCOUNT_HORIZON: u64 = 4 << 20;
 const INPUT_REQUEST: &[u8] = b"\"name\":\"request_user_input\"";
 const CALL_OUTPUT: &[u8] = b"\"type\":\"function_call_output\"";
 const CALL_ID: &[u8] = b"\"call_id\":\"";
+const WIRE_PEER: &str = "wire-peer/";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TurnState {
@@ -29,6 +30,7 @@ pub enum TurnState {
 struct Pulse {
     state: TurnState,
     input_call: Option<String>,
+    delegated_turn: bool,
     preview: String,
     account: Option<AccountMark>,
 }
@@ -66,20 +68,26 @@ impl Pulse {
             Some("task_started" | "turn_started") => {
                 self.state = TurnState::Running;
                 self.input_call = None;
+                self.delegated_turn = false;
             }
             Some(kind @ ("task_complete" | "turn_complete" | "turn_aborted")) => {
                 self.state = completion_state(kind, payload);
                 self.input_call = None;
+                self.delegated_turn = false;
                 if let Some(message) = payload.get("last_agent_message").and_then(Value::as_str) {
                     assign_preview(&mut self.preview, message);
                 }
             }
             Some("user_message" | "agent_message" | "item_completed") => {
+                if let Some(delegated) = delegated_user_message(payload) {
+                    self.delegated_turn = delegated;
+                }
                 absorb_preview(&mut self.preview, payload);
             }
             Some(kind) if unknown_transition(kind) => {
                 self.state = TurnState::Unknown;
                 self.input_call = None;
+                self.delegated_turn = false;
             }
             _ => {}
         }
@@ -114,6 +122,23 @@ fn absorb_item_preview(slot: &mut String, item: &Value) -> bool {
             assigned
         }
         _ => false,
+    }
+}
+
+fn delegated_user_message(payload: &Value) -> Option<bool> {
+    match payload.get("type").and_then(Value::as_str) {
+        Some("user_message") => Some(false),
+        Some("item_completed")
+            if payload["item"].get("type").and_then(Value::as_str) == Some("UserMessage") =>
+        {
+            Some(
+                payload["item"]
+                    .get("client_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|client| client.starts_with(WIRE_PEER)),
+            )
+        }
+        _ => None,
     }
 }
 
@@ -185,6 +210,7 @@ pub struct RolloutSummary {
     pub preview: String,
     pub state: TurnState,
     pub waiting_for_input: bool,
+    pub delegated_turn: bool,
     pub account: Option<AccountMark>,
 }
 
@@ -197,6 +223,7 @@ impl RolloutSummary {
             preview: String::new(),
             state: TurnState::Done,
             waiting_for_input: false,
+            delegated_turn: false,
             account: None,
         }
     }
@@ -218,6 +245,7 @@ impl Rollouts {
             preview: pulse.preview.clone(),
             state: pulse.state,
             waiting_for_input: pulse.input_call.is_some(),
+            delegated_turn: pulse.delegated_turn,
             account: pulse.account.clone(),
         };
         let _prior = self.memo.insert(path.to_owned(), Memo { length, pulse });
@@ -234,21 +262,46 @@ fn absorb_suffix(path: &Path, offset: u64, pulse: &mut Pulse) -> std::io::Result
     Ok(())
 }
 
+#[derive(Default)]
+struct ReverseFrontier(u8);
+
+impl ReverseFrontier {
+    const ACCOUNT: u8 = 1 << 0;
+    const DELEGATION: u8 = 1 << 1;
+    const INPUT_CALL: u8 = 1 << 2;
+    const PREVIEW: u8 = 1 << 3;
+    const WORK: u8 = 1 << 4;
+
+    const fn has(&self, finding: u8) -> bool {
+        self.0 & finding != 0
+    }
+
+    fn mark(&mut self, finding: u8) {
+        self.0 |= finding;
+    }
+
+    const fn resolved(&self, account_horizon_exhausted: bool) -> bool {
+        self.has(Self::WORK)
+            && self.has(Self::PREVIEW)
+            && self.has(Self::DELEGATION)
+            && (self.has(Self::ACCOUNT) || account_horizon_exhausted)
+    }
+
+    const fn fully_resolved(&self) -> bool {
+        self.resolved(false)
+    }
+}
+
 fn scan_reverse(path: &Path, length: u64) -> std::io::Result<Pulse> {
     let mut file = File::open(path)?;
     let mut cursor = length;
     let mut suffix = Vec::new();
     let mut newest = Pulse::default();
-    let mut found_work = false;
-    let mut found_preview = false;
-    let mut found_input_call = false;
-    let mut found_account = false;
+    let mut frontier = ReverseFrontier::default();
     let mut account_horizon_exhausted = false;
     let mut resolved_calls = HashSet::new();
 
-    while cursor > 0
-        && !(found_work && found_preview && (found_account || account_horizon_exhausted))
-    {
+    while cursor > 0 && !frontier.resolved(account_horizon_exhausted) {
         let start = cursor.saturating_sub(BLOCK as u64);
         let span = usize::try_from(cursor - start).unwrap_or(BLOCK);
         let mut bytes = vec![0; span];
@@ -263,16 +316,8 @@ fn scan_reverse(path: &Path, length: u64) -> std::io::Result<Pulse> {
             first_break.map_or(bytes.len(), |index| index + 1)
         };
         for line in bytes[complete_from..].split(|byte| *byte == b'\n').rev() {
-            inspect_reverse(
-                line,
-                &mut newest,
-                &mut found_work,
-                &mut found_preview,
-                &mut found_input_call,
-                &mut found_account,
-                &mut resolved_calls,
-            );
-            if found_work && found_preview && found_account {
+            inspect_reverse(line, &mut newest, &mut frontier, &mut resolved_calls);
+            if frontier.fully_resolved() {
                 break;
             }
         }
@@ -286,10 +331,7 @@ fn scan_reverse(path: &Path, length: u64) -> std::io::Result<Pulse> {
 fn inspect_reverse(
     line: &[u8],
     newest: &mut Pulse,
-    found_work: &mut bool,
-    found_preview: &mut bool,
-    found_input_call: &mut bool,
-    found_account: &mut bool,
+    frontier: &mut ReverseFrontier,
     resolved_calls: &mut HashSet<String>,
 ) {
     if memmem::find(line, CALL_OUTPUT).is_some() {
@@ -298,13 +340,13 @@ fn inspect_reverse(
         }
         return;
     }
-    if !*found_input_call && memmem::find(line, INPUT_REQUEST).is_some() {
+    if !frontier.has(ReverseFrontier::INPUT_CALL) && memmem::find(line, INPUT_REQUEST).is_some() {
         if let Some(call) = call_id(line)
             && !resolved_calls.contains(call)
         {
             newest.input_call = Some(call.to_owned());
         }
-        *found_input_call = true;
+        frontier.mark(ReverseFrontier::INPUT_CALL);
         return;
     }
     if !interesting(line) {
@@ -318,37 +360,50 @@ fn inspect_reverse(
     }
     let payload = &event["payload"];
     match payload.get("type").and_then(Value::as_str) {
-        Some("token_count") if !*found_account => {
+        Some("token_count") if !frontier.has(ReverseFrontier::ACCOUNT) => {
             newest.account = payload
                 .get("rate_limits")
                 .and_then(quota)
                 .map(AccountMark::quota);
-            *found_account = true;
+            frontier.mark(ReverseFrontier::ACCOUNT);
         }
-        Some("task_started" | "turn_started") if !*found_work => {
+        Some("task_started" | "turn_started") if !frontier.has(ReverseFrontier::WORK) => {
             newest.state = TurnState::Running;
-            *found_work = true;
-            *found_input_call = true;
+            frontier.mark(ReverseFrontier::WORK | ReverseFrontier::INPUT_CALL);
         }
-        Some(kind @ ("task_complete" | "turn_complete" | "turn_aborted")) if !*found_work => {
+        Some(kind @ ("task_complete" | "turn_complete" | "turn_aborted"))
+            if !frontier.has(ReverseFrontier::WORK) =>
+        {
             newest.state = completion_state(kind, payload);
-            *found_work = true;
-            *found_input_call = true;
-            if !*found_preview
+            frontier.mark(
+                ReverseFrontier::WORK | ReverseFrontier::INPUT_CALL | ReverseFrontier::DELEGATION,
+            );
+            if !frontier.has(ReverseFrontier::PREVIEW)
                 && let Some(message) = payload.get("last_agent_message").and_then(Value::as_str)
                 && !message.trim().is_empty()
             {
                 assign_preview(&mut newest.preview, message);
-                *found_preview = true;
+                frontier.mark(ReverseFrontier::PREVIEW);
             }
         }
-        Some("user_message" | "agent_message" | "item_completed") if !*found_preview => {
-            *found_preview = absorb_preview(&mut newest.preview, payload);
+        Some("user_message" | "agent_message" | "item_completed") => {
+            if !frontier.has(ReverseFrontier::DELEGATION)
+                && let Some(delegated) = delegated_user_message(payload)
+            {
+                newest.delegated_turn = delegated;
+                frontier.mark(ReverseFrontier::DELEGATION);
+            }
+            if !frontier.has(ReverseFrontier::PREVIEW)
+                && absorb_preview(&mut newest.preview, payload)
+            {
+                frontier.mark(ReverseFrontier::PREVIEW);
+            }
         }
-        Some(kind) if !*found_work && unknown_transition(kind) => {
+        Some(kind) if !frontier.has(ReverseFrontier::WORK) && unknown_transition(kind) => {
             newest.state = TurnState::Unknown;
-            *found_work = true;
-            *found_input_call = true;
+            frontier.mark(
+                ReverseFrontier::WORK | ReverseFrontier::INPUT_CALL | ReverseFrontier::DELEGATION,
+            );
         }
         _ => {}
     }
@@ -441,6 +496,54 @@ mod tests {
         assert_eq!(cold.state, TurnState::Error);
         assert!(!cold.waiting_for_input);
         assert_eq!(cold.preview, "final fragment");
+    }
+
+    #[test]
+    fn delegated_provenance_survives_cold_preview_and_incremental_replacement() {
+        let mut file = fixture(&[r#"{"type":"event_msg","payload":{"type":"task_started"}}"#]);
+        let mut rollouts = Rollouts::default();
+        assert!(
+            !rollouts
+                .read(file.path())
+                .expect("turn before delegated message")
+                .delegated_turn
+        );
+        file.write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"client_id\":\"wire-peer/post-1\",\"content\":[{\"type\":\"text\",\"text\":\"Wire advisory.\"}]}}}\n\
+              {\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"text\",\"text\":\"delegated progress\"}]}}}\n",
+        )
+        .expect("append delegated turn");
+        for summary in [
+            rollouts
+                .read(file.path())
+                .expect("incremental delegated turn"),
+            Rollouts::default()
+                .read(file.path())
+                .expect("cold delegated turn"),
+        ] {
+            assert_eq!(summary.state, TurnState::Running);
+            assert!(summary.delegated_turn);
+            assert_eq!(summary.preview, "delegated progress");
+        }
+
+        file.write_all(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n\
+              {\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n\
+              {\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"content\":[{\"type\":\"text\",\"text\":\"human turn\"}]}}}\n",
+        )
+        .expect("append ordinary turn");
+        for summary in [
+            rollouts
+                .read(file.path())
+                .expect("incremental ordinary turn"),
+            Rollouts::default()
+                .read(file.path())
+                .expect("cold ordinary turn"),
+        ] {
+            assert_eq!(summary.state, TurnState::Running);
+            assert!(!summary.delegated_turn);
+            assert_eq!(summary.preview, "human turn");
+        }
     }
 
     #[test]
