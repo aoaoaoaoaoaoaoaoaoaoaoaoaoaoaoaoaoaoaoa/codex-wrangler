@@ -8,6 +8,7 @@ Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=1h
 UMask=0077
+Environment=PATH=%h/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin
 
 [Install]
 WantedBy=default.target
