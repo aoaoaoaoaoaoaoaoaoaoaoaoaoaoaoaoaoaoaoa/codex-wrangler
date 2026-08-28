@@ -38,6 +38,7 @@ use crate::{
         TILE_GUIDE_GROUP, canon,
     },
     configuration::Configuration,
+    fleet::{FleetSnapshot, FleetWorker},
     history::{
         HistorySnapshot, HistoryWorker, Order as HistoryOrder, Session as HistorySession,
         Turn as HistoryTurn, spawn as spawn_history,
@@ -47,6 +48,7 @@ use crate::{
     posture::{Ledger, Posture},
     recon::{Intent, LiveWorker, Strike, spawn},
     search::{HistoryHit, HistorySearch, Hit, Search},
+    site::{SessionKey, Site},
     tray::{Signal as TraySignal, Tray},
 };
 
@@ -60,6 +62,14 @@ const ORANGE: Color32 = Color32::from_rgb(235, 158, 74);
 const RED: Color32 = Color32::from_rgb(236, 91, 91);
 const WHITE: Color32 = Color32::from_rgb(238, 234, 224);
 const ASH: Color32 = Color32::from_rgb(174, 172, 166);
+const SITE_PALETTE: [Color32; 6] = [
+    Color32::from_rgb(71, 201, 222),
+    Color32::from_rgb(235, 121, 187),
+    Color32::from_rgb(224, 190, 71),
+    Color32::from_rgb(126, 207, 103),
+    Color32::from_rgb(151, 127, 232),
+    Color32::from_rgb(235, 126, 84),
+];
 const TYPE_LIFT: f32 = 1.0;
 const SUMMON_BARRAGE: u8 = 12;
 const LONGINUS_FREQUENCY_HZ: f32 = 0.66;
@@ -82,7 +92,7 @@ const CONFIRM_DELETION: SettingSpec = SettingSpec::new(
     "Require confirmation before permanently deleting a historical session.",
 );
 
-type JoltLedger = HashMap<Harness, HashMap<String, Vec2>>;
+type JoltLedger = HashMap<(Site, Harness), HashMap<String, Vec2>>;
 
 struct CardPhysics<'a> {
     tool: TileTool,
@@ -158,28 +168,28 @@ impl Page {
 }
 
 struct HistoryGesture {
-    thread: String,
+    key: SessionKey,
     operation: HistoryOperation,
 }
 
 enum HistoryAction {
-    Inspect(String),
-    Open(String),
+    Inspect(SessionKey),
+    Open(SessionKey),
     Operate(HistoryGesture),
     BeginRename {
-        thread: String,
+        key: SessionKey,
         name: String,
         rect: egui::Rect,
     },
     CommitRename {
-        thread: String,
+        key: SessionKey,
         name: String,
     },
     CancelRename,
 }
 
 struct HistoryRename {
-    thread: String,
+    key: SessionKey,
     text: String,
     seize_focus: bool,
 }
@@ -224,14 +234,14 @@ impl HistoryLease {
         }
     }
 
-    fn settled(&self, thread: &str, snapshot: &HistorySnapshot) -> bool {
+    fn settled(&self, key: &SessionKey, snapshot: &HistorySnapshot) -> bool {
         if self.phase != HistoryPhase::Acknowledged {
             return false;
         }
         let session = snapshot
             .sessions
             .iter()
-            .find(|session| session.thread == thread);
+            .find(|session| session.key() == *key);
         match &self.effect {
             HistoryEffect::Archived(archived) => {
                 session.is_some_and(|session| session.archived == *archived)
@@ -245,7 +255,7 @@ impl HistoryLease {
 }
 
 struct TranscriptView {
-    thread: String,
+    key: SessionKey,
     name: Option<String>,
     state: TranscriptState,
 }
@@ -288,6 +298,11 @@ struct Wrangler<const START_FLOATING: bool> {
     living_wait: LivingWait,
     live_worker: LiveWorker,
     history_worker: HistoryWorker,
+    fleet_worker: FleetWorker,
+    remote_sites: Vec<crate::site::RemoteSite>,
+    local_live_snapshot: Option<LiveSnapshot>,
+    local_history_snapshot: Option<HistorySnapshot>,
+    fleet_snapshot: Option<FleetSnapshot>,
     live_snapshot: Option<LiveSnapshot>,
     history_snapshot: Option<HistorySnapshot>,
     live_snapshot_label: String,
@@ -299,17 +314,17 @@ struct Wrangler<const START_FLOATING: bool> {
     pending_activation: Option<ActivationFlight>,
     quit: Arc<AtomicBool>,
     hovered: Option<usize>,
-    history_hovered: Option<String>,
+    history_hovered: Option<SessionKey>,
     search_focus: SearchFocus,
     tile_tool: TileTool,
     jolts: JoltLedger,
     search: Search,
     history_search: HistorySearch,
-    history_requested: HashSet<(String, i64)>,
-    history_pending: HashMap<String, HistoryLease>,
+    history_requested: HashSet<(SessionKey, i64)>,
+    history_pending: HashMap<SessionKey, HistoryLease>,
     history_error: Option<String>,
     history_rename: Option<HistoryRename>,
-    delete_target: Option<String>,
+    delete_target: Option<SessionKey>,
     transcript: Option<TranscriptView>,
     page: Page,
     configuration: Configuration,
@@ -344,8 +359,12 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     fn raise(ctx: &egui::Context, incumbent: Incumbent, ledger: Ledger) -> anyhow::Result<Self> {
         lift_typography(ctx);
         let wake = NativeWake::from_context(ctx);
+        let configuration = Configuration::raise(ctx)?;
+        let remote_sites = configuration.remotes();
         let live_worker = spawn(wake.clone());
         let history_worker = spawn_history(wake.clone());
+        let fleet_worker = FleetWorker::spawn(wake.clone(), remote_sites.clone());
+        let resident = incumbent.resident();
         let summon = Arc::new(AtomicU64::new(pack_summon(1, incumbent.launch_desktop())));
         let tray_summon = Arc::clone(&summon);
         let quit = Arc::new(AtomicBool::new(false));
@@ -377,20 +396,24 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         .ok();
         let water = Surface::new(Wetness::Wet);
         let resting_ior_spread = water.chemistry().ior_spread;
-        let configuration = Configuration::raise(ctx)?;
         Ok(Self {
             water,
             resting_ior_spread,
             living_wait: LivingWait::default(),
             live_worker,
             history_worker,
+            fleet_worker,
+            remote_sites,
+            local_live_snapshot: None,
+            local_history_snapshot: None,
+            fleet_snapshot: None,
             live_snapshot: None,
             history_snapshot: None,
             live_snapshot_label: "DISCOVERING MANUAL THREADS".to_owned(),
             first_frame_presented: false,
             summon,
-            summon_generation: 0,
-            summon_attempts: Some(0),
+            summon_generation: u32::from(resident),
+            summon_attempts: (!resident).then_some(0),
             posture: Posture::from_floating(START_FLOATING),
             pending_activation: None,
             quit,
@@ -413,7 +436,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             guide: CommandGuide::default(),
             window_focused: None,
             configuration_fault_seen: None,
-            visibility: GalleryVisibility::Visible,
+            visibility: if resident {
+                GalleryVisibility::ConcealPending
+            } else {
+                GalleryVisibility::Visible
+            },
             ledger,
             tray,
         })
@@ -443,7 +470,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         {
             return;
         }
-        let Some(activation) = self.live_worker.take_activation() else {
+        let Some(activation) = self
+            .live_worker
+            .take_activation()
+            .or_else(|| self.fleet_worker.take_activation())
+        else {
             return;
         };
         if self
@@ -484,49 +515,85 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let Some(snapshot) = self.live_worker.take_snapshot() else {
             return false;
         };
-        self.search.reconcile(&snapshot.cards);
-        self.live_snapshot_label = self.search.label().to_owned();
-        self.live_snapshot = Some(snapshot);
-        self.reconcile_history_search();
+        self.local_live_snapshot = Some(snapshot);
+        self.rebuild_snapshots();
         true
     }
 
     fn drain_history(&mut self) -> bool {
         if let Some(snapshot) = self.history_worker.take_snapshot() {
             self.history_pending
-                .retain(|thread, lease| !lease.settled(thread, &snapshot));
-            self.history_snapshot = Some(snapshot);
-            self.reconcile_history_search();
+                .retain(|key, lease| !lease.settled(key, &snapshot));
+            self.local_history_snapshot = Some(snapshot);
+            self.rebuild_snapshots();
             return true;
         }
         false
+    }
+
+    fn drain_fleet(&mut self) -> bool {
+        let Some(snapshot) = self.fleet_worker.take_snapshot() else {
+            return false;
+        };
+        self.fleet_snapshot = Some(snapshot);
+        self.rebuild_snapshots();
+        true
+    }
+
+    fn rebuild_snapshots(&mut self) {
+        self.live_snapshot = self.local_live_snapshot.clone().map(|mut local| {
+            if let Some(fleet) = &self.fleet_snapshot {
+                local.cards.extend(fleet.cards.clone());
+                local.cards.sort();
+            }
+            local
+        });
+        self.history_snapshot = self.local_history_snapshot.clone().map(|mut local| {
+            if let Some(fleet) = &self.fleet_snapshot {
+                local.sessions.extend(fleet.sessions.clone());
+                local.sessions.sort_unstable_by(|left, right| {
+                    right
+                        .updated_at_ms
+                        .cmp(&left.updated_at_ms)
+                        .then_with(|| left.site.cmp(&right.site))
+                        .then_with(|| left.thread.cmp(&right.thread))
+                });
+            }
+            local
+        });
+        if let Some(snapshot) = &self.live_snapshot {
+            self.search.reconcile(&snapshot.cards);
+            self.live_snapshot_label = self.search.label().to_owned();
+        }
+        self.reconcile_history_search();
     }
 
     fn reap_history_outcomes(&mut self) -> bool {
         let mut changed = false;
         for outcome in self.history_worker.take_outcomes() {
             let thread = outcome.order.thread();
+            let key = SessionKey::new(Site::Local, thread.clone());
             let operation = outcome.order.operation();
             if let Some(error) = outcome.error {
-                let _prior = self.history_pending.remove(thread);
+                let _prior = self.history_pending.remove(&key);
                 self.history_error = Some(format!(
                     "{} {} FAILED · {error}",
                     operation.present_participle(),
                     outcome.order.thread()
                 ));
             } else {
-                let snapshot = self.history_snapshot.as_ref();
-                let settled = self.history_pending.get_mut(thread).is_some_and(|lease| {
+                let snapshot = self.local_history_snapshot.as_ref();
+                let settled = self.history_pending.get_mut(&key).is_some_and(|lease| {
                     assert_eq!(
                         lease.operation(),
                         operation,
                         "history outcome crossed its resource lease"
                     );
                     lease.phase = HistoryPhase::Acknowledged;
-                    snapshot.is_some_and(|snapshot| lease.settled(thread, snapshot))
+                    snapshot.is_some_and(|snapshot| lease.settled(&key, snapshot))
                 });
                 if settled {
-                    let _prior = self.history_pending.remove(thread);
+                    let _prior = self.history_pending.remove(&key);
                 }
                 self.history_error = None;
             }
@@ -541,7 +608,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             let Some(view) = self
                 .transcript
                 .as_mut()
-                .filter(|view| view.thread == outcome.thread)
+                .filter(|view| view.key.site.local() && view.key.thread == outcome.thread)
             else {
                 continue;
             };
@@ -794,6 +861,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.close_preference(ui);
                 ui.add_space(8.0);
+                fleet_legend(ui, self.fleet_snapshot.as_ref());
                 if self.page == Page::Live {
                     legend(ui, "DONE", Work::Done);
                     legend(ui, "SLEEP", Work::Sleep);
@@ -877,6 +945,28 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         });
     }
 
+    fn site_faults(&self, ui: &mut egui::Ui) {
+        let faults = self
+            .fleet_snapshot
+            .iter()
+            .flat_map(|fleet| &fleet.sites)
+            .filter_map(|status| {
+                status
+                    .fault
+                    .as_deref()
+                    .map(|fault| format!("{} · {fault}", status.site))
+            })
+            .collect::<Vec<_>>();
+        if !faults.is_empty() {
+            ui.add_space(7.0);
+            let _fault = ui.add(
+                egui::Label::new(RichText::new(faults.join("\n")).size(12.0).color(RED))
+                    .wrap()
+                    .show_tooltip_when_elided(false),
+            );
+        }
+    }
+
     fn settings_sheet(&mut self, ctx: &egui::Context) {
         let path = self.configuration.path().to_owned();
         let fault = self
@@ -912,6 +1002,17 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn reconcile_configuration(&mut self, ui: &egui::Ui) -> bool {
         let mut changed = self.configuration.absorb();
+        if self.configuration.fault().is_none() {
+            let remotes = self.configuration.remotes();
+            if remotes != self.remote_sites {
+                self.fleet_worker =
+                    FleetWorker::spawn(NativeWake::from_context(ui.ctx()), remotes.clone());
+                self.remote_sites = remotes;
+                self.fleet_snapshot = None;
+                self.rebuild_snapshots();
+                changed = true;
+            }
+        }
         let fault = self
             .configuration
             .fault()
@@ -952,6 +1053,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             )
             .show(ui, |ui| {
                 self.header(ui);
+                self.site_faults(ui);
                 if self.search_focus.editing() {
                     ui.add_space(7.0);
                     self.search_field(ui, search_id);
@@ -1020,6 +1122,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             )
             .show(ui, |ui| {
                 self.header(ui);
+                self.site_faults(ui);
                 if self.search_focus.editing() {
                     ui.add_space(7.0);
                     self.search_field(ui, search_id);
@@ -1098,26 +1201,30 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         (action, panel.inner)
     }
 
-    fn request_history_tallies(&mut self, tally: Vec<String>) {
+    fn request_history_tallies(&mut self, tally: Vec<SessionKey>) {
         let stamps = self
             .history_snapshot
             .iter()
             .flat_map(|history| &history.sessions)
-            .map(|session| (session.thread.as_str(), session.updated_at_ms))
+            .map(|session| (session.key(), session.updated_at_ms))
             .collect::<HashMap<_, _>>();
         let novel = tally
             .into_iter()
-            .filter(|thread| {
-                stamps.get(thread.as_str()).is_some_and(|updated_at_ms| {
-                    self.history_requested
-                        .insert((thread.clone(), *updated_at_ms))
+            .filter(|key| key.site.local())
+            .filter(|key| {
+                stamps.get(key).is_some_and(|updated_at_ms| {
+                    self.history_requested.insert((key.clone(), *updated_at_ms))
                 })
             })
             .collect::<Vec<_>>();
-        if !novel.is_empty() && self.history_worker.courier().tally(novel.clone()).is_err() {
-            for thread in novel {
-                if let Some(updated_at_ms) = stamps.get(thread.as_str()) {
-                    let _removed = self.history_requested.remove(&(thread, *updated_at_ms));
+        let threads = novel
+            .iter()
+            .map(|key| key.thread.clone())
+            .collect::<Vec<_>>();
+        if !threads.is_empty() && self.history_worker.courier().tally(threads).is_err() {
+            for key in novel {
+                if let Some(updated_at_ms) = stamps.get(&key) {
+                    let _removed = self.history_requested.remove(&(key, *updated_at_ms));
                 }
             }
         }
@@ -1153,17 +1260,18 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn submit_history(&mut self, order: HistoryOrder) {
         let thread = order.thread().clone();
-        if self.history_pending.contains_key(&thread) {
+        let key = SessionKey::new(Site::Local, thread.clone());
+        if self.history_pending.contains_key(&key) {
             return;
         }
         let lease = HistoryLease::claim(&order);
         let operation = lease.operation();
-        let prior = self.history_pending.insert(thread.clone(), lease);
+        let prior = self.history_pending.insert(key.clone(), lease);
         assert!(prior.is_none(), "history resource admitted two leases");
         if self.history_worker.courier().order(order).is_ok() {
             self.history_error = None;
         } else {
-            let _lease = self.history_pending.remove(&thread);
+            let _lease = self.history_pending.remove(&key);
             self.history_error = Some(format!(
                 "{} {thread} FAILED · history worker is unavailable",
                 operation.present_participle()
@@ -1177,31 +1285,41 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         }
         self.summon_attempts = None;
         self.sight_posture();
-        if self.live_worker.strike.try_send(strike.clone()).is_ok() {
+        let sent = if strike.site.local() {
+            self.live_worker.strike.try_send(strike.clone()).is_ok()
+        } else {
+            self.fleet_worker.strike.try_send(strike.clone()).is_ok()
+        };
+        if sent {
             self.pending_activation = Some(ActivationFlight::launch(strike));
         }
     }
 
     fn accept_history_action(&mut self, action: HistoryAction) {
         match action {
-            HistoryAction::Inspect(thread) => self.request_transcript(thread),
-            HistoryAction::Open(thread) => self.launch_strike(Strike {
+            HistoryAction::Inspect(key) => self.request_transcript(key),
+            HistoryAction::Open(key) => self.launch_strike(Strike {
+                site: key.site,
                 harness: Harness::Codex,
-                thread,
+                thread: key.thread,
                 intent: Intent::Open,
             }),
             HistoryAction::Operate(gesture) => self.accept_history_gesture(gesture),
-            HistoryAction::BeginRename { thread, name, rect } => {
+            HistoryAction::BeginRename { key, name, rect } => {
                 self.history_rename = Some(HistoryRename {
-                    thread,
+                    key,
                     text: name,
                     seize_focus: true,
                 });
                 self.water.click(rect);
             }
-            HistoryAction::CommitRename { thread, name } => {
+            HistoryAction::CommitRename { key, name } => {
                 self.history_rename = None;
-                self.submit_history(HistoryOrder::rename(thread, name));
+                assert!(
+                    key.site.local(),
+                    "remote history rename reached local worker"
+                );
+                self.submit_history(HistoryOrder::rename(key.thread, name));
             }
             HistoryAction::CancelRename => self.history_rename = None,
         }
@@ -1209,26 +1327,37 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn accept_history_gesture(&mut self, gesture: HistoryGesture) {
         if gesture.operation == HistoryOperation::Delete && self.configuration.confirm_deletion() {
-            self.delete_target = Some(gesture.thread);
+            self.delete_target = Some(gesture.key);
         } else {
-            self.submit_history(HistoryOrder::operate(gesture.thread, gesture.operation));
+            assert!(
+                gesture.key.site.local(),
+                "remote history operation reached local worker"
+            );
+            self.submit_history(HistoryOrder::operate(gesture.key.thread, gesture.operation));
         }
     }
 
-    fn request_transcript(&mut self, thread: String) {
+    fn request_transcript(&mut self, key: SessionKey) {
+        if !key.site.local() {
+            return;
+        }
         let name = self.history_snapshot.as_ref().and_then(|history| {
             history
                 .sessions
                 .iter()
-                .find(|session| session.thread == thread)
+                .find(|session| session.key() == key)
                 .and_then(|session| session.name.clone())
         });
         self.transcript = Some(TranscriptView {
-            thread: thread.clone(),
+            key: key.clone(),
             name,
             state: TranscriptState::Loading,
         });
-        if self.history_worker.courier().transcript(thread).is_err()
+        if self
+            .history_worker
+            .courier()
+            .transcript(key.thread)
+            .is_err()
             && let Some(view) = &mut self.transcript
         {
             view.state = TranscriptState::Failed("history reader is unavailable".to_owned());
@@ -1251,63 +1380,12 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             .show(ctx, |ui| {
                 let width = 860.0_f32.min(ctx.content_rect().width() - 48.0);
                 ui.set_width(width);
-                let _top = ui.horizontal(|ui| {
-                    let (cursor, total) = match &view.state {
-                        TranscriptState::Ready { turns, cursor } => (*cursor, turns.len()),
-                        TranscriptState::Loading | TranscriptState::Failed(_) => (0, 0),
-                    };
-                    let previous = ui.add_enabled(
-                        cursor > 0,
-                        egui::Button::new(RichText::new("←").size(18.0))
-                            .min_size(Vec2::new(34.0, 28.0)),
-                    );
-                    chrome::shallow_tension(ui, &previous);
-                    brass_poolrooms::poolroom_anchor!(
-                        ui,
-                        HistoryTarget(&view.thread, "previous-turn").to_string(),
-                        previous.rect
-                    );
-                    let next = ui.add_enabled(
-                        cursor + 1 < total,
-                        egui::Button::new(RichText::new("→").size(18.0))
-                            .min_size(Vec2::new(34.0, 28.0)),
-                    );
-                    chrome::shallow_tension(ui, &next);
-                    brass_poolrooms::poolroom_anchor!(
-                        ui,
-                        HistoryTarget(&view.thread, "next-turn").to_string(),
-                        next.rect
-                    );
-                    if previous.clicked()
-                        && let TranscriptState::Ready { cursor, .. } = &mut view.state
-                    {
-                        *cursor -= 1;
-                        self.water.click(previous.rect);
-                    }
-                    if next.clicked()
-                        && let TranscriptState::Ready { cursor, .. } = &mut view.state
-                    {
-                        *cursor += 1;
-                        self.water.click(next.rect);
-                    }
-                    ui.add_space(8.0);
-                    let title = view.name.as_deref().unwrap_or("anonymous");
-                    let _title = ui.add(
-                        egui::Label::new(chrome::title(title.to_uppercase()))
-                            .truncate()
-                            .show_tooltip_when_elided(false),
-                    );
-                    let _position =
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let position = if total == 0 {
-                                "NO TURNS".to_owned()
-                            } else {
-                                format!("TURN {} / {total}", cursor + 1)
-                            };
-                            let _position = ui.label(chrome::muted(position).size(12.0));
-                        });
-                });
-                let _thread = ui.label(RichText::new(&view.thread).size(11.0).color(chrome::MUTED));
+                transcript_header(ui, &mut view, &mut self.water);
+                let _thread = ui.label(
+                    RichText::new(&view.key.thread)
+                        .size(11.0)
+                        .color(chrome::MUTED),
+                );
                 ui.add_space(12.0);
                 match &view.state {
                     TranscriptState::Loading => {
@@ -1347,7 +1425,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 history
                     .sessions
                     .iter()
-                    .find(|session| session.thread == thread)
+                    .find(|session| session.key() == thread)
             })
             .and_then(|session| session.name.as_deref())
             .unwrap_or("anonymous")
@@ -1370,7 +1448,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 let _title = ui.label(chrome::title("DELETE SESSION PERMANENTLY?"));
                 ui.add_space(9.0);
                 let _name = ui.label(RichText::new(name).color(chrome::TEXT));
-                let _thread = ui.label(RichText::new(&thread).size(11.0).color(chrome::MUTED));
+                let _thread = ui.label(
+                    RichText::new(&thread.thread)
+                        .size(11.0)
+                        .color(chrome::MUTED),
+                );
                 ui.add_space(10.0);
                 let _warning = ui.label(
                     RichText::new("The rollout and its Codex index record will be destroyed.")
@@ -1383,7 +1465,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     .show(ui);
                 brass_poolrooms::poolroom_anchor!(
                     ui,
-                    HistoryTarget(&thread, "confirm-future").to_string(),
+                    HistoryTarget(&thread.thread, "confirm-future").to_string(),
                     guard.rect
                 );
                 self.water.checkbox(&guard);
@@ -1404,7 +1486,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     chrome::shallow_tension(ui, &delete_button);
                     brass_poolrooms::poolroom_anchor!(
                         ui,
-                        HistoryTarget(&thread, "confirm-delete").to_string(),
+                        HistoryTarget(&thread.thread, "confirm-delete").to_string(),
                         delete_button.rect
                     );
                     delete |= delete_button.clicked();
@@ -1412,7 +1494,14 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             });
         if delete {
             self.delete_target = None;
-            self.submit_history(HistoryOrder::operate(thread, HistoryOperation::Delete));
+            assert!(
+                thread.site.local(),
+                "remote delete reached local confirmation"
+            );
+            self.submit_history(HistoryOrder::operate(
+                thread.thread,
+                HistoryOperation::Delete,
+            ));
         } else if cancel || modal.should_close() {
             self.delete_target = None;
         }
@@ -1476,7 +1565,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 }
             };
             HistoryTranscriptObservation {
-                thread: view.thread.clone(),
+                thread: view.key.thread.clone(),
                 cursor,
                 total,
                 user,
@@ -1491,7 +1580,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         self.history_rename
             .as_ref()
             .map(|rename| HistoryRenameObservation {
-                thread: rename.thread.clone(),
+                thread: rename.key.thread.clone(),
                 draft: rename.text.clone(),
                 focused,
             })
@@ -1534,35 +1623,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     #[cfg(feature = "egui-test")]
     fn observation(&self, text_edit_focused: bool) -> Observation {
         let live = live_codex_threads(self.live_snapshot.as_ref());
-        let history = live.as_ref().map_or_else(Vec::new, |live| {
-            self.history_snapshot
-                .iter()
-                .flat_map(|history| &history.sessions)
-                .filter(|session| !live.contains(&session.thread))
-                .map(|session| HistoryObservation {
-                    thread: session.thread.clone(),
-                    name: session.name.clone(),
-                    turns: session.turns,
-                    bytes: session.bytes,
-                    archived: session.archived,
-                    pending: self
-                        .history_pending
-                        .get(&session.thread)
-                        .map(HistoryLease::operation),
-                })
-                .collect()
-        });
-        let history_order = self
-            .history_snapshot
-            .as_ref()
-            .map_or_else(Vec::new, |history| {
-                self.history_search
-                    .hits()
-                    .iter()
-                    .filter_map(|hit| history.sessions.get(hit.session()))
-                    .map(|session| session.thread.clone())
-                    .collect()
-            });
+        let history = self.history_observations(live.as_ref());
+        let history_order = self.history_order_observation();
         Observation {
             fingerprint: UI_FINGERPRINT.to_owned(),
             summoning: self.summon_attempts.is_some(),
@@ -1606,7 +1668,10 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             } else {
                 ClosePreference::Exit
             },
-            delete_prompt: self.delete_target.clone(),
+            delete_prompt: self
+                .delete_target
+                .as_ref()
+                .map(|target| target.thread.clone()),
             visible: self
                 .live_snapshot
                 .iter()
@@ -1632,6 +1697,42 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 .map(|(column, direction)| HistorySortObservation { column, direction })
                 .collect(),
         }
+    }
+
+    #[cfg(feature = "egui-test")]
+    fn history_observations(&self, live: Option<&HashSet<SessionKey>>) -> Vec<HistoryObservation> {
+        live.map_or_else(Vec::new, |live| {
+            self.history_snapshot
+                .iter()
+                .flat_map(|history| &history.sessions)
+                .filter(|session| !live.contains(&session.key()))
+                .map(|session| HistoryObservation {
+                    thread: session.thread.clone(),
+                    name: session.name.clone(),
+                    turns: session.turns,
+                    bytes: session.bytes,
+                    archived: session.archived,
+                    pending: self
+                        .history_pending
+                        .get(&session.key())
+                        .map(HistoryLease::operation),
+                })
+                .collect()
+        })
+    }
+
+    #[cfg(feature = "egui-test")]
+    fn history_order_observation(&self) -> Vec<String> {
+        self.history_snapshot
+            .as_ref()
+            .map_or_else(Vec::new, |history| {
+                self.history_search
+                    .hits()
+                    .iter()
+                    .filter_map(|hit| history.sessions.get(hit.session()))
+                    .map(|session| session.thread.clone())
+                    .collect()
+            })
     }
 }
 
@@ -1745,6 +1846,7 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
         {
             changed |= self.drain();
             changed |= self.drain_history();
+            changed |= self.drain_fleet();
         }
         if changed {
             ui.ctx().request_repaint();
@@ -1867,14 +1969,14 @@ impl From<Page> for Tab {
     }
 }
 
-fn live_codex_threads(snapshot: Option<&LiveSnapshot>) -> Option<HashSet<String>> {
+fn live_codex_threads(snapshot: Option<&LiveSnapshot>) -> Option<HashSet<SessionKey>> {
     let snapshot = snapshot.filter(|snapshot| snapshot.fault.is_none())?;
     Some(
         snapshot
             .cards
             .iter()
             .filter(|card| card.harness == Harness::Codex)
-            .map(|card| card.thread.clone())
+            .map(|card| SessionKey::new(card.site.clone(), card.thread.clone()))
             .collect(),
     )
 }
@@ -1905,6 +2007,62 @@ fn set_tool_cursor(ctx: &egui::Context, modifiers: egui::Modifiers) {
         Some(ForgePin::cursor_image())
     } else {
         None
+    });
+}
+
+fn transcript_header(ui: &mut egui::Ui, view: &mut TranscriptView, water: &mut Surface) {
+    let _top = ui.horizontal(|ui| {
+        let (cursor, total) = match &view.state {
+            TranscriptState::Ready { turns, cursor } => (*cursor, turns.len()),
+            TranscriptState::Loading | TranscriptState::Failed(_) => (0, 0),
+        };
+        let previous = ui.add_enabled(
+            cursor > 0,
+            egui::Button::new(RichText::new("←").size(18.0)).min_size(Vec2::new(34.0, 28.0)),
+        );
+        chrome::shallow_tension(ui, &previous);
+        brass_poolrooms::poolroom_anchor!(
+            ui,
+            HistoryTarget(&view.key.thread, "previous-turn").to_string(),
+            previous.rect
+        );
+        let next = ui.add_enabled(
+            cursor + 1 < total,
+            egui::Button::new(RichText::new("→").size(18.0)).min_size(Vec2::new(34.0, 28.0)),
+        );
+        chrome::shallow_tension(ui, &next);
+        brass_poolrooms::poolroom_anchor!(
+            ui,
+            HistoryTarget(&view.key.thread, "next-turn").to_string(),
+            next.rect
+        );
+        if previous.clicked()
+            && let TranscriptState::Ready { cursor, .. } = &mut view.state
+        {
+            *cursor -= 1;
+            water.click(previous.rect);
+        }
+        if next.clicked()
+            && let TranscriptState::Ready { cursor, .. } = &mut view.state
+        {
+            *cursor += 1;
+            water.click(next.rect);
+        }
+        ui.add_space(8.0);
+        let title = view.name.as_deref().unwrap_or("anonymous");
+        let _title = ui.add(
+            egui::Label::new(chrome::title(title.to_uppercase()))
+                .truncate()
+                .show_tooltip_when_elided(false),
+        );
+        let _position = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let position = if total == 0 {
+                "NO TURNS".to_owned()
+            } else {
+                format!("TURN {} / {total}", cursor + 1)
+            };
+            let _position = ui.label(chrome::muted(position).size(12.0));
+        });
     });
 }
 
@@ -1969,7 +2127,7 @@ impl HistoryColumns {
 
 struct HistoryRows {
     action: Option<HistoryAction>,
-    tally: Vec<String>,
+    tally: Vec<SessionKey>,
 }
 
 fn history_header(
@@ -2079,28 +2237,29 @@ fn history_rows(
     hits: &[HistoryHit],
     rows: std::ops::Range<usize>,
     columns: HistoryColumns,
-    pending: &HashMap<String, HistoryLease>,
+    pending: &HashMap<SessionKey, HistoryLease>,
     rename: &mut Option<HistoryRename>,
     water: &mut Surface,
-    hovered: &mut Option<String>,
+    hovered: &mut Option<SessionKey>,
 ) -> HistoryRows {
     let mut action = None;
     let mut tally = Vec::new();
     for visible in rows {
         let hit = &hits[visible];
         let session = &sessions[hit.session()];
-        if session.turns.is_none() && !session.tally_failed {
-            tally.push(session.thread.clone());
+        let key = session.key();
+        if key.site.local() && session.turns.is_none() && !session.tally_failed {
+            tally.push(key.clone());
         }
         let found = ui
-            .push_id(&session.thread, |ui| {
+            .push_id((&session.site, &session.thread), |ui| {
                 history_row(
                     ui,
                     visible,
                     session,
                     hit,
                     columns,
-                    pending.get(&session.thread).map(HistoryLease::operation),
+                    pending.get(&key).map(HistoryLease::operation),
                     rename,
                     water,
                     hovered,
@@ -2124,7 +2283,7 @@ fn history_row(
     flight: Option<HistoryOperation>,
     rename: &mut Option<HistoryRename>,
     water: &mut Surface,
-    hovered: &mut Option<String>,
+    hovered: &mut Option<SessionKey>,
 ) -> Option<HistoryAction> {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), HISTORY_ROW), Sense::click());
@@ -2169,7 +2328,9 @@ fn history_row(
         && flight != Some(HistoryOperation::Delete)
     {
         water.click(rect);
-        action = Some(HistoryAction::Inspect(session.thread.clone()));
+        if session.site.local() {
+            action = Some(HistoryAction::Inspect(session.key()));
+        }
     }
     brass_poolrooms::poolroom_anchor!(
         ui,
@@ -2177,8 +2338,8 @@ fn history_row(
         response.rect
     );
     if pointer_inside {
-        *hovered = Some(session.thread.clone());
-        water.hover(("historical", &session.thread), rect);
+        *hovered = Some(session.key());
+        water.hover(("historical", &session.site, &session.thread), rect);
     }
     ui.painter().line_segment(
         [rect.left_bottom(), rect.right_bottom()],
@@ -2197,6 +2358,22 @@ fn history_facts(
     water: &mut Surface,
 ) -> Option<HistoryAction> {
     history_cell(row, columns.id, |ui| {
+        if let Some(site) = session.site.remote() {
+            let (rect, _response) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            let center = rect.center();
+            let radius = 3.5;
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(0.0, -radius),
+                    center + egui::vec2(radius, 0.0),
+                    center + egui::vec2(0.0, radius),
+                    center + egui::vec2(-radius, 0.0),
+                ],
+                site_color(site),
+                Stroke::NONE,
+            ));
+            ui.add_space(3.0);
+        }
         let _id = history_marked_label(ui, &session.thread, hit.id_spans(), chrome::MUTED, 11.0);
     });
     let mut action = history_rename_control(
@@ -2219,10 +2396,14 @@ fn history_facts(
         );
     });
     history_cell(row, columns.turns, |ui| {
-        let tally = session.turns.map_or_else(
-            || if session.tally_failed { "ERR" } else { "…" }.to_owned(),
-            |turns| turns.to_string(),
-        );
+        let tally = if session.site.local() {
+            session.turns.map_or_else(
+                || if session.tally_failed { "ERR" } else { "…" }.to_owned(),
+                |turns| turns.to_string(),
+            )
+        } else {
+            "—".to_owned()
+        };
         let color = if session.tally_failed {
             RED
         } else {
@@ -2231,11 +2412,12 @@ fn history_facts(
         let _turns = ui.label(RichText::new(tally).size(12.0).color(color));
     });
     history_cell(row, columns.size, |ui| {
-        let _size = ui.label(
-            RichText::new(format_size(session.bytes))
-                .size(12.0)
-                .color(chrome::TEXT),
-        );
+        let size = if session.site.local() {
+            format_size(session.bytes)
+        } else {
+            "REMOTE".to_owned()
+        };
+        let _size = ui.label(RichText::new(size).size(12.0).color(chrome::TEXT));
     });
     history_cell(row, columns.state, |ui| {
         let (label, color) = if session.archived {
@@ -2262,7 +2444,7 @@ fn history_rename_control(
             return;
         }
         let rename = ui
-            .add_enabled_ui(!editing && flight.is_none(), |ui| {
+            .add_enabled_ui(session.site.local() && !editing && flight.is_none(), |ui| {
                 chrome::Monoglyph::symbol(chrome::Symbol::Rename)
                     .size(MechanismSize::Small)
                     .show(ui)
@@ -2277,7 +2459,7 @@ fn history_rename_control(
         );
         if rename.clicked() {
             action = Some(HistoryAction::BeginRename {
-                thread: session.thread.clone(),
+                key: session.key(),
                 name: session.name.clone().unwrap_or_default(),
                 rect: rename.rect,
             });
@@ -2296,10 +2478,7 @@ fn history_name(
 ) -> Option<HistoryAction> {
     let mut action = None;
     history_cell(row, width, |ui| {
-        let Some(draft) = rename
-            .as_mut()
-            .filter(|draft| draft.thread == session.thread)
-        else {
+        let Some(draft) = rename.as_mut().filter(|draft| draft.key == session.key()) else {
             if let Some(name) = session.name.as_deref() {
                 let _name = history_marked_label(ui, name, hit.name_spans(), chrome::TEXT, 13.0);
             } else {
@@ -2348,7 +2527,7 @@ fn history_name(
                 Some(HistoryAction::CancelRename)
             } else {
                 Some(HistoryAction::CommitRename {
-                    thread: session.thread.clone(),
+                    key: session.key(),
                     name: name.to_owned(),
                 })
             };
@@ -2384,7 +2563,7 @@ fn history_open(
             water.click(response.rect);
         }
     });
-    clicked.then(|| HistoryAction::Open(session.thread.clone()))
+    clicked.then(|| HistoryAction::Open(session.key()))
 }
 
 fn history_operation(
@@ -2411,7 +2590,7 @@ fn history_operation(
             HistoryOperation::present_participle,
         );
         let response = ui.add_enabled(
-            !editing && flight.is_none(),
+            session.site.local() && !editing && flight.is_none(),
             egui::Button::new(RichText::new(label).size(11.0)).min_size(Vec2::new(92.0, 24.0)),
         );
         chrome::shallow_tension(ui, &response);
@@ -2434,7 +2613,7 @@ fn history_operation(
         }
     });
     clicked.then(|| HistoryGesture {
-        thread: session.thread.clone(),
+        key: session.key(),
         operation,
     })
 }
@@ -2450,7 +2629,7 @@ fn history_delete(
     let mut clicked = false;
     history_cell(row, width, |ui| {
         let response = ui
-            .add_enabled_ui(!editing && flight.is_none(), |ui| {
+            .add_enabled_ui(session.site.local() && !editing && flight.is_none(), |ui| {
                 chrome::Monoglyph::symbol(chrome::Symbol::Delete)
                     .size(MechanismSize::Small)
                     .show(ui)
@@ -2466,7 +2645,7 @@ fn history_delete(
         clicked = response.clicked();
     });
     clicked.then(|| HistoryGesture {
-        thread: session.thread.clone(),
+        key: session.key(),
         operation: HistoryOperation::Delete,
     })
 }
@@ -2574,7 +2753,7 @@ fn card(
     physics: &mut CardPhysics<'_>,
 ) -> Option<Strike> {
     let (id, rect) = ui.allocate_space(Vec2::new(width, TILE_HEIGHT));
-    let dismissible = dismissible(card.harness, card.work);
+    let dismissible = dismissible(&card.site, card.harness, card.work);
     let fleeing = physics.tool == TileTool::Dismiss && dismissible;
     let offset = if fleeing {
         fear_offset(ui, &card.thread, rect, true)
@@ -2586,6 +2765,7 @@ fn card(
     if physics.tool.kinetic() || physics.recoiling {
         let travel = advance_jolt(
             physics.jolts,
+            &card.site,
             card.harness,
             &card.thread,
             fleeing.then_some(offset),
@@ -2620,7 +2800,7 @@ fn card(
         *physics.hovered = Some(hit.card());
         physics
             .water
-            .hover((card.harness.slug(), &card.thread), visual);
+            .hover((&card.site, card.harness.slug(), &card.thread), visual);
     }
     if response.clicked() {
         let modifiers = ui.input(|input| input.modifiers);
@@ -2629,7 +2809,9 @@ fn card(
         } else if modifiers.matches_exact(egui::Modifiers::CTRL) {
             (card.harness == Harness::Codex).then_some(Intent::Fork)?
         } else if modifiers.matches_exact(egui::Modifiers::ALT) {
-            if card.pinned {
+            if !card.site.local() {
+                return None;
+            } else if card.pinned {
                 Intent::Unpin
             } else {
                 Intent::Pin
@@ -2641,6 +2823,7 @@ fn card(
         };
         physics.water.click(visual);
         Some(Strike {
+            site: card.site.clone(),
             harness: card.harness,
             thread: card.thread.clone(),
             intent,
@@ -2657,6 +2840,7 @@ fn paint_card_contents(
     match_spans: &[std::ops::Range<usize>],
 ) {
     let workspace_width = paint_workspace(ui, visual, card);
+    let site_width = paint_site(ui, visual, &card.site);
     let inner = visual.shrink2(Vec2::new(14.0, 11.0));
     let mut body = ui.new_child(
         egui::UiBuilder::new()
@@ -2667,7 +2851,7 @@ fn paint_card_contents(
     body.set_max_width(inner.width());
     body.set_clip_rect(ui.clip_rect().intersect(inner));
     let name = card.name.as_deref().filter(|name| !name.is_empty());
-    body.set_max_width((inner.width() - workspace_width).max(80.0));
+    body.set_max_width((inner.width() - workspace_width.max(site_width)).max(80.0));
     let _name = if let Some(name) = name {
         marked_label(&mut body, name, match_spans, chrome::TEXT)
     } else {
@@ -2763,8 +2947,10 @@ fn fear_pose(thread: &str, clock: f64, bounds: egui::Rect, pointer: Option<egui:
     tremor(thread, clock) * proximity + direction * (FEAR_FLEE * proximity)
 }
 
-const fn dismissible(harness: Harness, work: Work) -> bool {
-    matches!(harness, Harness::Codex) && matches!(work, Work::Done | Work::Sleep | Work::Closed)
+const fn dismissible(site: &Site, harness: Harness, work: Work) -> bool {
+    site.local()
+        && matches!(harness, Harness::Codex)
+        && matches!(work, Work::Done | Work::Sleep | Work::Closed)
 }
 
 fn fear_proximity(distance: f32) -> f32 {
@@ -2791,11 +2977,12 @@ fn tremor(thread: &str, time: f64) -> Vec2 {
 
 fn advance_jolt(
     ledger: &mut JoltLedger,
+    site: &Site,
     harness: Harness,
     thread: &str,
     current: Option<Vec2>,
 ) -> Vec2 {
-    let bank = ledger.entry(harness).or_default();
+    let bank = ledger.entry((site.clone(), harness)).or_default();
     match current {
         Some(current) => {
             if let Some(prior) = bank.get_mut(thread) {
@@ -2844,6 +3031,50 @@ fn legend(ui: &mut egui::Ui, label: &str, work: Work) {
         paint_work(ui.painter(), rect.center(), 3.25, work);
         let _label = ui.label(RichText::new(label).small().color(chrome::MUTED));
     });
+}
+
+fn site_legend(ui: &mut egui::Ui, status: &crate::fleet::SiteStatus) {
+    let legend = ui.horizontal(|ui| {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+        let color = site_color(&status.site);
+        ui.painter().circle_filled(rect.center(), 3.5, color);
+        if status.fault.is_some() {
+            ui.painter()
+                .circle_stroke(rect.center(), 4.25, Stroke::new(1.0, RED));
+        }
+        let label = ui.label(
+            RichText::new(status.site.endpoint())
+                .small()
+                .color(chrome::MUTED),
+        );
+        response.union(label)
+    });
+    let bridge = status.bridge_version.as_deref().unwrap_or("unknown bridge");
+    let codex = status.codex_version.as_deref().unwrap_or("unknown Codex");
+    let platform = status.platform.as_deref().unwrap_or("unknown platform");
+    let identity = format!("{bridge} · Codex {codex} · {platform}");
+    let hint = status
+        .fault
+        .as_ref()
+        .map_or(identity.clone(), |fault| format!("{fault}\n{identity}"));
+    let _hint = legend.inner.on_hover_text(hint);
+}
+
+fn fleet_legend(ui: &mut egui::Ui, fleet: Option<&FleetSnapshot>) {
+    let Some(fleet) = fleet.filter(|fleet| !fleet.sites.is_empty()) else {
+        return;
+    };
+    for site in fleet.sites.iter().rev() {
+        site_legend(ui, site);
+    }
+    ui.add_space(8.0);
+}
+
+fn site_color(site: &crate::site::RemoteSite) -> Color32 {
+    let palette_len = u64::try_from(SITE_PALETTE.len()).expect("Site palette length fits u64");
+    let index =
+        usize::try_from(site.palette() % palette_len).expect("Site palette modulus fits usize");
+    SITE_PALETTE[index]
 }
 
 fn paint_card_work(painter: &egui::Painter, tile: egui::Rect, work: Work) {
@@ -2927,6 +3158,31 @@ fn paint_workspace(ui: &egui::Ui, tile: egui::Rect, card: &Card) -> f32 {
             .paint(ui.painter(), false);
     }
     width
+}
+
+fn paint_site(ui: &egui::Ui, tile: egui::Rect, site: &Site) -> f32 {
+    let Some(site) = site.remote() else {
+        return 0.0;
+    };
+    let badge_side = 22.0;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(tile.right() - badge_side, tile.top()),
+        Vec2::splat(badge_side),
+    );
+    let center = rect.center();
+    let radius = 4.5;
+    let points = vec![
+        center + egui::vec2(0.0, -radius),
+        center + egui::vec2(radius, 0.0),
+        center + egui::vec2(0.0, radius),
+        center + egui::vec2(-radius, 0.0),
+    ];
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        site_color(site),
+        Stroke::NONE,
+    ));
+    badge_side
 }
 
 const fn work_color(work: Work) -> Color32 {
@@ -3025,16 +3281,21 @@ mod tests {
 
     #[test]
     fn only_stopped_tiles_fear_management() {
-        assert!(dismissible(Harness::Codex, Work::Done));
-        assert!(dismissible(Harness::Codex, Work::Sleep));
-        assert!(dismissible(Harness::Codex, Work::Closed));
-        assert!(!dismissible(Harness::Codex, Work::Error));
-        assert!(!dismissible(Harness::Codex, Work::Input));
-        assert!(!dismissible(Harness::Codex, Work::Goal));
-        assert!(!dismissible(Harness::Codex, Work::Delegated));
-        assert!(!dismissible(Harness::Codex, Work::Turn));
-        assert!(!dismissible(Harness::ClaudeCode, Work::Done));
-        assert!(!dismissible(Harness::PrimeAgent, Work::Sleep));
+        assert!(dismissible(&Site::Local, Harness::Codex, Work::Done));
+        assert!(dismissible(&Site::Local, Harness::Codex, Work::Sleep));
+        assert!(dismissible(&Site::Local, Harness::Codex, Work::Closed));
+        assert!(!dismissible(&Site::Local, Harness::Codex, Work::Error));
+        assert!(!dismissible(&Site::Local, Harness::Codex, Work::Input));
+        assert!(!dismissible(&Site::Local, Harness::Codex, Work::Goal));
+        assert!(!dismissible(&Site::Local, Harness::Codex, Work::Delegated));
+        assert!(!dismissible(&Site::Local, Harness::Codex, Work::Turn));
+        assert!(!dismissible(&Site::Local, Harness::ClaudeCode, Work::Done));
+        assert!(!dismissible(&Site::Local, Harness::PrimeAgent, Work::Sleep));
+        assert!(!dismissible(
+            &Site::Remote(crate::site::RemoteSite::parse("host").expect("lawful endpoint")),
+            Harness::Codex,
+            Work::Done
+        ));
     }
 
     #[test]

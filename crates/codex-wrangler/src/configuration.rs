@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     time::{Duration, Instant},
 };
@@ -14,11 +15,12 @@ const LEGACY_FILE: &str = "preferences.json";
 const LEGACY_VERSION: u8 = 1;
 const SETTLE: Duration = Duration::from_millis(350);
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 struct ConfigurationValues {
     confirm_deletion: bool,
     minimize_on_close: bool,
+    remotes: Vec<String>,
 }
 
 impl Default for ConfigurationValues {
@@ -26,11 +28,23 @@ impl Default for ConfigurationValues {
         Self {
             confirm_deletion: true,
             minimize_on_close: false,
+            remotes: Vec::new(),
         }
     }
 }
 
-impl ConfigurationContract for ConfigurationValues {}
+impl ConfigurationContract for ConfigurationValues {
+    fn validate(&self) -> std::result::Result<(), String> {
+        let mut unique = HashSet::with_capacity(self.remotes.len());
+        for endpoint in &self.remotes {
+            let remote = crate::site::RemoteSite::parse(endpoint)?;
+            if !unique.insert(remote) {
+                return Err(format!("remote SSH endpoint `{endpoint}` is duplicated"));
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Deserialize)]
 struct Legacy {
@@ -94,6 +108,18 @@ impl Configuration {
             })
     }
 
+    pub fn remotes(&self) -> Vec<crate::site::RemoteSite> {
+        self.ledger
+            .live()
+            .remotes
+            .iter()
+            .map(|endpoint| {
+                crate::site::RemoteSite::parse(endpoint)
+                    .expect("live configuration passed remote validation")
+            })
+            .collect()
+    }
+
     pub const fn writable(&self) -> bool {
         self.ledger.writable()
     }
@@ -153,5 +179,6 @@ fn legacy() -> Result<ConfigurationValues> {
     Ok(ConfigurationValues {
         confirm_deletion: legacy.confirm_deletion,
         minimize_on_close: legacy.minimize_on_close,
+        remotes: Vec::new(),
     })
 }

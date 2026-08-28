@@ -7,5 +7,4 @@ target_directory=$(cargo metadata --format-version 1 --no-deps \
 test -n "$target_directory"
 install -Dm755 "$target_directory/release/codex-wrangler" \
   "$HOME/.local/bin/codex-wrangler"
-install -Dm644 assets/codex-wrangler.desktop \
-  "$HOME/.local/share/applications/codex-wrangler.desktop"
+"$HOME/.local/bin/codex-wrangler" install

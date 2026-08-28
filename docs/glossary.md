@@ -15,8 +15,13 @@ historical, archived, or absent from the current host process table.
 : Wrangler's observed projection of a thread at a point in its lifecycle. A
 session is not a process, terminal window, or workspace.
 
+**Site**
+: One machine that owns a Codex app server and its threads. `Local` is the
+machine rendering Wrangler; every remote Site is identified by one OpenSSH
+destination or `Host` alias.
+
 **Workspace**
-: The i3 workspace containing a live session's terminal window.
+: The i3 workspace containing a local live session's terminal window.
 
 **Pin**
 : A Wrangler-owned ordering mark that keeps a session in the head bucket. It

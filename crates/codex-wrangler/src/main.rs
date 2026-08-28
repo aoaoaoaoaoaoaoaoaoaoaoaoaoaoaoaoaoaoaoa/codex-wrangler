@@ -3,9 +3,11 @@ mod codex_rpc;
 mod commands;
 mod configuration;
 mod desktop;
+mod fleet;
 mod history;
 mod i3;
 mod instance;
+mod integration;
 mod model;
 mod names;
 mod pinboard;
@@ -14,6 +16,7 @@ mod recon;
 mod rollout;
 mod roster;
 mod search;
+mod site;
 mod stasis;
 mod state;
 mod transcript;
@@ -29,6 +32,9 @@ use instance::{Incumbent, Invocation};
 use posture::Ledger;
 
 fn main() -> Result<()> {
+    if matches!(integration::dispatch()?, integration::Dispatch::Exit) {
+        return Ok(());
+    }
     if stasis::thawguard_requested() {
         return stasis::run_thawguard();
     }

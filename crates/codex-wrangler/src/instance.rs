@@ -17,6 +17,7 @@ pub const QUIT_REQUEST: u32 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Invocation {
     Summon,
+    Resident,
     Quit,
 }
 
@@ -25,8 +26,9 @@ impl Invocation {
         let mut arguments = std::env::args_os().skip(1);
         match (arguments.next(), arguments.next()) {
             (None, None) => Ok(Self::Summon),
+            (Some(argument), None) if argument == "--resident" => Ok(Self::Resident),
             (Some(argument), None) if argument == "--quit" => Ok(Self::Quit),
-            _ => anyhow::bail!("usage: codex-wrangler [--quit]"),
+            _ => anyhow::bail!("usage: codex-wrangler [--resident|--quit]"),
         }
     }
 }
@@ -37,6 +39,7 @@ pub struct Incumbent {
     pub(crate) anchor: Window,
     pub(crate) summons: Atom,
     pub(crate) launch_desktop: Option<u32>,
+    pub(crate) resident: bool,
 }
 
 impl Incumbent {
@@ -63,7 +66,7 @@ impl Incumbent {
         let summons = intern(&conn, &format!("_CODEX_WRANGLER_INSTANCE_S{screen_number}"))?;
         let launch_desktop = match invocation {
             Invocation::Summon => Desktop::current_desktop()?,
-            Invocation::Quit => None,
+            Invocation::Resident | Invocation::Quit => None,
         };
         let desktop = launch_desktop.unwrap_or(NO_DESKTOP);
 
@@ -77,7 +80,7 @@ impl Incumbent {
                 .context("query Codex Wrangler instance")?
                 .owner;
             match (owner, invocation) {
-                (NONE, Invocation::Summon) => {
+                (NONE, Invocation::Summon | Invocation::Resident) => {
                     conn.set_selection_owner(anchor, summons, CURRENT_TIME)?
                         .check()
                         .context("claim Codex Wrangler instance")?;
@@ -105,6 +108,7 @@ impl Incumbent {
                 anchor,
                 summons,
                 launch_desktop,
+                resident: invocation == Invocation::Resident,
             }))
         } else {
             conn.destroy_window(anchor)?
@@ -118,6 +122,10 @@ impl Incumbent {
     pub const fn launch_desktop(&self) -> Option<u32> {
         self.launch_desktop
     }
+
+    pub const fn resident(&self) -> bool {
+        self.resident
+    }
 }
 
 fn relay(
@@ -128,7 +136,7 @@ fn relay(
     invocation: Invocation,
 ) -> Result<()> {
     let request = match invocation {
-        Invocation::Summon => 0,
+        Invocation::Summon | Invocation::Resident => 0,
         Invocation::Quit => QUIT_REQUEST,
     };
     let message = ClientMessageEvent::new(32, owner, summons, [desktop, request, 0, 0, 0]);

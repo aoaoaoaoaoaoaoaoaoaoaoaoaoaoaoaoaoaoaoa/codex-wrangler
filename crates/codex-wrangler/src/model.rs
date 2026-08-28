@@ -2,8 +2,11 @@ use std::cmp::Ordering;
 
 use codex_wrangler_contract::{Harness, Work};
 
+use crate::site::Site;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Card {
+    pub site: Site,
     pub harness: Harness,
     pub thread: String,
     pub name: Option<String>,
@@ -18,11 +21,18 @@ pub struct Card {
 
 impl Card {
     pub fn assert_lawful(&self) {
-        assert_eq!(
-            self.work == Work::Closed,
-            self.window.is_none(),
-            "Closed must be exactly terminal absence"
-        );
+        if self.site.local() {
+            assert_eq!(
+                self.work == Work::Closed,
+                self.window.is_none(),
+                "a local closed session must be exactly terminal absence"
+            );
+        } else {
+            assert!(
+                self.window.is_none(),
+                "a remote session cannot own a local X11 window"
+            );
+        }
     }
 }
 
@@ -52,6 +62,7 @@ impl Ord for Card {
             rank(self.work)
                 .cmp(&rank(other.work))
                 .then_with(|| other.updated_at_ms.cmp(&self.updated_at_ms))
+                .then_with(|| self.site.cmp(&other.site))
                 .then_with(|| self.harness.cmp(&other.harness))
                 .then_with(|| self.thread.cmp(&other.thread))
         })
@@ -94,6 +105,7 @@ mod tests {
     #[test]
     fn pinned_heads_while_unpinned_stops_share_recency_and_closed_tails() {
         let card = |thread: &str, work, updated_at_ms| Card {
+            site: Site::Local,
             harness: Harness::Codex,
             thread: thread.to_owned(),
             name: None,

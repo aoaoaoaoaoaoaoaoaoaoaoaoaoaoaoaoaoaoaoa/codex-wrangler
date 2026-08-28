@@ -3,7 +3,7 @@ use std::{cmp::Ordering, collections::HashSet, ops::Range};
 use codex_wrangler_contract::{HistoryColumn, SortDirection};
 use regex::{Regex, RegexBuilder};
 
-use crate::{history::Session, model::Card};
+use crate::{history::Session, model::Card, site::SessionKey};
 
 #[derive(Debug)]
 pub struct Hit {
@@ -96,7 +96,11 @@ impl Search {
                 .filter(|name| !name.is_empty())
                 .unwrap_or(&model.cwd);
             let mut findings = matcher.find_iter(haystack).peekable();
-            if findings.peek().is_none() {
+            let site_match = model
+                .site
+                .remote()
+                .is_some_and(|site| matcher.is_match(site.endpoint()));
+            if findings.peek().is_none() && !site_match {
                 continue;
             }
             let spans = findings
@@ -213,30 +217,30 @@ impl HistorySearch {
         self.order(sessions);
     }
 
-    pub fn revise(&mut self, sessions: &[Session], live: &HashSet<String>) {
+    pub fn revise(&mut self, sessions: &[Session], live: &HashSet<SessionKey>) {
         (self.matcher, self.valid) = compile(&self.query);
         self.reconcile(sessions, live);
     }
 
-    pub fn clear(&mut self, sessions: &[Session], live: &HashSet<String>) {
+    pub fn clear(&mut self, sessions: &[Session], live: &HashSet<SessionKey>) {
         self.query.clear();
         self.matcher = None;
         self.valid = true;
         self.reconcile(sessions, live);
     }
 
-    pub fn reconcile(&mut self, sessions: &[Session], live: &HashSet<String>) {
+    pub fn reconcile(&mut self, sessions: &[Session], live: &HashSet<SessionKey>) {
         self.hits.clear();
         let total = sessions
             .iter()
-            .filter(|session| !live.contains(session.thread.as_str()))
+            .filter(|session| !live.contains(&session.key()))
             .count();
         let Some(matcher) = self.matcher.as_ref() else {
             self.hits.extend(
                 sessions
                     .iter()
                     .enumerate()
-                    .filter(|(_, session)| !live.contains(session.thread.as_str()))
+                    .filter(|(_, session)| !live.contains(&session.key()))
                     .map(|(session, _)| HistoryHit {
                         session,
                         id_spans: Vec::new(),
@@ -253,7 +257,7 @@ impl HistorySearch {
         };
 
         for (index, session) in sessions.iter().enumerate() {
-            if live.contains(session.thread.as_str()) {
+            if live.contains(&session.key()) {
                 continue;
             }
             let id_match = matcher.is_match(&session.thread);
@@ -261,7 +265,11 @@ impl HistorySearch {
                 .name
                 .as_deref()
                 .is_some_and(|name| matcher.is_match(name));
-            if !id_match && !name_match {
+            let site_match = session
+                .site
+                .remote()
+                .is_some_and(|site| matcher.is_match(site.endpoint()));
+            if !id_match && !name_match && !site_match {
                 continue;
             }
             let id_spans = spans(matcher, &session.thread);

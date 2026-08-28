@@ -26,7 +26,13 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{codex_rpc::CodexRpc, names::NameIndex, state, watchfire::Watchfire};
+use crate::{
+    codex_rpc::CodexRpc,
+    names::NameIndex,
+    site::{SessionKey, Site},
+    state,
+    watchfire::Watchfire,
+};
 
 const INTEGRITY_AUDIT: Duration = Duration::from_mins(1);
 const LEDGER_SETTLE: Duration = Duration::from_secs(2);
@@ -39,6 +45,7 @@ const LONG_WINDOW: &str = "--long=31";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
+    pub site: Site,
     pub thread: String,
     pub name: Option<String>,
     pub last_turn: String,
@@ -47,6 +54,12 @@ pub struct Session {
     pub tally_failed: bool,
     pub bytes: u64,
     pub archived: bool,
+}
+
+impl Session {
+    pub fn key(&self) -> SessionKey {
+        SessionKey::new(self.site.clone(), self.thread.clone())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -620,6 +633,7 @@ impl Historian {
             };
             let turns = self.ledger.get(&thread, updated_at_ms);
             sessions.push(Session {
+                site: Site::Local,
                 name: db_name.or_else(|| self.names.get(&thread).map(str::to_owned)),
                 tally_failed: turns.is_none() && self.failed.contains(&thread),
                 bytes: fs::metadata(&artifact.path)?.len(),
@@ -848,6 +862,12 @@ pub(crate) fn prepare_resume(
         return Err(error);
     }
     remove_compressed(nominal)
+}
+
+pub(crate) fn prepare_thread_resume(home: &Path, thread: &str) -> Result<PathBuf> {
+    let (cwd, archived, nominal) = crate::integration::prepare_row(home, thread)?;
+    prepare_resume(home, thread, archived, &nominal)?;
+    Ok(cwd)
 }
 
 fn resolve_artifact(nominal: &Path, updated_at_ms: i64) -> Option<Artifact> {

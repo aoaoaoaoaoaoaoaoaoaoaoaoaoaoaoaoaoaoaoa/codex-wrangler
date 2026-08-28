@@ -143,6 +143,7 @@ impl X11Tray {
             anchor,
             summons,
             launch_desktop: _,
+            resident: _,
         } = incumbent;
         let screen = &conn.setup().roots[screen_number];
         let root = screen.root;

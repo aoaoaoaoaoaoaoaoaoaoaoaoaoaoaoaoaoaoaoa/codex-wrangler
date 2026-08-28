@@ -1,0 +1,14 @@
+[Unit]
+Description=Codex Wrangler resident session gallery
+ConditionEnvironment=DISPLAY
+PartOf=x11-apps.target
+After=x11-apps.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/codex-wrangler --resident
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=x11-apps.target

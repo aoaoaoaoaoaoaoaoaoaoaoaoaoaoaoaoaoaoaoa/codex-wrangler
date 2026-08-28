@@ -36,6 +36,7 @@ use crate::{
     pinboard::Pinboard,
     rollout::{RolloutSummary, Rollouts, TurnState},
     roster::{AccountMark, Roster, Sighting as SessionSighting},
+    site::Site,
     stasis::{ProcessKey, Quarry, Stasis},
     transcript::Transcripts,
     watchfire::Watchfire,
@@ -71,6 +72,7 @@ impl CodexLaunch {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Strike {
+    pub site: Site,
     pub harness: Harness,
     pub thread: String,
     pub intent: Intent,
@@ -612,6 +614,10 @@ impl Recon {
     }
 
     fn execute(&mut self, strike: &Strike, now: Instant) -> Result<bool> {
+        assert!(
+            strike.site.local(),
+            "local reconnaissance received a remote strike"
+        );
         if strike.harness == Harness::Codex && strike.intent == Intent::Open {
             return self.open_historical(&strike.thread);
         }
@@ -888,7 +894,7 @@ fn inspect_codex_version(operation: &str) -> Option<Version> {
         .ok()
 }
 
-fn installed_codex_version() -> Result<Version> {
+pub(crate) fn installed_codex_version() -> Result<Version> {
     let output = Command::new("codex")
         .arg("--version")
         .output()
@@ -1034,6 +1040,7 @@ impl Codex {
         });
         Ok(Some((
             Card {
+                site: Site::Local,
                 harness: Harness::Codex,
                 thread: thread.id,
                 name,
@@ -1055,6 +1062,7 @@ impl Codex {
             .sessions()
             .filter(|(thread, _)| !live.contains(*thread))
             .map(|(thread, session)| Card {
+                site: Site::Local,
                 harness: Harness::Codex,
                 thread: thread.to_owned(),
                 name: session.name.clone(),
@@ -1350,6 +1358,7 @@ fn foreign_card(
         work
     };
     let card = Card {
+        site: Site::Local,
         harness: process.harness,
         thread,
         name: process

@@ -7,6 +7,7 @@ Live discovery detects capabilities, never version strings. This table is the su
 | 0.146.x | Writable rollout JSONL descriptors; newest lawful main-thread claim wins | `task_*`, legacy messages | `Goal Codex` owns two main rollouts | `CodexClaim::WritableRollout`, `writable_access` |
 | 0.147.x | Open `thread-writer-locks/<id>.lock`, resolved through `threads.rollout_path`; dominates legacy claims | `turn_*`, paginated `item_completed`, legacy records accepted; rollout may be absent before the first turn | `Turn Codex` owns only a writer lock; `Fresh Codex` has no rollout artifact | `CodexClaim::WriterLock`, `writer_lock_thread`, `RolloutSummary::quiescent` |
 | 0.149.x | Persistent `codex app-server` owns writer locks and rollouts; an established TUI binding survives cwd changes, while a bare `resume` may recover one unique unclaimed primary lock by Git origin after a repository move | 0.147 vocabulary retained | `Fresh Codex` resumes from a transplanted worktree with no claim or rollout; a detached app-server owns its older lock and its row falsely says `source = 'vscode'` | `app_server_writer_claims`, `Process::app_server_claim`, `GitOrigin` |
+| 0.150.x-wrangler | The packaged shared app server is mandatory by default; TUI bindings reconnect after a managed rollover | 0.149 vocabulary retained | Local acceptance retains process-level discovery; bridge protocol 1 projects remote app-server history and loaded-thread status | `codex-wrangler-bridge`, `FleetWorker`, `CODEX_ALLOW_EMBEDDED_SERVER` |
 
 All supported lines require `state_5.sqlite` and the UUID forms of `codex resume`
 and `codex fork`. They also provide app-server `thread/name/set` for unloaded,
@@ -36,3 +37,10 @@ Stopped-session rollover compares the launcher's `codex --version` with the
 session runtime last sealed in Wrangler's XDG roster. SQLite `cli_version`
 seeds that value once; it is the creation version and does not advance on
 resume.
+
+Remote Sites are admitted through the bundled `codex-wrangler-bridge`, not by
+reading remote files or process tables. The bridge compiles against the exact
+app-server protocol and emits protocol-versioned NDJSON over SSH. A protocol
+mismatch quarantines remote data. A Codex or bridge build mismatch remains
+visible with a `HARMONIZE SITE` fault so compatible state can still be inspected
+before the Site is upgraded.
