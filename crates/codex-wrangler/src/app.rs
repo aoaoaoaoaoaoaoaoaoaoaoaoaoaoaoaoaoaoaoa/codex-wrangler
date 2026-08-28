@@ -861,7 +861,6 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.close_preference(ui);
                 ui.add_space(8.0);
-                fleet_legend(ui, self.fleet_snapshot.as_ref());
                 if self.page == Page::Live {
                     legend(ui, "DONE", Work::Done);
                     legend(ui, "SLEEP", Work::Sleep);
@@ -897,6 +896,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 }
             });
         });
+        fleet_legend(ui, self.fleet_snapshot.as_ref());
         ui.add_space(7.0);
         let _tabs = ui.horizontal(|ui| {
             for page in Page::ALL {
@@ -3064,10 +3064,12 @@ fn fleet_legend(ui: &mut egui::Ui, fleet: Option<&FleetSnapshot>) {
     let Some(fleet) = fleet.filter(|fleet| !fleet.sites.is_empty()) else {
         return;
     };
-    for site in fleet.sites.iter().rev() {
-        site_legend(ui, site);
-    }
-    ui.add_space(8.0);
+    ui.add_space(3.0);
+    let _row = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        for site in fleet.sites.iter().rev() {
+            site_legend(ui, site);
+        }
+    });
 }
 
 fn site_color(site: &crate::site::RemoteSite) -> Color32 {
