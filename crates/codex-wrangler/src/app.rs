@@ -543,7 +543,12 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     fn rebuild_snapshots(&mut self) {
         self.live_snapshot = self.local_live_snapshot.clone().map(|mut local| {
             if let Some(fleet) = &self.fleet_snapshot {
-                local.cards.extend(fleet.cards.clone());
+                local
+                    .cards
+                    .extend(fleet.cards.iter().cloned().map(|mut card| {
+                        card.seat = local.relay_seats.get(&card.key()).copied();
+                        card
+                    }));
                 local.cards.sort();
             }
             local
@@ -1298,12 +1303,20 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     fn accept_history_action(&mut self, action: HistoryAction) {
         match action {
             HistoryAction::Inspect(key) => self.request_transcript(key),
-            HistoryAction::Open(key) => self.launch_strike(Strike {
-                site: key.site,
-                harness: Harness::Codex,
-                thread: key.thread,
-                intent: Intent::Open,
-            }),
+            HistoryAction::Open(key) => {
+                let seat = self
+                    .local_live_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.relay_seats.get(&key))
+                    .copied();
+                self.launch_strike(Strike {
+                    site: key.site,
+                    harness: Harness::Codex,
+                    thread: key.thread,
+                    intent: Intent::Open,
+                    seat,
+                });
+            }
             HistoryAction::Operate(gesture) => self.accept_history_gesture(gesture),
             HistoryAction::BeginRename { key, name, rect } => {
                 self.history_rename = Some(HistoryRename {
@@ -1614,7 +1627,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 name: card.name.clone(),
                 thread: card.thread.clone(),
                 work: card.work,
-                workspace: card.workspace,
+                workspace: card.workspace(),
                 pinned: card.pinned,
             })
             .collect()
@@ -2827,6 +2840,7 @@ fn card(
             harness: card.harness,
             thread: card.thread.clone(),
             intent,
+            seat: card.seat,
         })
     } else {
         None
@@ -3123,7 +3137,7 @@ fn paint_work(painter: &egui::Painter, center: egui::Pos2, radius: f32, work: Wo
 }
 
 fn paint_workspace(ui: &egui::Ui, tile: egui::Rect, card: &Card) -> f32 {
-    let Some(workspace) = card.workspace else {
+    let Some(workspace) = card.workspace() else {
         return 0.0;
     };
     let galley = ui.painter().layout_no_wrap(

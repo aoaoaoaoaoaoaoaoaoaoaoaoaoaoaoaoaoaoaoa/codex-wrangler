@@ -53,9 +53,9 @@ impl ProcessKey {
     }
 }
 
-/// One live top-level Codex process holding a session's writer lock.
+/// One live top-level Codex process claiming a session's writer lock.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Seat {
+pub struct ProcessClaim {
     /// Durable session identity.
     pub session: SessionId,
     /// Ephemeral process identity.
@@ -64,10 +64,10 @@ pub struct Seat {
     pub cwd: Option<PathBuf>,
 }
 
-/// A point-in-time projection of unambiguous live Codex seats.
+/// A point-in-time projection of unambiguous live Codex process claims.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProcessSnapshot {
-    seats: BTreeMap<SessionId, Seat>,
+    claims: BTreeMap<SessionId, ProcessClaim>,
     conflicts: BTreeSet<SessionId>,
 }
 
@@ -86,29 +86,33 @@ impl ProcessSnapshot {
             else {
                 continue;
             };
-            let Some(seat) = inspect(pid) else {
+            let Some(claim) = inspect(pid) else {
                 continue;
             };
-            if snapshot.conflicts.contains(&seat.session) {
+            if snapshot.conflicts.contains(&claim.session) {
                 continue;
             }
-            if snapshot.seats.insert(seat.session, seat.clone()).is_some() {
-                snapshot.seats.remove(&seat.session);
-                snapshot.conflicts.insert(seat.session);
+            if snapshot
+                .claims
+                .insert(claim.session, claim.clone())
+                .is_some()
+            {
+                snapshot.claims.remove(&claim.session);
+                snapshot.conflicts.insert(claim.session);
             }
         }
         Ok(snapshot)
     }
 
-    /// The sole live seat for a session, excluding ambiguous ownership.
+    /// The sole live process claim for a session, excluding ambiguous ownership.
     #[must_use]
-    pub fn seat(&self, session: &SessionId) -> Option<&Seat> {
-        self.seats.get(session)
+    pub fn claim(&self, session: &SessionId) -> Option<&ProcessClaim> {
+        self.claims.get(session)
     }
 
-    /// All unambiguous seats in session order.
-    pub fn seats(&self) -> impl Iterator<Item = &Seat> {
-        self.seats.values()
+    /// All unambiguous process claims in session order.
+    pub fn claims(&self) -> impl Iterator<Item = &ProcessClaim> {
+        self.claims.values()
     }
 
     /// Session identities claimed by more than one eligible process.
@@ -150,9 +154,9 @@ pub fn session(pid: u32) -> Option<SessionId> {
         .flatten()
 }
 
-fn inspect(pid: u32) -> Option<Seat> {
+fn inspect(pid: u32) -> Option<ProcessClaim> {
     let session = session(pid)?;
-    Some(Seat {
+    Some(ProcessClaim {
         session,
         process: ProcessKey::sight(pid).ok()?,
         cwd: fs::read_link(proc_path(pid).join("cwd")).ok(),

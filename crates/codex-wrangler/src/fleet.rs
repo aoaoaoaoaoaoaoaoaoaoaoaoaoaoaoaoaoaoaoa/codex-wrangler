@@ -20,6 +20,7 @@ use semver::Version;
 use serde::Deserialize;
 
 use crate::{
+    desktop::Desktop,
     history::Session,
     model::Card,
     recon::{Activation, Intent, Strike},
@@ -409,8 +410,8 @@ fn absorb(
                     cwd: thread.cwd,
                     tile_preview: thread.preview,
                     work: thread.work.into(),
-                    window: None,
-                    workspace: None,
+                    seat: None,
+                    last_workspace: None,
                     updated_at_ms: thread.updated_at.saturating_mul(1_000),
                     pinned: false,
                 })
@@ -540,6 +541,12 @@ fn launch(strike: &Strike) -> anyhow::Result<bool> {
     let Some(site) = strike.site.remote() else {
         anyhow::bail!("remote launcher received a local strike");
     };
+    if matches!(strike.intent, Intent::Select | Intent::Open)
+        && let Some(seat) = strike.seat
+    {
+        Desktop::connect()?.activate(seat.window)?;
+        return Ok(true);
+    }
     let verb = match strike.intent {
         Intent::Select | Intent::Open => "resume",
         Intent::Fork => "fork",

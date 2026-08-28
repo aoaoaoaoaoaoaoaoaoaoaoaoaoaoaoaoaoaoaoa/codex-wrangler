@@ -1,8 +1,15 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashMap};
 
 use codex_wrangler_contract::{Harness, Work};
 
-use crate::site::Site;
+use crate::site::{SessionKey, Site};
+
+/// One terminal on this machine currently displaying a session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Seat {
+    pub window: u32,
+    pub workspace: Option<u32>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Card {
@@ -13,25 +20,36 @@ pub struct Card {
     pub cwd: String,
     pub tile_preview: String,
     pub work: Work,
-    pub window: Option<u32>,
-    pub workspace: Option<u32>,
+    pub seat: Option<Seat>,
+    pub last_workspace: Option<u32>,
     pub updated_at_ms: i64,
     pub pinned: bool,
 }
 
 impl Card {
+    pub fn key(&self) -> SessionKey {
+        SessionKey::new(self.site.clone(), self.thread.clone())
+    }
+
     pub fn assert_lawful(&self) {
         if self.site.local() {
             assert_eq!(
                 self.work == Work::Closed,
-                self.window.is_none(),
-                "a local closed session must be exactly terminal absence"
+                self.seat.is_none(),
+                "a local closed session must be exactly seatless"
             );
         } else {
             assert!(
-                self.window.is_none(),
-                "a remote session cannot own a local X11 window"
+                self.work != Work::Closed,
+                "remote history must not masquerade as a live card"
             );
+        }
+    }
+
+    pub const fn workspace(&self) -> Option<u32> {
+        match self.seat {
+            Some(seat) => seat.workspace,
+            None => self.last_workspace,
         }
     }
 }
@@ -90,6 +108,8 @@ const fn rank(work: Work) -> u8 {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LiveSnapshot {
     pub cards: Vec<Card>,
+    /// Local terminal seats whose sessions live on configured remote Sites.
+    pub relay_seats: HashMap<SessionKey, Seat>,
     pub fault: Option<String>,
 }
 
@@ -112,8 +132,11 @@ mod tests {
             cwd: "/work".to_owned(),
             tile_preview: String::new(),
             work,
-            window: (work != Work::Closed).then_some(1),
-            workspace: None,
+            seat: (work != Work::Closed).then_some(Seat {
+                window: 1,
+                workspace: None,
+            }),
+            last_workspace: None,
             updated_at_ms,
             pinned: false,
         };

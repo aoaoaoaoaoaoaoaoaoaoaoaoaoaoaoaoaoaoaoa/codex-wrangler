@@ -31,12 +31,12 @@ use semver::Version;
 use crate::{
     codex_rpc::CodexRpc,
     desktop::{Desktop, DesktopSignal},
-    model::{Card, LiveSnapshot, snip},
+    model::{Card, LiveSnapshot, Seat, snip},
     names::NameIndex,
     pinboard::Pinboard,
     rollout::{RolloutSummary, Rollouts, TurnState},
     roster::{AccountMark, Roster, Sighting as SessionSighting},
-    site::Site,
+    site::{RemoteSite, SessionKey, Site},
     stasis::{ProcessKey, Quarry, Stasis},
     transcript::Transcripts,
     watchfire::Watchfire,
@@ -76,6 +76,7 @@ pub struct Strike {
     pub harness: Harness,
     pub thread: String,
     pub intent: Intent,
+    pub seat: Option<Seat>,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +191,7 @@ fn raid(
                 latest,
                 LiveSnapshot {
                     cards: Vec::new(),
+                    relay_seats: HashMap::new(),
                     fault: Some(format!("Could not arm reconnaissance: {error:#}")),
                 },
             );
@@ -416,6 +418,7 @@ fn publish_fault(
         latest,
         LiveSnapshot {
             cards: Vec::new(),
+            relay_seats: HashMap::new(),
             fault: Some(format!("Could not inspect harnesses: {error:#}")),
         },
     );
@@ -439,8 +442,10 @@ struct Recon {
     desktop: Desktop,
     process_cache: HashMap<ProcessKey, Process>,
     sightings: Vec<Sighting>,
+    relay_windows: HashMap<SessionKey, u32>,
+    relay_seats: HashMap<SessionKey, Seat>,
     semantic: Vec<Card>,
-    codex_seats: HashMap<String, Seat>,
+    codex_bodies: HashMap<String, CodexBody>,
     stasis: Stasis,
     transcripts: Transcripts,
     watchfire: Watchfire,
@@ -448,9 +453,9 @@ struct Recon {
 }
 
 #[derive(Clone, Copy)]
-struct Seat {
+struct CodexBody {
     process: ProcessKey,
-    window: u32,
+    seat: Seat,
 }
 
 impl Recon {
@@ -467,8 +472,10 @@ impl Recon {
             desktop: Desktop::connect()?,
             process_cache: HashMap::new(),
             sightings: Vec::new(),
+            relay_windows: HashMap::new(),
+            relay_seats: HashMap::new(),
             semantic: Vec::new(),
-            codex_seats: HashMap::new(),
+            codex_bodies: HashMap::new(),
             stasis: Stasis::arm(),
             transcripts: Transcripts::default(),
             watchfire: Watchfire::kindle()?,
@@ -478,7 +485,7 @@ impl Recon {
 
     fn refresh_forest(&mut self) -> Result<bool> {
         let windows = self.desktop.windows_by_pid()?;
-        let mut sightings = manual_harnesses(&windows, &mut self.process_cache);
+        let (mut sightings, relay_windows) = manual_forest(&windows, &mut self.process_cache);
         if let Some(codex) = &mut self.codex {
             codex.refresh_app_server_writers();
             codex.reconcile_app_server_claims(&mut sightings)?;
@@ -488,10 +495,15 @@ impl Recon {
                     .insert(sighting.process.key, sighting.process.clone());
             }
         }
-        self.desktop
-            .watch_terminals(sightings.iter().map(|sighting| sighting.window))?;
-        let changed = sightings != self.sightings;
+        self.desktop.watch_terminals(
+            sightings
+                .iter()
+                .map(|sighting| sighting.window)
+                .chain(relay_windows.values().copied()),
+        )?;
+        let changed = sightings != self.sightings || relay_windows != self.relay_windows;
         self.sightings = sightings;
+        self.relay_windows = relay_windows;
         Ok(changed)
     }
 
@@ -505,10 +517,7 @@ impl Recon {
                     .insert(sighting.process.key, sighting.process.clone());
             }
         }
-        let workspaces = self
-            .desktop
-            .workspace_numbers(self.sightings.iter().map(|sighting| sighting.window))
-            .unwrap_or_default();
+        let workspaces = self.workspace_numbers();
         let active = match self.desktop.active_window() {
             Ok(active) => active,
             Err(error) => {
@@ -524,7 +533,7 @@ impl Recon {
             .as_ref()
             .map_or_else(Vec::new, Codex::watch_paths);
         let mut seen = HashSet::new();
-        let mut codex_seats = HashMap::new();
+        let mut codex_bodies = HashMap::new();
         for sighting in &self.sightings {
             let process = &sighting.process;
             watched.extend(process.transcripts.iter().cloned());
@@ -556,11 +565,14 @@ impl Recon {
             watched.extend(transcript);
             if seen.insert((card.harness, card.thread.clone())) {
                 if card.harness == Harness::Codex {
-                    let _prior = codex_seats.insert(
+                    let _prior = codex_bodies.insert(
                         card.thread.clone(),
-                        Seat {
+                        CodexBody {
                             process: process.key,
-                            window: sighting.window,
+                            seat: Seat {
+                                window: sighting.window,
+                                workspace,
+                            },
                         },
                     );
                     quarry.push(Quarry {
@@ -573,7 +585,7 @@ impl Recon {
             }
         }
         if let Some(codex) = &mut self.codex {
-            cards.extend(codex.closed_cards(codex_seats.keys().map(String::as_str)));
+            cards.extend(codex.closed_cards(codex_bodies.keys().map(String::as_str)));
             codex.commit()?;
         }
         for card in &mut cards {
@@ -584,9 +596,21 @@ impl Recon {
         }
         self.stasis.observe(now, active, &quarry);
         self.watchfire.reconcile(watched)?;
-        self.codex_seats = codex_seats;
+        self.relay_seats = seat_relays(&self.relay_windows, &workspaces);
+        self.codex_bodies = codex_bodies;
         self.semantic = cards;
         Ok(())
+    }
+
+    fn workspace_numbers(&self) -> HashMap<u32, u32> {
+        self.desktop
+            .workspace_numbers(
+                self.sightings
+                    .iter()
+                    .map(|sighting| sighting.window)
+                    .chain(self.relay_windows.values().copied()),
+            )
+            .unwrap_or_default()
     }
 
     fn refresh_focus(&mut self, now: Instant) {
@@ -603,14 +627,18 @@ impl Recon {
         let mut cards = self.semantic.clone();
         for card in &mut cards {
             if card
-                .window
-                .is_some_and(|window| self.stasis.sleeping(window))
+                .seat
+                .is_some_and(|seat| self.stasis.sleeping(seat.window))
             {
                 card.work = Work::Sleep;
             }
         }
         cards.sort();
-        LiveSnapshot { cards, fault: None }
+        LiveSnapshot {
+            cards,
+            relay_seats: self.relay_seats.clone(),
+            fault: None,
+        }
     }
 
     fn execute(&mut self, strike: &Strike, now: Instant) -> Result<bool> {
@@ -636,8 +664,8 @@ impl Recon {
             return Ok(true);
         }
         if strike.harness != Harness::Codex {
-            return match (strike.intent, card.window) {
-                (Intent::Select, Some(window)) => self.activate(window, now),
+            return match (strike.intent, card.seat) {
+                (Intent::Select, Some(seat)) => self.activate(seat.window, now),
                 _ => Ok(false),
             };
         }
@@ -670,9 +698,9 @@ impl Recon {
         if card.work == Work::Closed {
             let active = self.active_account("bind resumed Codex login");
             let version = inspect_codex_version("inspect installed Codex version");
-            return self.summon_codex(&card.thread, card.workspace, active, version);
+            return self.summon_codex(&card.thread, card.last_workspace, active, version);
         }
-        let window = card.window.expect("live Codex card owns a window");
+        let seat = card.seat.expect("live local Codex card owns a seat");
         if card.work == Work::Done {
             let codex = self.codex.as_mut().context("Codex adapter is absent")?;
             let home = codex.home.clone();
@@ -694,15 +722,15 @@ impl Recon {
             });
             if rotated || superseded {
                 let seat = self
-                    .codex_seats
+                    .codex_bodies
                     .get(&card.thread)
                     .copied()
-                    .context("live Codex card has no process seat")?;
+                    .context("live Codex card has no process body")?;
                 self.retire(seat, now)?;
-                return self.summon_codex(&card.thread, card.workspace, active, version);
+                return self.summon_codex(&card.thread, card.workspace(), active, version);
             }
         }
-        self.activate(window, now)
+        self.activate(seat.window, now)
     }
 
     fn dismiss_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
@@ -716,10 +744,10 @@ impl Recon {
             return Ok(false);
         }
         let seat = self
-            .codex_seats
+            .codex_bodies
             .get(&card.thread)
             .copied()
-            .context("open Codex card has no process seat")?;
+            .context("open Codex card has no process body")?;
         self.retire(seat, now)?;
         Ok(true)
     }
@@ -732,7 +760,13 @@ impl Recon {
             .context("Codex session is absent from Wrangler state")?;
         let cwd = session.cwd.clone();
         let home = codex.home.clone();
-        self.launch_codex(&card.thread, &cwd, card.workspace, &home, CodexLaunch::Fork)?;
+        self.launch_codex(
+            &card.thread,
+            &cwd,
+            card.workspace(),
+            &home,
+            CodexLaunch::Fork,
+        )?;
         Ok(true)
     }
 
@@ -759,28 +793,28 @@ impl Recon {
         Ok(true)
     }
 
-    fn retire(&mut self, seat: Seat, now: Instant) -> Result<()> {
-        if !self.stasis.prepare_retirement(now, seat.window) {
-            anyhow::bail!("Codex process {} remains frozen", seat.process.pid);
+    fn retire(&mut self, body: CodexBody, now: Instant) -> Result<()> {
+        if !self.stasis.prepare_retirement(now, body.seat.window) {
+            anyhow::bail!("Codex process {} remains frozen", body.process.pid);
         }
-        if let Err(error) = self.desktop.close(seat.window) {
+        if let Err(error) = self.desktop.close(body.seat.window) {
             eprintln!(
                 "codex-wrangler could not close terminal window {} cleanly: {error:#}",
-                seat.window
+                body.seat.window
             );
         }
-        if wait_dead(seat.process, Duration::from_secs(2)) {
+        if wait_dead(body.process, Duration::from_secs(2)) {
             return Ok(());
         }
         nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(i32::try_from(seat.process.pid)?),
+            nix::unistd::Pid::from_raw(i32::try_from(body.process.pid)?),
             nix::sys::signal::Signal::SIGTERM,
         )
         .context("terminate stopped Codex process")?;
         anyhow::ensure!(
-            wait_dead(seat.process, Duration::from_secs(2)),
+            wait_dead(body.process, Duration::from_secs(2)),
             "Codex process {} survived terminal closure and SIGTERM",
-            seat.process.pid
+            body.process.pid
         );
         Ok(())
     }
@@ -1047,8 +1081,8 @@ impl Codex {
                 cwd: compact_path(live_cwd, process.home.as_deref()),
                 tile_preview: preview,
                 work,
-                window: Some(window),
-                workspace,
+                seat: Some(Seat { window, workspace }),
+                last_workspace: workspace,
                 updated_at_ms: thread.updated_at_ms,
                 pinned: false,
             },
@@ -1069,8 +1103,8 @@ impl Codex {
                 cwd: compact_path(&session.cwd, None),
                 tile_preview: session.preview.clone(),
                 work: Work::Closed,
-                window: None,
-                workspace: session.workspace,
+                seat: None,
+                last_workspace: session.workspace,
                 updated_at_ms: session.updated_at_ms,
                 pinned: false,
             })
@@ -1369,8 +1403,8 @@ fn foreign_card(
             .as_ref()
             .map_or_else(String::new, |summary| snip(&summary.preview, 280)),
         work,
-        window: Some(window),
-        workspace,
+        seat: Some(Seat { window, workspace }),
+        last_workspace: workspace,
         updated_at_ms: summary
             .as_ref()
             .map_or_else(|| i64::from(process.pid), |summary| summary.updated_at_ms),
@@ -1572,13 +1606,52 @@ fn codex_resumed_thread(argv: &[OsString]) -> Option<&str> {
         .find(|arg| uuid_literal(arg))
 }
 
-fn manual_harnesses(
+fn seat_relays(
+    windows: &HashMap<SessionKey, u32>,
+    workspaces: &HashMap<u32, u32>,
+) -> HashMap<SessionKey, Seat> {
+    windows
+        .iter()
+        .map(|(key, window)| {
+            (
+                key.clone(),
+                Seat {
+                    window: *window,
+                    workspace: workspaces.get(window).copied(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn manual_forest(
     windows: &HashMap<u32, Vec<u32>>,
     cache: &mut HashMap<ProcessKey, Process>,
-) -> Vec<Sighting> {
+) -> (Vec<Sighting>, HashMap<SessionKey, u32>) {
     let mut sightings = Vec::new();
+    let mut relays = HashMap::<SessionKey, (u32, u32)>::new();
     for pid in proc_pids() {
-        let Some(process) = harness_process(pid, cache) else {
+        let root = PathBuf::from(format!("/proc/{pid}"));
+        let Some(argv) = process_arguments(&root) else {
+            continue;
+        };
+        if let Some(key) = relay_session(&argv) {
+            let hint = process_environment(&root)
+                .get("WINDOWID")
+                .and_then(|value| x11_window_id(value));
+            if let Some(window) = nearest_process_window(pid, hint, windows) {
+                let candidate = (pid, window);
+                relays
+                    .entry(key)
+                    .and_modify(|seat| {
+                        if candidate.0 > seat.0 {
+                            *seat = candidate;
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+        }
+        let Some(process) = harness_process(pid, &root, argv, cache) else {
             continue;
         };
         let Some(window) = nearest_window(&process, windows) else {
@@ -1592,7 +1665,43 @@ fn manual_harnesses(
         .map(|sighting| sighting.process.key)
         .collect::<HashSet<_>>();
     cache.retain(|key, _| living.contains(key));
-    sightings
+    (
+        sightings,
+        relays
+            .into_iter()
+            .map(|(key, (_pid, window))| (key, window))
+            .collect(),
+    )
+}
+
+fn process_arguments(root: &Path) -> Option<Vec<OsString>> {
+    let bytes = fs::read(root.join("cmdline")).ok()?;
+    Some(
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| OsString::from_vec(arg.to_vec()))
+            .collect(),
+    )
+}
+
+fn relay_session(argv: &[OsString]) -> Option<SessionKey> {
+    if Path::new(argv.first()?).file_name()? != OsStr::new("ssh") {
+        return None;
+    }
+    let separator = argv.iter().rposition(|arg| arg == OsStr::new("--"))?;
+    let [endpoint, wrangler, relay, resume, thread] = argv.get(separator + 1..)? else {
+        return None;
+    };
+    if Path::new(wrangler).file_name()? != OsStr::new("codex-wrangler")
+        || relay != OsStr::new("relay")
+        || resume != OsStr::new("resume")
+    {
+        return None;
+    }
+    let thread = thread.to_str().filter(|thread| uuid_literal(thread))?;
+    let site = RemoteSite::parse(endpoint.to_str()?).ok()?;
+    Some(SessionKey::new(Site::Remote(site), thread.to_owned()))
 }
 
 fn proc_pids() -> Vec<u32> {
@@ -1609,7 +1718,15 @@ fn nearest_window(process: &Process, windows: &HashMap<u32, Vec<u32>>) -> Option
         .environment
         .get("WINDOWID")
         .and_then(|value| x11_window_id(value));
-    let mut ancestor = process.pid;
+    nearest_process_window(process.pid, hint, windows)
+}
+
+fn nearest_process_window(
+    pid: u32,
+    hint: Option<u32>,
+    windows: &HashMap<u32, Vec<u32>>,
+) -> Option<u32> {
+    let mut ancestor = pid;
     for _ in 0..256 {
         if ancestor <= 1 {
             return None;
@@ -1649,14 +1766,12 @@ fn stat_parent(stat: &str) -> Option<u32> {
         .ok()
 }
 
-fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option<Process> {
-    let root = PathBuf::from(format!("/proc/{pid}"));
-    let bytes = fs::read(root.join("cmdline")).ok()?;
-    let argv = bytes
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| OsString::from_vec(arg.to_vec()))
-        .collect::<Vec<_>>();
+fn harness_process(
+    pid: u32,
+    root: &Path,
+    argv: Vec<OsString>,
+    cache: &mut HashMap<ProcessKey, Process>,
+) -> Option<Process> {
     let harness = harness_argv(&argv)?;
     let key = ProcessKey::sight(pid).ok()?;
     if let Some(prior) = cache.get(&key)
@@ -1664,7 +1779,7 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         && prior.harness == harness
     {
         let mut process = prior.clone();
-        let (transcripts, claims) = process_descriptors(&root, harness);
+        let (transcripts, claims) = process_descriptors(root, harness);
         if claims != prior.codex_claims {
             process.binding = Arc::new(OnceLock::new());
         }
@@ -1678,17 +1793,17 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         let _prior = cache.insert(key, process.clone());
         return Some(process);
     }
-    if !foreground_tty(&root) {
+    if !foreground_tty(root) {
         return None;
     }
-    let environment = process_environment(&root);
+    let environment = process_environment(root);
     let home = environment
         .get("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     let cwd = fs::read_link(root.join("cwd")).unwrap_or_else(|_| PathBuf::from("."));
     let goal = harness == Harness::PrimeAgent && has_option(&argv, "--goal");
-    let (transcripts, codex_claims) = process_descriptors(&root, harness);
+    let (transcripts, codex_claims) = process_descriptors(root, harness);
     let binding = cache
         .get(&key)
         .filter(|prior| {
@@ -1714,7 +1829,7 @@ fn harness_process(pid: u32, cache: &mut HashMap<ProcessKey, Process>) -> Option
         environment,
         home,
         goal,
-        started_at: fs::metadata(&root)
+        started_at: fs::metadata(root)
             .and_then(|metadata| metadata.modified())
             .ok(),
     };
@@ -2371,6 +2486,37 @@ mod tests {
                 OsString::from("resume"),
                 OsString::from("--last"),
             ]),
+            None
+        );
+    }
+
+    #[test]
+    fn relay_seat_requires_the_exact_remote_resume_grammar() {
+        let id = "019fc940-b18f-7ad2-a012-71d86289bd60";
+        let command = [
+            "ssh",
+            "-t",
+            "--",
+            "main",
+            "/usr/bin/codex-wrangler",
+            "relay",
+            "resume",
+            id,
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            relay_session(&command),
+            Some(SessionKey::new(
+                Site::Remote(RemoteSite::parse("main").expect("valid fixture Site")),
+                id.to_owned(),
+            ))
+        );
+
+        let mut fork = command.clone();
+        fork[6] = OsString::from("fork");
+        assert_eq!(relay_session(&fork), None);
+        assert_eq!(
+            relay_session(&[OsString::from("ssh"), OsString::from("main")]),
             None
         );
     }

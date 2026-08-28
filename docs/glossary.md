@@ -20,8 +20,12 @@ session is not a process, terminal window, or workspace.
 machine rendering Wrangler; every remote Site is identified by one OpenSSH
 destination or `Host` alias.
 
+**Seat**
+: A terminal on the machine rendering Wrangler that currently displays a
+session. Session ownership and remote terminal windows do not confer a Seat.
+
 **Workspace**
-: The i3 workspace containing a local live session's terminal window.
+: The i3 workspace containing a Seat.
 
 **Pin**
 : A Wrangler-owned ordering mark that keeps a session in the head bucket. It
