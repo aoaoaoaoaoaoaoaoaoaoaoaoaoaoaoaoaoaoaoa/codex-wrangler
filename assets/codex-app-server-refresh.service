@@ -3,4 +3,6 @@ Description=Adopt the installed Codex app-server release
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/systemctl --user try-restart codex-app-server.service
+# SIGHUP drains running turns before replacing the daemon. Patched local TUIs
+# reconnect after the replacement socket is ready.
+ExecStart=/usr/bin/systemctl --user kill --signal=SIGHUP --kill-whom=main codex-app-server.service

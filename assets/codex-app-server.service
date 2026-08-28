@@ -4,7 +4,10 @@ Description=Shared Codex app server
 [Service]
 Type=simple
 ExecStart=/usr/bin/codex app-server --listen unix://
-Restart=on-failure
+# The kernel may kill a sacrificial tool descendant under memory pressure.
+# Keep the agent alive so it can observe that failure and recover the turn.
+OOMPolicy=continue
+Restart=always
 RestartSec=3s
 TimeoutStopSec=1h
 UMask=0077
