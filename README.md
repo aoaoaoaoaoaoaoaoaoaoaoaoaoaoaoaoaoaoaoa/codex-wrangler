@@ -31,8 +31,9 @@ remotes = ["MAIN", "vivobook"]
 ```
 
 Each Site must run the Wrangler-managed Codex distribution and expose
-`/usr/bin/codex-wrangler-bridge`. Wrangler reads remote state through that
-bridge and opens remote sessions in local Alacritty windows.
+`codex-wrangler-bridge`. Federation prefers the Site's user-local installation
+and falls back to `/usr/bin`; Wrangler opens remote sessions in local Alacritty
+windows.
 Colored diamonds identify Sites; their header legend reports connection,
 protocol, and distribution drift. Authentication and host policy remain owned
 by OpenSSH configuration.
