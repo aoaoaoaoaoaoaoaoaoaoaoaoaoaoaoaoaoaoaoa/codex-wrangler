@@ -567,7 +567,7 @@ fn verify_session_lifecycle(
         "superseded Codex session did not roll onto the installed version",
     )?;
     demand(
-        read_roster(&fixture.roster)?["sessions"][DONE]["cli_version"] == "0.147.0",
+        read_roster(&fixture.roster)?["sessions"][DONE]["cli_version"] == "0.151.0",
         "rolled session did not bind its launched Codex version",
     )?;
 
@@ -2587,18 +2587,16 @@ fn forge_fake_harness(testbed: &Testbed) -> Result<PathBuf> {
         "fake-session.bash",
         br#"if [ "${1:-}" = resume ]; then
   shift
+  case ${1:-} in
+    /*) ;;
+    *) shift ;;
+  esac
 fi
 rollout=$1
 proof=$2
 claim=${3:-$rollout}
-if [ "$claim" = legacy ]; then
-  claim=$rollout
-fi
 if [ "$claim" != none ]; then
   exec 9>>"$claim"
-fi
-if [ -n "${4:-}" ]; then
-  exec 8>>"$4"
 fi
 case $(xprop -id "$WINDOWID" WM_CLASS) in
   *NeutralTerminal*) ;;
@@ -2652,25 +2650,25 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<
          done\n\
          i3-msg 'workspace number 7' >/dev/null\n\
          \"$terminal\" --class NeutralTerminal --title 'Goal Codex' -o 'window.position={{x=1500,y=0}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof legacy /test/home/.codex/sessions/2026/08/03/{}' &\n\
+           'exec -a codex bash /test/fake-session.bash resume {GOAL} /test/home/.codex/sessions/2026/08/03/{} /test/focus-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Turn Codex' -o 'window.position={{x=1500,y=200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof /test/home/.codex/thread-writer-locks/{TURN}.lock' &\n\
+           'exec -a codex bash /test/fake-session.bash resume {TURN} /test/home/.codex/sessions/2026/08/03/{} /test/turn-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --working-directory /test/work/fresh-transplanted --class NeutralTerminal --title 'Fresh Codex' -o 'window.position={{x=1500,y=300}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a codex bash /test/fake-session.bash resume /test/home/.codex/sessions/2026/08/03/{} /test/fresh-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Done Codex' -o 'window.position={{x=1500,y=400}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/done-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash resume {DONE} /test/home/.codex/sessions/2026/08/03/{} /test/done-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Input Codex' -o 'window.position={{x=1500,y=600}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/input-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash resume {INPUT} /test/home/.codex/sessions/2026/08/03/{} /test/input-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title '[ ! ] Action Required | Permission Codex' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/permission-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash resume {PERMISSION} /test/home/.codex/sessions/2026/08/03/{} /test/permission-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Old Account Codex' -o 'window.position={{x=1500,y=1000}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/rotate-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash resume {ROTATE} /test/home/.codex/sessions/2026/08/03/{} /test/rotate-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Claude Code' -o 'window.position={{x=1500,y=800}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
            'exec -a claude bash /test/fake-session.bash /test/home/.claude/projects/-work-claude/{} /test/claude-proof' &\n\
@@ -2679,7 +2677,7 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<
            'exec -a prime-agent bash /test/fake-session.bash /test/home/.prime/agent/sessions/{} /test/prime-proof' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          \"$terminal\" --class NeutralTerminal --title 'Error Codex' -o 'window.position={{x=1500,y=1200}}' -o 'window.dimensions={{columns=20,lines=5}}' -e bash -c \
-           'exec -a codex bash /test/fake-session.bash /test/home/.codex/sessions/2026/08/03/{} /test/error-proof' &\n\
+           'exec -a codex bash /test/fake-session.bash resume {ERROR} /test/home/.codex/sessions/2026/08/03/{} /test/error-proof none' &\n\
          terminal_pids=\"$terminal_pids $!\"\n\
          fixture_windows=0\n\
          ready=0\n\
@@ -2711,7 +2709,6 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<
          done\n\
          exec {}\n",
         names[0],
-        names[9],
         names[1],
         names[10],
         names[2],
@@ -2735,7 +2732,7 @@ fn forge_fake_cli(testbed: &Testbed) -> Result<PathBuf> {
 db=/test/home/.codex/state_5.sqlite
 sqlite() {{ sqlite3 -batch -cmd '.timeout 2000' "$db" "$@"; }}
 if [ "${{1:-}}" = --version ]; then
-  printf '%s\n' 'codex-cli 0.147.0'
+  printf '%s\n' 'codex-cli 0.151.0'
   exit 0
 fi
 if [ "${{1:-}}" = app-server ]; then
@@ -2817,7 +2814,7 @@ esac
 workspace=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused).num')
 printf '%s\n' "$operation $workspace" > "/test/${{operation}}-proof-${{thread}}"
 rollout=$(sqlite "SELECT rollout_path FROM threads WHERE id = '$thread'")
-exec -a codex bash -c 'exec 9>>"$1"; sleep 90; :' wrangler-resume "$rollout"
+exec -a codex bash -c 'exec 9>>"$2"; sleep 90; :' resume "$thread" "$rollout"
 "#,
         ),
     )
@@ -2983,7 +2980,7 @@ fn seed_index(path: &Path) -> Result<()> {
            id TEXT PRIMARY KEY, title TEXT NOT NULL, name TEXT, cwd TEXT NOT NULL,
            updated_at_ms INTEGER NOT NULL, thread_source TEXT, source TEXT NOT NULL,
            agent_role TEXT, rollout_path TEXT NOT NULL,
-           cli_version TEXT NOT NULL DEFAULT '0.147.0',
+           cli_version TEXT NOT NULL DEFAULT '0.151.0',
            git_origin_url TEXT,
            archived INTEGER NOT NULL DEFAULT 0
          );",
@@ -2991,7 +2988,7 @@ fn seed_index(path: &Path) -> Result<()> {
     .map_err(verdict("declare fixture thread index"))?;
     seed_thread_rows(&db)?;
     db.execute(
-        "UPDATE threads SET cli_version = '0.146.0' WHERE id = ?1",
+        "UPDATE threads SET cli_version = '0.149.0' WHERE id = ?1",
         params![DONE],
     )
     .map_err(verdict("seed superseded Codex version"))?;

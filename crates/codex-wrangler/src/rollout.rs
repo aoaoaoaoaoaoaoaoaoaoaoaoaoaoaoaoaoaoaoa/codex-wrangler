@@ -215,9 +215,9 @@ pub struct RolloutSummary {
 }
 
 impl RolloutSummary {
-    /// Codex 0.147 creates the authoritative thread row and writer lock before
-    /// materializing a rollout. Until the first turn, that is a lawful stopped
-    /// session rather than a failed read.
+    /// The shared app server may create the authoritative thread row and writer
+    /// lock before materializing a rollout. Until the first turn, that is a
+    /// lawful stopped session rather than a failed read.
     pub fn quiescent() -> Self {
         Self {
             preview: String::new(),

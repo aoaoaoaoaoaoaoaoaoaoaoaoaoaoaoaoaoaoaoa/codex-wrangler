@@ -278,7 +278,7 @@ mod tests {
             preview: "Still.",
             updated_at_ms: 7,
             workspace: Some(4),
-            cli_version: Some("0.147.0"),
+            cli_version: Some("0.149.0"),
             account: Some(quota(1_000_000)),
         });
         roster.commit().expect("seal roster");
