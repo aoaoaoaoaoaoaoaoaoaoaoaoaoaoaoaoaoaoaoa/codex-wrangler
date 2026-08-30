@@ -31,6 +31,10 @@ session. Session ownership and remote terminal windows do not confer a Seat.
 : A Wrangler-owned ordering mark that keeps a session in the head bucket. It
 does not change harness state.
 
+**Roster**
+: The Site-owned set of sessions Wrangler has observed live and not forgotten.
+It is the sole authority for closed cards at that Site.
+
 **Fork**
 : A harness operation that creates a new thread from an existing Codex thread.
 

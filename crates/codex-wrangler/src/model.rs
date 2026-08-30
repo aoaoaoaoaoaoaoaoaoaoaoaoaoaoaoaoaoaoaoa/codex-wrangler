@@ -38,11 +38,6 @@ impl Card {
                 self.seat.is_none(),
                 "a local closed session must be exactly seatless"
             );
-        } else {
-            assert!(
-                self.work != Work::Closed,
-                "remote history must not masquerade as a live card"
-            );
         }
     }
 

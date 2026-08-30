@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::{BufRead as _, BufReader, Read as _},
     process::{Child, Command, Stdio},
     sync::{
@@ -27,7 +28,7 @@ use crate::{
     site::{RemoteSite, Site},
 };
 
-const BRIDGE_PROTOCOL: u16 = 1;
+const BRIDGE_PROTOCOL: u16 = 2;
 const RECONNECTION_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -63,7 +64,9 @@ pub struct FleetStriker {
 struct SiteState {
     status: SiteStatus,
     protocol_compatible: bool,
-    cards: Vec<Card>,
+    live_cards: Vec<Card>,
+    history_cards: Vec<Card>,
+    roster: HashSet<String>,
     sessions: Vec<Session>,
 }
 
@@ -93,6 +96,9 @@ enum Frame {
     History {
         threads: Vec<HistoricalThread>,
     },
+    Roster {
+        threads: Vec<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +124,8 @@ enum RemoteWork {
 struct HistoricalThread {
     thread: String,
     name: Option<String>,
+    cwd: String,
+    preview: String,
     updated_at: i64,
     last_turn: String,
     archived: bool,
@@ -154,7 +162,9 @@ impl FleetWorker {
                             fault: Some("CONNECTING".to_owned()),
                         },
                         protocol_compatible: false,
-                        cards: Vec::new(),
+                        live_cards: Vec::new(),
+                        history_cards: Vec::new(),
+                        roster: HashSet::new(),
                         sessions: Vec::new(),
                     })
                 })
@@ -394,13 +404,15 @@ fn absorb(
             state.status.fault = if state.protocol_compatible {
                 distribution_fault(expected_codex, &state.status)
             } else {
+                state.live_cards.clear();
+                state.roster.clear();
                 Some(format!(
                     "HARMONIZE SITE · bridge protocol {protocol}, expected {BRIDGE_PROTOCOL}"
                 ))
             };
         }
         Frame::Live { threads } if state.protocol_compatible => {
-            state.cards = threads
+            state.live_cards = threads
                 .into_iter()
                 .map(|thread| Card {
                     site: Site::Remote(site.clone()),
@@ -417,23 +429,43 @@ fn absorb(
                 })
                 .collect();
         }
+        Frame::Roster { threads } if state.protocol_compatible => {
+            state.roster = threads.into_iter().collect();
+        }
         Frame::History { threads } if state.protocol_compatible => {
-            state.sessions = threads
-                .into_iter()
-                .map(|thread| Session {
+            let mut sessions = Vec::with_capacity(threads.len());
+            let mut history_cards = Vec::with_capacity(threads.len());
+            for thread in threads {
+                let updated_at_ms = thread.updated_at.saturating_mul(1_000);
+                history_cards.push(Card {
+                    site: Site::Remote(site.clone()),
+                    harness: Harness::Codex,
+                    thread: thread.thread.clone(),
+                    name: thread.name.clone(),
+                    cwd: thread.cwd,
+                    tile_preview: thread.preview,
+                    work: Work::Closed,
+                    seat: None,
+                    last_workspace: None,
+                    updated_at_ms,
+                    pinned: false,
+                });
+                sessions.push(Session {
                     site: Site::Remote(site.clone()),
                     thread: thread.thread,
                     name: thread.name,
                     last_turn: thread.last_turn,
-                    updated_at_ms: thread.updated_at.saturating_mul(1_000),
+                    updated_at_ms,
                     turns: None,
                     tally_failed: true,
                     bytes: 0,
                     archived: thread.archived,
-                })
-                .collect();
+                });
+            }
+            state.history_cards = history_cards;
+            state.sessions = sessions;
         }
-        Frame::Live { .. } | Frame::History { .. } => {}
+        Frame::Live { .. } | Frame::History { .. } | Frame::Roster { .. } => {}
     }
     drop(state);
     publish(repaint, latest, states);
@@ -465,7 +497,8 @@ fn fault(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.status.fault = Some(error);
     state.protocol_compatible = false;
-    state.cards.clear();
+    state.live_cards.clear();
+    state.roster.clear();
     drop(state);
     publish(repaint, latest, states);
 }
@@ -496,10 +529,7 @@ fn publish(
         })
         .collect::<Vec<_>>();
     let mut snapshot = FleetSnapshot {
-        cards: states
-            .iter()
-            .flat_map(|state| state.cards.clone())
-            .collect(),
+        cards: states.iter().flat_map(SiteState::cards).collect(),
         sessions: states
             .iter()
             .flat_map(|state| state.sessions.clone())
@@ -518,6 +548,24 @@ fn publish(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     let _repaint = repaint.request_repaint();
+}
+
+impl SiteState {
+    fn cards(&self) -> impl Iterator<Item = Card> + '_ {
+        let loaded = self
+            .live_cards
+            .iter()
+            .map(|card| card.thread.as_str())
+            .collect::<HashSet<_>>();
+        self.live_cards.iter().cloned().chain(
+            self.history_cards
+                .iter()
+                .filter(move |card| {
+                    self.roster.contains(&card.thread) && !loaded.contains(card.thread.as_str())
+                })
+                .cloned(),
+        )
+    }
 }
 
 fn bridge_error(child: &mut Child) -> String {
