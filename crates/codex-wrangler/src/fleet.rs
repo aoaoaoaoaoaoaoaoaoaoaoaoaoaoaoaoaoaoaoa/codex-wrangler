@@ -608,6 +608,8 @@ fn launch(strike: &Strike) -> anyhow::Result<bool> {
             "-t",
             "--",
             site.endpoint(),
+            "/usr/bin/env",
+            "COLORTERM=truecolor",
             "/usr/bin/codex-wrangler",
             "relay",
             verb,

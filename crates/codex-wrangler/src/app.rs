@@ -2854,7 +2854,7 @@ fn paint_card_contents(
     match_spans: &[std::ops::Range<usize>],
 ) {
     let workspace_width = paint_workspace(ui, visual, card);
-    let site_width = paint_site(ui, visual, &card.site);
+    paint_site(ui, visual, &card.site);
     let inner = visual.shrink2(Vec2::new(14.0, 11.0));
     let mut body = ui.new_child(
         egui::UiBuilder::new()
@@ -2865,7 +2865,7 @@ fn paint_card_contents(
     body.set_max_width(inner.width());
     body.set_clip_rect(ui.clip_rect().intersect(inner));
     let name = card.name.as_deref().filter(|name| !name.is_empty());
-    body.set_max_width((inner.width() - workspace_width.max(site_width)).max(80.0));
+    body.set_max_width((inner.width() - workspace_width).max(80.0));
     let _name = if let Some(name) = name {
         marked_label(&mut body, name, match_spans, chrome::TEXT)
     } else {
@@ -3079,11 +3079,15 @@ fn fleet_legend(ui: &mut egui::Ui, fleet: Option<&FleetSnapshot>) {
         return;
     };
     ui.add_space(3.0);
-    let _row = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        for site in fleet.sites.iter().rev() {
-            site_legend(ui, site);
-        }
-    });
+    let _row = ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            for site in fleet.sites.iter().rev() {
+                site_legend(ui, site);
+            }
+        },
+    );
 }
 
 fn site_color(site: &crate::site::RemoteSite) -> Color32 {
@@ -3176,29 +3180,15 @@ fn paint_workspace(ui: &egui::Ui, tile: egui::Rect, card: &Card) -> f32 {
     width
 }
 
-fn paint_site(ui: &egui::Ui, tile: egui::Rect, site: &Site) -> f32 {
+fn paint_site(ui: &egui::Ui, tile: egui::Rect, site: &Site) {
     let Some(site) = site.remote() else {
-        return 0.0;
+        return;
     };
-    let badge_side = 22.0;
-    let rect = egui::Rect::from_min_size(
-        egui::pos2(tile.right() - badge_side, tile.top()),
-        Vec2::splat(badge_side),
-    );
-    let center = rect.center();
-    let radius = 4.5;
-    let points = vec![
-        center + egui::vec2(0.0, -radius),
-        center + egui::vec2(radius, 0.0),
-        center + egui::vec2(0.0, radius),
-        center + egui::vec2(-radius, 0.0),
-    ];
-    ui.painter().add(egui::Shape::convex_polygon(
-        points,
+    ui.painter().circle_filled(
+        tile.left_top() + egui::vec2(7.0, 7.0),
+        3.5,
         site_color(site),
-        Stroke::NONE,
-    ));
-    badge_side
+    );
 }
 
 const fn work_color(work: Work) -> Color32 {
