@@ -34,9 +34,10 @@ use crate::{
     model::{Card, LiveSnapshot, Seat, snip},
     names::NameIndex,
     pinboard::Pinboard,
+    relay,
     rollout::{RolloutSummary, Rollouts, TurnState},
     roster::{AccountMark, Roster, Sighting as SessionSighting},
-    site::{RemoteSite, SessionKey, Site},
+    site::{SessionKey, Site},
     stasis::{ProcessKey, Quarry, Stasis},
     transcript::Transcripts,
     watchfire::Watchfire,
@@ -1564,7 +1565,7 @@ fn manual_forest(
         let Some(argv) = process_arguments(&root) else {
             continue;
         };
-        if let Some(key) = relay_session(&argv) {
+        if let Some(key) = relay::resumed_session(&argv) {
             let hint = process_environment(&root)
                 .get("WINDOWID")
                 .and_then(|value| x11_window_id(value));
@@ -1612,25 +1613,6 @@ fn process_arguments(root: &Path) -> Option<Vec<OsString>> {
             .map(|arg| OsString::from_vec(arg.to_vec()))
             .collect(),
     )
-}
-
-fn relay_session(argv: &[OsString]) -> Option<SessionKey> {
-    if Path::new(argv.first()?).file_name()? != OsStr::new("ssh") {
-        return None;
-    }
-    let separator = argv.iter().rposition(|arg| arg == OsStr::new("--"))?;
-    let [endpoint, wrangler, relay, resume, thread] = argv.get(separator + 1..)? else {
-        return None;
-    };
-    if Path::new(wrangler).file_name()? != OsStr::new("codex-wrangler")
-        || relay != OsStr::new("relay")
-        || resume != OsStr::new("resume")
-    {
-        return None;
-    }
-    let thread = thread.to_str().filter(|thread| uuid_literal(thread))?;
-    let site = RemoteSite::parse(endpoint.to_str()?).ok()?;
-    Some(SessionKey::new(Site::Remote(site), thread.to_owned()))
 }
 
 fn proc_pids() -> Vec<u32> {
@@ -2354,37 +2336,6 @@ mod tests {
                 OsString::from("resume"),
                 OsString::from("--last"),
             ]),
-            None
-        );
-    }
-
-    #[test]
-    fn relay_seat_requires_the_exact_remote_resume_grammar() {
-        let id = "019fc940-b18f-7ad2-a012-71d86289bd60";
-        let command = [
-            "ssh",
-            "-t",
-            "--",
-            "main",
-            "/usr/bin/codex-wrangler",
-            "relay",
-            "resume",
-            id,
-        ]
-        .map(OsString::from);
-        assert_eq!(
-            relay_session(&command),
-            Some(SessionKey::new(
-                Site::Remote(RemoteSite::parse("main").expect("valid fixture Site")),
-                id.to_owned(),
-            ))
-        );
-
-        let mut fork = command.clone();
-        fork[6] = OsString::from("fork");
-        assert_eq!(relay_session(&fork), None);
-        assert_eq!(
-            relay_session(&[OsString::from("ssh"), OsString::from("main")]),
             None
         );
     }

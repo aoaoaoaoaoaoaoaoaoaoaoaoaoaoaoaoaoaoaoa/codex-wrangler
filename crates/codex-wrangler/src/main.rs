@@ -13,6 +13,7 @@ mod names;
 mod pinboard;
 mod posture;
 mod recon;
+mod relay;
 mod rollout;
 mod roster;
 mod search;

@@ -25,6 +25,7 @@ use crate::{
     history::Session,
     model::Card,
     recon::{Activation, Intent, Strike},
+    relay::{self, RelayOperation},
     site::{RemoteSite, Site},
 };
 
@@ -596,25 +597,14 @@ fn launch(strike: &Strike) -> anyhow::Result<bool> {
         Desktop::connect()?.activate(seat.window)?;
         return Ok(true);
     }
-    let verb = match strike.intent {
-        Intent::Select | Intent::Open => "resume",
-        Intent::Fork => "fork",
+    let operation = match strike.intent {
+        Intent::Select | Intent::Open => RelayOperation::Resume,
+        Intent::Fork => RelayOperation::Fork,
         Intent::Pin | Intent::Unpin | Intent::Dismiss => return Ok(false),
     };
     let mut child = Command::new("alacritty")
-        .args([
-            "-e",
-            "ssh",
-            "-t",
-            "--",
-            site.endpoint(),
-            "/usr/bin/env",
-            "COLORTERM=truecolor",
-            "/usr/bin/codex-wrangler",
-            "relay",
-            verb,
-            &strike.thread,
-        ])
+        .arg("-e")
+        .args(relay::ssh_argv(site, operation, &strike.thread))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
