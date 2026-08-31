@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use brass_poolrooms::chrome::FontScale;
 use directories::ProjectDirs;
 use eternalist_apps::configuration::{
     Configuration as ConfigurationContract, ConfigurationFault, ConfigurationLedger,
@@ -19,6 +20,7 @@ const SETTLE: Duration = Duration::from_millis(350);
 #[serde(default)]
 struct ConfigurationValues {
     confirm_deletion: bool,
+    font_scale: FontScale,
     minimize_on_close: bool,
     remotes: Vec<String>,
 }
@@ -27,6 +29,7 @@ impl Default for ConfigurationValues {
     fn default() -> Self {
         Self {
             confirm_deletion: true,
+            font_scale: FontScale::Standard,
             minimize_on_close: false,
             remotes: Vec::new(),
         }
@@ -84,6 +87,19 @@ impl Configuration {
 
     pub const fn confirm_deletion(&self) -> bool {
         self.ledger.live().confirm_deletion
+    }
+
+    pub const fn font_scale(&self) -> FontScale {
+        self.ledger.live().font_scale
+    }
+
+    pub fn set_font_scale(&mut self, scale: FontScale) -> bool {
+        self.ledger
+            .revise(|values| values.font_scale = scale)
+            .unwrap_or_else(|error| {
+                eprintln!("codex-wrangler cannot revise font scale: {error:#}");
+                false
+            })
     }
 
     pub fn set_confirm_deletion(&mut self, confirm: bool) -> bool {
@@ -178,6 +194,7 @@ fn legacy() -> Result<ConfigurationValues> {
     );
     Ok(ConfigurationValues {
         confirm_deletion: legacy.confirm_deletion,
+        font_scale: FontScale::Standard,
         minimize_on_close: legacy.minimize_on_close,
         remotes: Vec::new(),
     })

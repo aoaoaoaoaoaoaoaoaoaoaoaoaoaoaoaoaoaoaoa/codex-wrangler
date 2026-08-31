@@ -1092,6 +1092,7 @@ fn verify_gallery(
     verify_snapshot(&frame.state)?;
     verify_native_cursor_fields(story)?;
     enable_minimize_on_close(story, &fixture.configuration_path)?;
+    verify_font_scale(story, &fixture.configuration_path)?;
     verify_configuration_preflight(story, &fixture.configuration_path)?;
     verify_search_and_help(story)?;
     verify_history(testbed, story, &fixture.index)?;
@@ -1363,6 +1364,83 @@ fn enable_minimize_on_close(
             .any(|line| line.trim() == "minimize_on_close = true"),
         "minimize-on-close did not seal its XDG configuration",
     )
+}
+
+fn verify_font_scale(
+    story: &mut Story<'_, '_, Observation>,
+    configuration_path: &Path,
+) -> Result<()> {
+    const FONT_SCALE: &str = "eternalist.settings.entry/font_scale";
+    const APPLICATION_NAME: &str = "eternalist.application.name";
+
+    let standard = story.anchor(APPLICATION_NAME)?.rect;
+    let opened = story.session().key(Key::Function(2))?;
+    let _opened = story
+        .reaction(opened)
+        .within(input_reaction_budget())
+        .until(Condition::new(
+            "settings shortcut to expose the canonical font scale",
+            |state: &Observation| state.settings.open,
+        ))?;
+    let _focused = story
+        .tap(FONT_SCALE, Button::Primary, Motion::default())?
+        .within(ReactionBudget::functional(FUNCTIONAL_INPUT_TIMEOUT))
+        .next_frame()?;
+    let _rendered = story
+        .key(Key::End)?
+        .within(ReactionBudget::functional(FUNCTIONAL_INPUT_TIMEOUT))
+        .next_frame()?;
+    let configuration = configuration_path.to_owned();
+    let _sealed = story.wait_stable(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        "extra-large semantic typography to settle",
+        move |frame| {
+            (frame.state.settings.settled
+                && fs::read_to_string(&configuration).is_ok_and(|source| {
+                    source
+                        .lines()
+                        .any(|line| line.trim() == "font_scale = \"extra_large\"")
+                }))
+            .then_some(())
+        },
+    )?;
+    let extra_large = story.anchor(APPLICATION_NAME)?.rect;
+    demand(
+        extra_large[3] - extra_large[1] > standard[3] - standard[1],
+        "extra-large setting did not enlarge semantic application text",
+    )?;
+
+    let _rendered = story
+        .key(Key::Home)?
+        .within(ReactionBudget::functional(FUNCTIONAL_INPUT_TIMEOUT))
+        .next_frame()?;
+    let configuration = configuration_path.to_owned();
+    let _sealed = story.wait_stable(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        "standard semantic typography to settle",
+        move |frame| {
+            (frame.state.settings.settled
+                && fs::read_to_string(&configuration).is_ok_and(|source| {
+                    source
+                        .lines()
+                        .any(|line| line.trim() == "font_scale = \"standard\"")
+                }))
+            .then_some(())
+        },
+    )?;
+    let closed = story
+        .session()
+        .chord(Modifiers::CTRL, Key::Character(','))?;
+    let _closed = story
+        .reaction(closed)
+        .within(ReactionBudget::functional(FUNCTIONAL_INPUT_TIMEOUT))
+        .until(Condition::new(
+            "settings shortcut to close the typography sheet",
+            |state: &Observation| !state.settings.open,
+        ))?;
+    Ok(())
 }
 
 fn verify_configuration_preflight(

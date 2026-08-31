@@ -9,7 +9,9 @@ use std::{
 
 use brass_poolrooms::{
     chrome,
-    chrome::{ForgePin, LonginusCursor, MechanismSize, ScrewScroll, SortDetent, SortToggle},
+    chrome::{
+        ForgePin, LonginusCursor, MechanismSize, ScrewScroll, SortDetent, SortToggle, TypeRole,
+    },
     water::{Domain, Floor, Frame as WaterFrame, Poke, Radiator, Surface, Wetness},
 };
 #[cfg(feature = "egui-test")]
@@ -70,7 +72,6 @@ const SITE_PALETTE: [Color32; 6] = [
     Color32::from_rgb(151, 127, 232),
     Color32::from_rgb(235, 126, 84),
 ];
-const TYPE_LIFT: f32 = 1.0;
 const SUMMON_BARRAGE: u8 = 12;
 const LONGINUS_FREQUENCY_HZ: f32 = 0.66;
 const LONGINUS_STRENGTH: f32 = 0.58;
@@ -357,9 +358,9 @@ pub fn launch(
 
 impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     fn raise(ctx: &egui::Context, incumbent: Incumbent, ledger: Ledger) -> anyhow::Result<Self> {
-        lift_typography(ctx);
         let wake = NativeWake::from_context(ctx);
         let configuration = Configuration::raise(ctx)?;
+        chrome::set_font_scale(ctx, configuration.font_scale());
         let remote_sites = configuration.remotes();
         let live_worker = spawn(wake.clone());
         let history_worker = spawn_history(wake.clone());
@@ -858,9 +859,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 Page::Historical => (self.history_search.label(), self.history_search.valid()),
             };
             let count = if valid {
-                chrome::muted(label).size(13.0)
+                chrome::muted(label)
             } else {
-                RichText::new(label).size(13.0).color(RED)
+                TypeRole::Body.text(label).color(RED)
             };
             let _count = ui.label(count);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -928,9 +929,9 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 ui.add_space(10.0);
                 let filter = format!("FILTER · {query}");
                 let text = if valid {
-                    chrome::muted(filter).size(12.0)
+                    TypeRole::Label.text(filter).color(chrome::MUTED)
                 } else {
-                    RichText::new(filter).size(12.0).color(RED)
+                    TypeRole::Label.text(filter).color(RED)
                 };
                 let filter_rect = ui
                     .add(
@@ -965,7 +966,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         if !faults.is_empty() {
             ui.add_space(7.0);
             let _fault = ui.add(
-                egui::Label::new(RichText::new(faults.join("\n")).size(12.0).color(RED))
+                egui::Label::new(TypeRole::Body.text(faults.join("\n")).color(RED))
                     .wrap()
                     .show_tooltip_when_elided(false),
             );
@@ -985,15 +986,22 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let file = file
             .reloading(self.configuration.reload_pending())
             .reloadable(self.configuration.fault().is_some() || self.configuration.settled());
+        let mut font_scale = self.configuration.font_scale();
         let mut minimize = self.configuration.minimize_on_close();
         let mut confirm = self.configuration.confirm_deletion();
+        let mut font_scale_changed = false;
         let mut minimize_changed = false;
         let mut confirm_changed = false;
         let response = self.settings.show(ctx, &mut self.water, file, |ui| {
-            ui.section("BEHAVIOR");
+            ui.group("APPEARANCE");
+            font_scale_changed = ui.font_scale(&mut font_scale);
+            ui.group("BEHAVIOR");
             minimize_changed = ui.boolean(MINIMIZE_ON_CLOSE, &mut minimize);
             confirm_changed = ui.boolean(CONFIRM_DELETION, &mut confirm);
         });
+        if font_scale_changed && self.configuration.set_font_scale(font_scale) {
+            chrome::set_font_scale(ctx, font_scale);
+        }
         if minimize_changed {
             let _revised = self.configuration.set_minimize_on_close(minimize);
         }
@@ -1007,6 +1015,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
 
     fn reconcile_configuration(&mut self, ui: &egui::Ui) -> bool {
         let mut changed = self.configuration.absorb();
+        chrome::set_font_scale(ui.ctx(), self.configuration.font_scale());
         if self.configuration.fault().is_none() {
             let remotes = self.configuration.remotes();
             if remotes != self.remote_sites {
@@ -1084,13 +1093,11 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                             .is_some_and(|snapshot| snapshot.cards.is_empty())
                         {
                             let _empty = ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    chrome::muted("NO MANUAL HARNESS TERMINALS FOUND").size(13.0),
-                                )
+                                ui.label(chrome::muted("NO MANUAL HARNESS TERMINALS FOUND"))
                             });
                         } else if self.search.hits().is_empty() {
                             let _empty = ui.centered_and_justified(|ui| {
-                                ui.label(chrome::muted("NO MATCHING SESSIONS").size(13.0))
+                                ui.label(chrome::muted("NO MATCHING SESSIONS"))
                             });
                         } else if let Some(snapshot) = &self.live_snapshot {
                             selected = gallery(
@@ -1135,7 +1142,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 if let Some(error) = &self.history_error {
                     ui.add_space(7.0);
                     let _error = ui.add(
-                        egui::Label::new(RichText::new(error).size(12.0).color(RED))
+                        egui::Label::new(TypeRole::Body.text(error).color(RED))
                             .wrap()
                             .show_tooltip_when_elided(false),
                     );
@@ -1150,8 +1157,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                     } else {
                         "NO MATCHING HISTORICAL SESSIONS"
                     };
-                    let _empty =
-                        ui.centered_and_justified(|ui| ui.label(chrome::muted(message).size(13.0)));
+                    let _empty = ui.centered_and_justified(|ui| ui.label(chrome::muted(message)));
                     return 0.0;
                 }
                 let width = ui.available_width();
@@ -1394,11 +1400,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 let width = 860.0_f32.min(ctx.content_rect().width() - 48.0);
                 ui.set_width(width);
                 transcript_header(ui, &mut view, &mut self.water);
-                let _thread = ui.label(
-                    RichText::new(&view.key.thread)
-                        .size(11.0)
-                        .color(chrome::MUTED),
-                );
+                let _thread = ui.label(TypeRole::Label.text(&view.key.thread).color(chrome::MUTED));
                 ui.add_space(12.0);
                 match &view.state {
                     TranscriptState::Loading => {
@@ -1461,11 +1463,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
                 let _title = ui.label(chrome::title("DELETE SESSION PERMANENTLY?"));
                 ui.add_space(9.0);
                 let _name = ui.label(RichText::new(name).color(chrome::TEXT));
-                let _thread = ui.label(
-                    RichText::new(&thread.thread)
-                        .size(11.0)
-                        .color(chrome::MUTED),
-                );
+                let _thread = ui.label(TypeRole::Label.text(&thread.thread).color(chrome::MUTED));
                 ui.add_space(10.0);
                 let _warning = ui.label(
                     RichText::new("The rollout and its Codex index record will be destroyed.")
@@ -2031,7 +2029,7 @@ fn transcript_header(ui: &mut egui::Ui, view: &mut TranscriptView, water: &mut S
         };
         let previous = ui.add_enabled(
             cursor > 0,
-            egui::Button::new(RichText::new("←").size(18.0)).min_size(Vec2::new(34.0, 28.0)),
+            egui::Button::new(TypeRole::Body.text("←")).min_size(Vec2::new(34.0, 28.0)),
         );
         chrome::shallow_tension(ui, &previous);
         brass_poolrooms::poolroom_anchor!(
@@ -2041,7 +2039,7 @@ fn transcript_header(ui: &mut egui::Ui, view: &mut TranscriptView, water: &mut S
         );
         let next = ui.add_enabled(
             cursor + 1 < total,
-            egui::Button::new(RichText::new("→").size(18.0)).min_size(Vec2::new(34.0, 28.0)),
+            egui::Button::new(TypeRole::Body.text("→")).min_size(Vec2::new(34.0, 28.0)),
         );
         chrome::shallow_tension(ui, &next);
         brass_poolrooms::poolroom_anchor!(
@@ -2074,7 +2072,7 @@ fn transcript_header(ui: &mut egui::Ui, view: &mut TranscriptView, water: &mut S
             } else {
                 format!("TURN {} / {total}", cursor + 1)
             };
-            let _position = ui.label(chrome::muted(position).size(12.0));
+            let _position = ui.label(TypeRole::Label.text(position).color(chrome::MUTED));
         });
     });
 }
@@ -2209,7 +2207,7 @@ fn history_sort_cell(
             Some(SortDirection::Descending) => SortDetent::Descending,
             None => SortDetent::Off,
         };
-        let mut text = chrome::eyebrow(label).size(11.0);
+        let mut text = TypeRole::Label.text(label).color(chrome::MUTED);
         if direction.is_some() {
             text = text.color(chrome::HOT);
         }
@@ -2321,7 +2319,7 @@ fn history_row(
     if flight == Some(HistoryOperation::Delete) {
         history_cell(&mut row, columns.open, |_| {});
         history_cell(&mut row, columns.action, |ui| {
-            let _deleting = ui.label(chrome::muted("DELETING…").size(11.0));
+            let _deleting = ui.label(TypeRole::Label.text("DELETING…").color(chrome::MUTED));
         });
         history_cell(&mut row, columns.delete, |_| {});
     } else if action.is_none() {
@@ -2387,7 +2385,13 @@ fn history_facts(
             ));
             ui.add_space(3.0);
         }
-        let _id = history_marked_label(ui, &session.thread, hit.id_spans(), chrome::MUTED, 11.0);
+        let _id = history_marked_label(
+            ui,
+            &session.thread,
+            hit.id_spans(),
+            chrome::MUTED,
+            TypeRole::Label,
+        );
     });
     let mut action = history_rename_control(
         row,
@@ -2403,8 +2407,8 @@ fn history_facts(
     }
     history_cell(row, columns.date, |ui| {
         let _date = ui.label(
-            RichText::new(&session.last_turn)
-                .size(12.0)
+            TypeRole::Label
+                .text(&session.last_turn)
                 .color(chrome::MUTED),
         );
     });
@@ -2422,7 +2426,7 @@ fn history_facts(
         } else {
             chrome::TEXT
         };
-        let _turns = ui.label(RichText::new(tally).size(12.0).color(color));
+        let _turns = ui.label(TypeRole::Body.text(tally).color(color));
     });
     history_cell(row, columns.size, |ui| {
         let size = if session.site.local() {
@@ -2430,7 +2434,7 @@ fn history_facts(
         } else {
             "REMOTE".to_owned()
         };
-        let _size = ui.label(RichText::new(size).size(12.0).color(chrome::TEXT));
+        let _size = ui.label(TypeRole::Body.text(size).color(chrome::TEXT));
     });
     history_cell(row, columns.state, |ui| {
         let (label, color) = if session.archived {
@@ -2438,7 +2442,7 @@ fn history_facts(
         } else {
             ("UNARCHIVED", chrome::MUTED)
         };
-        let _state = ui.label(RichText::new(label).size(11.0).color(color));
+        let _state = ui.label(TypeRole::Label.text(label).color(color));
     });
     action
 }
@@ -2493,10 +2497,11 @@ fn history_name(
     history_cell(row, width, |ui| {
         let Some(draft) = rename.as_mut().filter(|draft| draft.key == session.key()) else {
             if let Some(name) = session.name.as_deref() {
-                let _name = history_marked_label(ui, name, hit.name_spans(), chrome::TEXT, 13.0);
+                let _name =
+                    history_marked_label(ui, name, hit.name_spans(), chrome::TEXT, TypeRole::Body);
             } else {
                 let _anonymous = ui.add(
-                    egui::Label::new(RichText::new("anonymous").size(11.0).color(chrome::MUTED))
+                    egui::Label::new(TypeRole::Label.text("anonymous").color(chrome::MUTED))
                         .truncate()
                         .show_tooltip_when_elided(false),
                 );
@@ -2563,7 +2568,7 @@ fn history_open(
     history_cell(row, width, |ui| {
         let response = ui.add_enabled(
             !editing && flight.is_none(),
-            egui::Button::new(RichText::new("OPEN").size(11.0)).min_size(Vec2::new(60.0, 24.0)),
+            egui::Button::new("OPEN").min_size(Vec2::new(60.0, 24.0)),
         );
         chrome::shallow_tension(ui, &response);
         brass_poolrooms::poolroom_anchor!(
@@ -2604,7 +2609,7 @@ fn history_operation(
         );
         let response = ui.add_enabled(
             session.site.local() && !editing && flight.is_none(),
-            egui::Button::new(RichText::new(label).size(11.0)).min_size(Vec2::new(92.0, 24.0)),
+            egui::Button::new(label).min_size(Vec2::new(92.0, 24.0)),
         );
         chrome::shallow_tension(ui, &response);
         brass_poolrooms::poolroom_anchor!(
@@ -2681,13 +2686,13 @@ fn history_marked_label(
     text: &str,
     spans: &[std::ops::Range<usize>],
     color: Color32,
-    size: f32,
+    role: TypeRole,
 ) -> egui::Response {
     let label = if spans.is_empty() {
-        egui::Label::new(RichText::new(text).size(size).color(color))
+        egui::Label::new(role.text(text).color(color))
     } else {
         let plain = TextFormat {
-            font_id: egui::FontId::new(size, egui::FontFamily::Proportional),
+            font_id: role.proportional(ui.style()),
             color,
             ..TextFormat::default()
         };
@@ -2870,7 +2875,7 @@ fn paint_card_contents(
         marked_label(&mut body, name, match_spans, chrome::TEXT)
     } else {
         body.add(
-            egui::Label::new(RichText::new("anonymous").small().color(chrome::MUTED))
+            egui::Label::new(TypeRole::Label.text("anonymous").color(chrome::MUTED))
                 .truncate()
                 .show_tooltip_when_elided(false),
         )
@@ -3043,7 +3048,7 @@ fn legend(ui: &mut egui::Ui, label: &str, work: Work) {
     let _legend = ui.horizontal(|ui| {
         let (rect, _response) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
         paint_work(ui.painter(), rect.center(), 3.25, work);
-        let _label = ui.label(RichText::new(label).small().color(chrome::MUTED));
+        let _label = ui.label(TypeRole::Label.text(label).color(chrome::MUTED));
     });
 }
 
@@ -3057,8 +3062,8 @@ fn site_legend(ui: &mut egui::Ui, status: &crate::fleet::SiteStatus) {
                 .circle_stroke(rect.center(), 4.25, Stroke::new(1.0, RED));
         }
         let label = ui.label(
-            RichText::new(status.site.endpoint())
-                .small()
+            TypeRole::Label
+                .text(status.site.endpoint())
                 .color(chrome::MUTED),
         );
         response.union(label)
@@ -3146,7 +3151,7 @@ fn paint_workspace(ui: &egui::Ui, tile: egui::Rect, card: &Card) -> f32 {
     };
     let galley = ui.painter().layout_no_wrap(
         workspace.to_string(),
-        egui::FontId::new(14.0, egui::FontFamily::Monospace),
+        TypeRole::Body.monospace(ui.style()),
         chrome::TEXT,
     );
     let height = (galley.size().y + 6.0).max(25.0);
@@ -3204,14 +3209,6 @@ const fn work_color(work: Work) -> Color32 {
     }
 }
 
-fn lift_typography(ctx: &egui::Context) {
-    let mut style = (*ctx.global_style()).clone();
-    for font in style.text_styles.values_mut() {
-        font.size += TYPE_LIFT;
-    }
-    ctx.set_global_style(style);
-}
-
 fn arm_summon(summon: &AtomicU64, destination: Option<u32>) {
     let prior = summon.load(Ordering::Relaxed);
     let generation = u32::try_from(prior >> 32)
@@ -3248,16 +3245,6 @@ mod tests {
         assert_eq!(work_color(Work::Sleep), ASH);
         assert_eq!(work_color(Work::Closed), Color32::BLACK);
         assert_eq!(work_color(Work::Done), WHITE);
-    }
-
-    #[test]
-    fn typography_rises_by_exactly_one_point() {
-        let ctx = egui::Context::default();
-        let before = ctx.global_style().text_styles.clone();
-        lift_typography(&ctx);
-        for (text_style, font) in &ctx.global_style().text_styles {
-            assert!((font.size - before[text_style].size - 1.0).abs() < f32::EPSILON);
-        }
     }
 
     #[test]

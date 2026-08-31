@@ -1,0 +1,11 @@
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true
+
+disallowed-methods = [
+  { path = "egui::FontId::monospace", reason = "choose a Poolrooms TypeRole; a physical or dynamic spatial escape requires a narrow reasoned allow" },
+  { path = "egui::FontId::new", reason = "choose a Poolrooms TypeRole; a physical or dynamic spatial escape requires a narrow reasoned allow" },
+  { path = "egui::FontId::proportional", reason = "choose a Poolrooms TypeRole; a physical or dynamic spatial escape requires a narrow reasoned allow" },
+  { path = "egui::RichText::size", reason = "choose a Poolrooms TypeRole instead of a caller-owned point size" },
+  { path = "egui::RichText::small", reason = "choose the Poolrooms Label role instead of egui's undersized stock Small metric" },
+]

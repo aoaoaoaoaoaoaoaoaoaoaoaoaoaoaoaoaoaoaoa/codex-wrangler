@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use eternalist_apps::{
-    command_guide::{GuideGesture, GuideSection},
+    command_guide::{GuideGesture, GuideGroup},
     commands::{
         CommandCanon, CommandScope, CommandSpec, SETTINGS_SHORTCUTS, Shortcut, ShortcutKey,
         ShortcutModifiers,
@@ -49,12 +49,11 @@ const TILE_GESTURES: [GuideGesture; 2] = [
     ),
 ];
 
-pub const NAVIGATION_GUIDE_GROUP: GuideSection =
-    GuideSection::new("NAVIGATION", &NAVIGATION_GESTURES);
-pub const APPLICATION_GUIDE_GROUP: GuideSection =
-    GuideSection::new("APPLICATION", &APPLICATION_GESTURES);
-pub const SEARCH_GUIDE_GROUP: GuideSection = GuideSection::new("SEARCH", &SEARCH_GESTURES);
-pub const TILE_GUIDE_GROUP: GuideSection = GuideSection::new("TILES", &TILE_GESTURES);
+pub const NAVIGATION_GUIDE_GROUP: GuideGroup = GuideGroup::new("NAVIGATION", &NAVIGATION_GESTURES);
+pub const APPLICATION_GUIDE_GROUP: GuideGroup =
+    GuideGroup::new("APPLICATION", &APPLICATION_GESTURES);
+pub const SEARCH_GUIDE_GROUP: GuideGroup = GuideGroup::new("SEARCH", &SEARCH_GESTURES);
+pub const TILE_GUIDE_GROUP: GuideGroup = GuideGroup::new("TILES", &TILE_GESTURES);
 
 const EDICTS: [CommandSpec<Edict, Context>; 1] = [CommandSpec::new(
     Edict::Search,
