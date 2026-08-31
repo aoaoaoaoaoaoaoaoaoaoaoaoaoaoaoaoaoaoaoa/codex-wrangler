@@ -106,6 +106,26 @@ impl CodexRpc {
         Ok(())
     }
 
+    pub fn reload_daemon_auth(home: &Path) -> Result<bool> {
+        let socket = home.join("app-server-control/app-server-control.sock");
+        if !socket.exists() {
+            return Ok(false);
+        }
+        let output = Command::new("codex")
+            .args(["app-server", "daemon", "reload-auth"])
+            .env("CODEX_HOME", home)
+            .output()
+            .context("ask the Codex app-server daemon to reload authentication")?;
+        if !output.status.success() {
+            bail!(
+                "Codex app-server authentication reload exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(true)
+    }
+
     fn request(&mut self, method: &str, params: &Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);

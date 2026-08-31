@@ -698,7 +698,18 @@ impl Recon {
 
     fn select_codex(&mut self, card: &Card, now: Instant) -> Result<bool> {
         if card.work == Work::Closed {
-            let active = self.active_account("bind resumed Codex login");
+            let codex = self.codex.as_ref().context("Codex adapter is absent")?;
+            let home = codex.home.clone();
+            let active = inspect_account(&home, "bind resumed Codex login");
+            let rotated = active.as_ref().is_some_and(|active| {
+                codex
+                    .roster
+                    .get(&card.thread)
+                    .is_some_and(|session| session.account.rotated_to(active))
+            });
+            if rotated {
+                let _daemon_was_running = CodexRpc::reload_daemon_auth(&home)?;
+            }
             let version = inspect_codex_version("inspect installed Codex version");
             return self.summon_codex(&card.thread, card.last_workspace, active, version);
         }
@@ -722,7 +733,7 @@ impl Recon {
                     .and_then(|session| Version::parse(session).ok())
                     .is_some_and(|session| session < *installed)
             });
-            if rotated || superseded {
+            if superseded {
                 let seat = self
                     .codex_bodies
                     .get(&card.thread)
@@ -730,6 +741,17 @@ impl Recon {
                     .context("live Codex card has no process body")?;
                 self.retire(seat, now)?;
                 return self.summon_codex(&card.thread, card.workspace(), active, version);
+            }
+            if rotated {
+                anyhow::ensure!(
+                    CodexRpc::reload_daemon_auth(&home)?,
+                    "the active Codex terminal has no app-server daemon socket"
+                );
+                let codex = self.codex.as_mut().context("Codex adapter is absent")?;
+                if let Some(active) = active {
+                    codex.roster.bind(&card.thread, active);
+                }
+                codex.commit()?;
             }
         }
         self.activate(seat.window, now)
@@ -887,11 +909,6 @@ impl Recon {
         self.desktop.activate(window)?;
         unit.relinquish();
         Ok(())
-    }
-
-    fn active_account(&self, operation: &str) -> Option<AccountMark> {
-        let codex = self.codex.as_ref()?;
-        inspect_account(&codex.home, operation)
     }
 }
 

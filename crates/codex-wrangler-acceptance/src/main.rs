@@ -520,17 +520,19 @@ fn verify_session_lifecycle(
     verify_management_veto(story, fixture)?;
     pin_and_unpin(story, fixture)?;
     fork_and_return(testbed, story, app, fixture)?;
-    select_and_return(
+    reload_auth_and_return(
         testbed,
         story,
         app,
         ROTATE,
-        &fixture.rotate_resume,
+        &fixture.auth_reload_proof,
         &fixture.roster,
     )?;
     demand(
-        fs::read_to_string(&fixture.rotate_resume).is_ok_and(|proof| proof.trim() == "resume 7"),
-        "rolled session did not resume on its terminal workspace",
+        !testbed
+            .private_path(format!("resume-proof-{ROTATE}"))?
+            .exists(),
+        "authentication rollover replaced the existing Codex terminal",
     )?;
     demand(
         read_roster(&fixture.roster)?["sessions"][ROTATE]["account"]["account"].is_string(),
@@ -908,6 +910,49 @@ fn select_and_return(
     // appear until the gallery returns and presents another frame.
     let _landed = story.wait(Condition::new(
         "Codex session strike to leave flight",
+        |state: &Observation| state.flight == Flight::Grounded,
+    ))?;
+    Ok(())
+}
+
+fn reload_auth_and_return(
+    testbed: &Testbed,
+    story: &mut Story<'_, '_, Observation>,
+    app: &Application<'_>,
+    thread: &str,
+    proof: &Path,
+    roster: &Path,
+) -> Result<()> {
+    story.session().focus()?;
+    let (strike_x, strike_y) = seize_card(story, thread, "reload authentication")?;
+    let selected = story.session().click(strike_x, strike_y, Button::Primary)?;
+    let _armed = story.reaction(selected).until(Condition::new(
+        "account rollover strike to enter flight",
+        |state: &Observation| state.flight == Flight::Striking,
+    ))?;
+    app.wait_until(
+        Duration::from_secs(10),
+        "Codex daemon to reload its account",
+        || Ok(proof.is_file()),
+    )?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "Wrangler to yield to the existing Codex terminal",
+        || Ok(wrangler_count(testbed)? == Some(0)),
+    )?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "existing Codex session to finish its account binding",
+        || Ok(read_roster(roster)?["sessions"][thread]["account"]["account"].is_string()),
+    )?;
+    let _returned = story.session().key(Key::Function(7))?;
+    app.wait_until(
+        Duration::from_secs(8),
+        "i3 to return to the fixed Wrangler workspace after account reload",
+        || Ok(wrangler_count(testbed)? == Some(1)),
+    )?;
+    let _landed = story.wait(Condition::new(
+        "account rollover strike to leave flight",
         |state: &Observation| state.flight == Flight::Grounded,
     ))?;
     Ok(())
@@ -2540,7 +2585,7 @@ struct Fixture {
     configuration_path: PathBuf,
     pinboard: PathBuf,
     index: PathBuf,
-    rotate_resume: PathBuf,
+    auth_reload_proof: PathBuf,
     fork_launch: PathBuf,
     version_resume: PathBuf,
     dormant_resume: PathBuf,
@@ -2569,7 +2614,7 @@ impl Fixture {
         forge_zstd_guard(testbed)?;
         forge_replaceable_alacritty(testbed)?;
         let terminal_service_proof = forge_terminal_supervisor(testbed)?;
-        let rotate_resume = testbed.private_path(format!("resume-proof-{ROTATE}"))?;
+        forge_daemon_control(testbed)?;
         let dormant_resume = testbed.private_path(format!("resume-proof-{DORMANT}"))?;
         let workspace_proof = testbed.private_path("workspace-proof")?;
         let launch_workspace_proof = testbed.private_path("launch-workspace-proof")?;
@@ -2641,7 +2686,7 @@ impl Fixture {
             configuration_path: testbed.private_path("xdg/config/codex-wrangler/config.toml")?,
             pinboard: testbed.private_path("xdg/state/codex-wrangler/pinned-sessions.json")?,
             index: db_path,
-            rotate_resume,
+            auth_reload_proof: testbed.private_path("auth-reload-proof")?,
             fork_launch: testbed.private_path(format!("fork-proof-{TURN}"))?,
             version_resume: testbed.private_path(format!("resume-proof-{DONE}"))?,
             dormant_resume,
@@ -2918,6 +2963,10 @@ if [ "${{1:-}}" = --version ]; then
   printf '%s\n' 'codex-cli 0.151.0'
   exit 0
 fi
+if [ "${{1:-}}" = app-server ] && [ "${{2:-}}" = daemon ] && [ "${{3:-}}" = reload-auth ]; then
+  printf '%s\n' 'reloaded' > /test/auth-reload-proof
+  exit 0
+fi
 if [ "${{1:-}}" = app-server ]; then
   while IFS= read -r request; do
     id=$(printf '%s\n' "$request" | jq -r '.id // empty')
@@ -3001,6 +3050,15 @@ exec -a codex bash -c 'exec 9>>"$2"; sleep 90; :' resume "$thread" "$rollout"
 "#,
         ),
     )
+}
+
+fn forge_daemon_control(testbed: &Testbed) -> Result<()> {
+    let _control = testbed.create_private_dir("home/.codex/app-server-control")?;
+    let socket = testbed.write_private(
+        "home/.codex/app-server-control/app-server-control.sock",
+        b"fixture\n",
+    )?;
+    demand(socket.is_file(), "daemon control fixture was not created")
 }
 
 fn forge_zstd_guard(testbed: &Testbed) -> Result<()> {

@@ -32,6 +32,12 @@ session runtime last sealed in Wrangler's XDG roster. SQLite `cli_version`
 seeds that value once; it is the creation version and does not advance on
 resume.
 
+Authentication rollover compares the stopped session's roster mark with a
+fresh disk-authenticated account reading. Wrangler then invokes
+`codex app-server daemon reload-auth`, which changes the shared daemon in place
+and broadcasts `account/updated`; the existing terminal remains the session's
+seat. `CodexRpc::reload_daemon_auth` is the removal seam.
+
 Remote Sites are admitted through the bundled `codex-wrangler-bridge`, not by
 reading remote files or process tables. The bridge compiles against the exact
 app-server protocol and emits protocol-versioned NDJSON over SSH. A protocol
