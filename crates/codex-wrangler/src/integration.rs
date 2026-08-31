@@ -137,6 +137,7 @@ fn uninstall() -> Result<()> {
 fn relay_codex(verb: &str, thread: &str) -> Result<()> {
     let home = codex_home()?;
     let cwd = if verb == "resume" {
+        let _retired = crate::relay::retire_superseded_writer(&home, thread)?;
         Some(crate::history::prepare_thread_resume(&home, thread)?)
     } else {
         None
