@@ -4,8 +4,7 @@ Live discovery detects capabilities, never version strings. This table is the su
 
 | Codex | Live thread claim | Rollout vocabulary | Acceptance fixture | Removal seam |
 | --- | --- | --- | --- | --- |
-| 0.149.x | Persistent `codex app-server` owns writer locks and rollouts; an established TUI binding survives cwd changes, while a bare `resume` may recover one unique unclaimed primary lock by Git origin after a repository move | `task_*`, `turn_*`, paginated `item_completed`, and legacy messages emitted by this line | `Fresh Codex` resumes from a transplanted worktree with no claim or rollout; a detached app-server owns its older lock and its row falsely says `source = 'vscode'` | `app_server_writer_claims`, `Process::app_server_claim`, `GitOrigin` |
-| 0.150.x–0.151.x-wrangler | The packaged shared app server is mandatory by default; TUI bindings reconnect after a managed rollover | 0.149 vocabulary retained | Local acceptance retains process-level discovery; bridge protocol 2 projects remote app-server history, loaded-thread status, and the Site-owned Wrangler roster | `codex-wrangler-bridge`, `FleetWorker`, `CODEX_ALLOW_EMBEDDED_SERVER` |
+| 0.151.0-wrangler | The packaged shared app server is mandatory; TUI bindings reconnect after a managed rollover and survive cwd changes | `task_*`, `turn_*`, and paginated `item_completed` | Local acceptance proves process-level discovery and transplantation; bridge protocol 2 projects remote app-server history, loaded-thread status, and the Site-owned Wrangler roster | `codex-wrangler-bridge`, `FleetWorker`, `CODEX_ALLOW_EMBEDDED_SERVER` |
 
 All supported lines require `state_5.sqlite` and the UUID forms of `codex resume`
 and `codex fork`. They also provide app-server `thread/name/set` for unloaded,
@@ -18,13 +17,10 @@ and named removal seam leave in the same change.
 
 Live admission trusts the foreground terminal process, an explicit resume
 identity or a conservatively reconciled app-server claim, `thread_source =
-'user'`, and the absence of an agent role. An app-server claim must be newly
-acquired in the same cwd, already bound to that PID incarnation, or the sole
-primary Git-origin match for a bare `resume`. A closing terminal cannot donate
-its lingering lock to an unrelated TUI. Live admission does not consult
-`threads.source`. Historical enumeration retains `source = 'cli'` because no
-live process exists to supply the stronger proof; every anomalous 0.149 TUI row
-enters Wrangler's roster while live and remains a closed session thereafter.
+'user'`, and the absence of an agent role. A closing terminal cannot donate its
+lingering lock to an unrelated TUI. Live admission does not consult
+`threads.source`; historical enumeration retains `source = 'cli'` because no
+live process exists to supply the stronger proof.
 
 Historical turn tallies count persisted `user_message` and paginated
 `item_completed/UserMessage` records. A running message whose `client_id` begins
