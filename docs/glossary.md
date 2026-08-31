@@ -24,6 +24,11 @@ destination or `Host` alias.
 : A terminal on the machine rendering Wrangler that currently displays a
 session. Session ownership and remote terminal windows do not confer a Seat.
 
+**Terminal Unit**
+: A transient systemd user service that owns one Wrangler-opened Alacritty.
+Wrangler relinquishes it after the window maps; it then outlives Wrangler and
+disappears with the terminal.
+
 **Workspace**
 : The i3 workspace containing a Seat.
 

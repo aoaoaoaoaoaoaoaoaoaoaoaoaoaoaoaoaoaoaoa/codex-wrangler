@@ -1,10 +1,10 @@
 use std::{
     collections::HashSet,
     io::{BufRead as _, BufReader, Read as _},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -13,10 +13,6 @@ use std::{
 use codex_wrangler_contract::{Harness, Work};
 use crossbeam_channel::{Sender, TrySendError, bounded};
 use eternalist_apps::NativeWake;
-use nix::{
-    sys::signal::{Signal, kill},
-    unistd::Pid,
-};
 use semver::Version;
 use serde::Deserialize;
 
@@ -27,6 +23,7 @@ use crate::{
     recon::{Activation, Intent, Strike},
     relay::{self, RelayOperation},
     site::{RemoteSite, Site},
+    terminal::TerminalService,
 };
 
 const BRIDGE_PROTOCOL: u16 = 2;
@@ -53,7 +50,7 @@ pub struct FleetWorker {
     activation: Arc<Mutex<Option<Activation>>>,
     pub strike: FleetStriker,
     alive: Arc<AtomicBool>,
-    pids: Arc<Vec<AtomicU32>>,
+    bridges: Vec<BridgeCell>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -78,9 +75,12 @@ struct SiteWatcher {
     repaint: NativeWake,
     latest: Arc<Mutex<Option<FleetSnapshot>>>,
     states: Arc<Vec<Mutex<SiteState>>>,
-    pids: Arc<Vec<AtomicU32>>,
+    bridge: BridgeCell,
     alive: Arc<AtomicBool>,
 }
+
+#[derive(Clone, Default)]
+struct BridgeCell(Arc<Mutex<Option<Child>>>);
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "frame", rename_all = "kebab-case")]
@@ -143,12 +143,10 @@ impl FleetWorker {
         let latest = Arc::new(Mutex::new(None));
         let activation = Arc::new(Mutex::new(None));
         let alive = Arc::new(AtomicBool::new(true));
-        let pids = Arc::new(
-            remotes
-                .iter()
-                .map(|_| AtomicU32::new(0))
-                .collect::<Vec<_>>(),
-        );
+        let bridges = remotes
+            .iter()
+            .map(|_| BridgeCell::default())
+            .collect::<Vec<_>>();
         let states = Arc::new(
             remotes
                 .iter()
@@ -185,7 +183,7 @@ impl FleetWorker {
                     repaint: repaint.clone(),
                     latest: Arc::clone(&latest),
                     states: Arc::clone(&states),
-                    pids: Arc::clone(&pids),
+                    bridge: bridges[index].clone(),
                     alive: Arc::clone(&alive),
                 };
                 thread::Builder::new()
@@ -235,7 +233,7 @@ impl FleetWorker {
             activation,
             strike: FleetStriker { channel: strike },
             alive,
-            pids,
+            bridges,
             threads,
         }
     }
@@ -258,12 +256,8 @@ impl FleetWorker {
 impl Drop for FleetWorker {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
-        for pid in self.pids.iter().map(|pid| pid.swap(0, Ordering::AcqRel)) {
-            if let Ok(pid) = i32::try_from(pid)
-                && pid > 0
-            {
-                let _killed = kill(Pid::from_raw(pid), Signal::SIGTERM);
-            }
+        for bridge in &self.bridges {
+            bridge.abort();
         }
         for thread in self.threads.drain(..) {
             let _joined = thread.join();
@@ -276,27 +270,35 @@ impl SiteWatcher {
         while self.alive.load(Ordering::Acquire) {
             match bridge(&self.site) {
                 Ok(mut child) => {
-                    self.pids[self.index].store(child.id(), Ordering::Release);
-                    read_bridge(
-                        &self.site,
-                        self.expected_codex.as_ref(),
-                        &self.repaint,
-                        &self.latest,
-                        &self.states,
-                        &mut child,
-                        &self.alive,
-                    );
-                    self.pids[self.index].store(0, Ordering::Release);
-                    let error = bridge_error(&mut child);
-                    fault(self.index, error, &self.repaint, &self.latest, &self.states);
+                    let stdout = child.stdout.take();
+                    self.bridge.arm(child);
+                    if let Some(stdout) = stdout {
+                        read_bridge(
+                            &self.site,
+                            self.expected_codex.as_ref(),
+                            &self.repaint,
+                            &self.latest,
+                            &self.states,
+                            stdout,
+                            &self.alive,
+                        );
+                    }
+                    self.bridge.abort();
+                    let error = self.bridge.reap().map(|mut child| bridge_error(&mut child));
+                    if self.alive.load(Ordering::Acquire)
+                        && let Some(error) = error
+                    {
+                        fault(self.index, error, &self.repaint, &self.latest, &self.states);
+                    }
                 }
-                Err(error) => fault(
+                Err(error) if self.alive.load(Ordering::Acquire) => fault(
                     self.index,
                     format!("COULD NOT RAISE SITE BRIDGE · {error}"),
                     &self.repaint,
                     &self.latest,
                     &self.states,
                 ),
+                Err(_) => return,
             }
             for _ in 0..RECONNECTION_DELAY.as_millis() / 100 {
                 if !self.alive.load(Ordering::Acquire) {
@@ -305,6 +307,36 @@ impl SiteWatcher {
                 thread::sleep(Duration::from_millis(100));
             }
         }
+    }
+}
+
+impl BridgeCell {
+    fn arm(&self, child: Child) {
+        let prior = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(child);
+        assert!(prior.is_none(), "Site watcher armed two SSH bridges");
+    }
+
+    fn abort(&self) {
+        let mut bridge = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = bridge.as_mut()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _killed = child.kill();
+        }
+    }
+
+    fn reap(&self) -> Option<Child> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -338,16 +370,14 @@ fn read_bridge(
     repaint: &NativeWake,
     latest: &Mutex<Option<FleetSnapshot>>,
     states: &[Mutex<SiteState>],
-    child: &mut Child,
+    stdout: ChildStdout,
     alive: &AtomicBool,
 ) {
-    let Some(stdout) = child.stdout.take() else {
-        return;
-    };
-    for line in BufReader::new(stdout).lines() {
-        if !alive.load(Ordering::Acquire) {
+    let mut lines = BufReader::new(stdout).lines();
+    while alive.load(Ordering::Acquire) {
+        let Some(line) = lines.next() else {
             break;
-        }
+        };
         let frame = match line {
             Ok(line) => serde_json::from_str::<Frame>(&line),
             Err(error) => {
@@ -374,9 +404,6 @@ fn read_bridge(
                 break;
             }
         }
-    }
-    if !alive.load(Ordering::Acquire) {
-        let _killed = child.kill();
     }
 }
 
@@ -602,17 +629,11 @@ fn launch(strike: &Strike) -> anyhow::Result<bool> {
         Intent::Fork => RelayOperation::Fork,
         Intent::Pin | Intent::Unpin | Intent::Dismiss => return Ok(false),
     };
-    let mut child = Command::new("alacritty")
+    let unit = TerminalService::alacritty()
         .arg("-e")
         .args(relay::ssh_argv(site, operation, &strike.thread))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    thread::Builder::new()
-        .name("codex-wrangler-remote-terminal-reaper".to_owned())
-        .spawn(move || {
-            let _waited = child.wait();
-        })?;
+        .raise()?;
+    unit.relinquish();
     Ok(true)
 }
 

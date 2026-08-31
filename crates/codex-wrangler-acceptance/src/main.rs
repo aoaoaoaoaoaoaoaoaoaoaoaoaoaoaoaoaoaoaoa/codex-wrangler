@@ -536,6 +536,7 @@ fn verify_session_lifecycle(
         read_roster(&fixture.roster)?["sessions"][ROTATE]["account"]["account"].is_string(),
         "rolled session was not rebound to the current Codex account",
     )?;
+    verify_terminal_supervision(app, &fixture.terminal_service_proof)?;
 
     select_and_return(
         testbed,
@@ -910,6 +911,30 @@ fn select_and_return(
         |state: &Observation| state.flight == Flight::Grounded,
     ))?;
     Ok(())
+}
+
+fn verify_terminal_supervision(app: &Application<'_>, proof: &Path) -> Result<()> {
+    let text = fs::read_to_string(proof).map_err(io_verdict("read terminal service proof"))?;
+    let mut fields = text.split_ascii_whitespace();
+    let unit = fields.next().unwrap_or_default();
+    let pid = fields.next().and_then(|pid| pid.parse::<u32>().ok());
+    let parent = fields.next().and_then(|pid| pid.parse::<u32>().ok());
+    demand(
+        unit.starts_with("codex-wrangler-terminal-")
+            && unit.ends_with(".service")
+            && pid.is_some()
+            && parent.is_some()
+            && fields.next().is_none(),
+        format!("terminal service proof is malformed: `{}`", text.trim()),
+    )?;
+    let wrangler = application_processes(app.unit())?;
+    demand(
+        parent.is_some_and(|parent| !wrangler.contains(&parent)),
+        format!(
+            "Wrangler remained the terminal's process parent: `{}`",
+            text.trim()
+        ),
+    )
 }
 
 fn seize_card(
@@ -2519,6 +2544,7 @@ struct Fixture {
     fork_launch: PathBuf,
     version_resume: PathBuf,
     dormant_resume: PathBuf,
+    terminal_service_proof: PathBuf,
 }
 
 impl Fixture {
@@ -2541,7 +2567,8 @@ impl Fixture {
         let _fake_app_server = forge_fake_app_server(testbed)?;
         let fake_cli = forge_fake_cli(testbed)?;
         forge_zstd_guard(testbed)?;
-        let replaceable_alacritty = forge_replaceable_alacritty(testbed)?;
+        forge_replaceable_alacritty(testbed)?;
+        let terminal_service_proof = forge_terminal_supervisor(testbed)?;
         let rotate_resume = testbed.private_path(format!("resume-proof-{ROTATE}"))?;
         let dormant_resume = testbed.private_path(format!("resume-proof-{DORMANT}"))?;
         let workspace_proof = testbed.private_path("workspace-proof")?;
@@ -2592,10 +2619,6 @@ impl Fixture {
         arm_executable(&focus_probe, "make focus probe executable")?;
         arm_executable(&desktop_recorder, "make desktop recorder executable")?;
         arm_executable(&posture_probe, "make posture probe executable")?;
-        demand(
-            replaceable_alacritty.is_file(),
-            "replaceable Alacritty fixture was not created",
-        )?;
         demand(i3.is_file(), "private i3 config was not created")?;
         Ok(Self {
             wrapper,
@@ -2622,6 +2645,7 @@ impl Fixture {
             fork_launch: testbed.private_path(format!("fork-proof-{TURN}"))?,
             version_resume: testbed.private_path(format!("resume-proof-{DONE}"))?,
             dormant_resume,
+            terminal_service_proof,
         })
     }
 }
@@ -2712,6 +2736,87 @@ fn forge_replaceable_alacritty(testbed: &Testbed) -> Result<PathBuf> {
     symlink("alacritty-0.16.1-x11-ime", launcher)
         .map_err(io_verdict("link canonical fake Alacritty executable"))?;
     Ok(terminal)
+}
+
+fn forge_terminal_supervisor(testbed: &Testbed) -> Result<PathBuf> {
+    let _units = testbed.create_private_dir("terminal-units")?;
+    let proof = testbed.private_path("terminal-service-proof")?;
+    let run = testbed.write_private(
+        "bin/systemd-run",
+        r#"#!/bin/sh
+user=0
+quiet=0
+collect=0
+exec_service=0
+unit=
+directory=
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --user) user=1 ;;
+    --quiet) quiet=1 ;;
+    --collect) collect=1 ;;
+    --service-type=exec) exec_service=1 ;;
+    --unit=*) unit=${1#--unit=} ;;
+    --working-directory)
+      shift
+      [ "$#" -gt 0 ] || exit 64
+      directory=$1
+      ;;
+    --setenv=*) ;;
+    --)
+      shift
+      break
+      ;;
+    *) exit 64 ;;
+  esac
+  shift
+done
+[ "$user" = 1 ] && [ "$quiet" = 1 ] && [ "$collect" = 1 ] && \
+  [ "$exec_service" = 1 ] && [ -n "$unit" ] && [ "$#" -gt 0 ] || exit 64
+case $unit in
+  codex-wrangler-terminal-*.service) ;;
+  *) exit 64 ;;
+esac
+(
+  if [ -n "$directory" ]; then
+    cd "$directory" || exit 72
+  fi
+  "$@" </dev/null >/dev/null 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "/test/terminal-units/$unit.pid"
+  parent=$(sed -n 's/^[^)]*) [^ ]* \([0-9][0-9]*\) .*/\1/p' "/proc/$pid/stat")
+  printf '%s %s %s\n' "$unit" "$pid" "$parent" > /test/terminal-service-proof
+  wait "$pid"
+) </dev/null >/dev/null 2>&1 &
+for attempt in $(seq 1 100); do
+  [ -s "/test/terminal-units/$unit.pid" ] && exit 0
+  sleep 0.01
+done
+exit 70
+"#,
+    )?;
+    let control = testbed.write_private(
+        "bin/systemctl",
+        r#"#!/bin/sh
+[ "${1:-}" = --user ] || exit 64
+operation=${2:-}
+case $operation in
+  show)
+    unit=${3:-}
+    cat "/test/terminal-units/$unit.pid"
+    ;;
+  kill)
+    unit=${5:-}
+    pid=$(cat "/test/terminal-units/$unit.pid" 2>/dev/null) || exit 0
+    kill -KILL "$pid" 2>/dev/null || :
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+    )?;
+    arm_executable(&run, "make fake terminal supervisor executable")?;
+    arm_executable(&control, "make fake terminal controller executable")?;
+    Ok(proof)
 }
 
 fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<PathBuf> {

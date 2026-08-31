@@ -39,6 +39,7 @@ use crate::{
     roster::{AccountMark, Roster, Sighting as SessionSighting},
     site::{SessionKey, Site},
     stasis::{ProcessKey, Quarry, Stasis},
+    terminal::TerminalService,
     transcript::Transcripts,
     watchfire::Watchfire,
 };
@@ -865,39 +866,26 @@ impl Recon {
             anyhow::ensure!(status.success(), "i3 rejected workspace `{workspace}`");
         }
         let path = codex_launch_path()?;
-        let mut child = Command::new("alacritty")
-            .arg("--working-directory")
-            .arg(cwd)
+        let unit = TerminalService::alacritty()
+            .current_dir(cwd)
             .args(["-e", "codex", launch.verb(), thread_id])
             .env("CODEX_HOME", home)
             .env("PATH", path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .raise()
             .with_context(|| format!("raise Alacritty for Codex thread `{thread_id}`"))?;
-        let pid = child.id();
+        let pid = unit.main_pid()?;
         let deadline = Instant::now() + Duration::from_secs(8);
         let window = loop {
             if let Some(window) = self.desktop.window_by_pid(pid)? {
                 break window;
             }
-            if let Some(status) = child.try_wait()? {
-                anyhow::bail!("Alacritty exited before mapping its window: {status}");
-            }
             if Instant::now() >= deadline {
-                let _killed = child.kill();
-                let _waited = child.wait();
                 anyhow::bail!("Alacritty did not map a window within 8 seconds");
             }
             thread::sleep(Duration::from_millis(25));
         };
-        thread::Builder::new()
-            .name("codex-wrangler-terminal-reaper".to_owned())
-            .spawn(move || {
-                let _waited = child.wait();
-            })
-            .context("spawn Alacritty reaper")?;
         self.desktop.activate(window)?;
+        unit.relinquish();
         Ok(())
     }
 

@@ -36,4 +36,5 @@ and falls back to `/usr/bin`; Wrangler opens remote sessions in local Alacritty
 windows.
 Colored diamonds identify Sites; their header legend reports connection,
 protocol, and distribution drift. Authentication and host policy remain owned
-by OpenSSH configuration.
+by OpenSSH configuration. Wrangler-opened terminals are independent transient
+user services and survive Wrangler restart or exit.

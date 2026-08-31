@@ -20,6 +20,7 @@ mod search;
 mod site;
 mod stasis;
 mod state;
+mod terminal;
 mod transcript;
 mod tray;
 mod watchfire;
