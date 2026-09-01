@@ -3375,10 +3375,10 @@ fn seed_historical(sessions: &Path, archive: &Path) -> Result<()> {
             concat!(
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"content\":[{\"type\":\"text\",\"text\":\"What is this engine?\"}]}}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"text\",\"text\":\"A brass prototype.\"}]}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"Text\",\"text\":\"A brass prototype.\"}]}}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_started\"}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"content\":[{\"type\":\"text\",\"text\":\"What did it become?\"}]}}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"text\",\"text\":\"The final copper machine.\"}]}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"Text\",\"text\":\"The final copper machine.\"}]}}}\n",
             ),
         ),
         (

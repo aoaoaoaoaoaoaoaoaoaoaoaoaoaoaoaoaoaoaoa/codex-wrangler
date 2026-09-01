@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    codex_event::{CompletedMessage, completed_message},
     codex_rpc::CodexRpc,
     names::NameIndex,
     site::{SessionKey, Site},
@@ -1106,21 +1107,10 @@ fn parse_turns(reader: &mut dyn Read, alive: &AtomicBool) -> Result<Vec<Turn>> {
 }
 
 fn absorb_completed_item(turns: &mut Vec<Turn>, item: &Value) {
-    let Some(content) = item.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    let message = content
-        .iter()
-        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("text") => part.get("text").and_then(Value::as_str),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    match item.get("type").and_then(Value::as_str) {
-        Some("UserMessage") => push_user(turns, &message),
-        Some("AgentMessage") => assign_model(turns, &message),
-        _ => {}
+    match completed_message(item) {
+        Some(CompletedMessage::User(message)) => push_user(turns, &message),
+        Some(CompletedMessage::Agent(message)) => assign_model(turns, &message),
+        None => {}
     }
 }
 

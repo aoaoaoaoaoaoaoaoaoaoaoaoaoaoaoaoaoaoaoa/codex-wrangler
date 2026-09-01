@@ -8,7 +8,10 @@ use std::{
 use memchr::memmem;
 use serde_json::Value;
 
-use crate::roster::{AccountMark, QuotaMark};
+use crate::{
+    codex_event::{CompletedMessage, completed_message},
+    roster::{AccountMark, QuotaMark},
+};
 
 const BLOCK: usize = 1 << 20;
 const ACCOUNT_HORIZON: u64 = 4 << 20;
@@ -106,22 +109,11 @@ fn absorb_preview(slot: &mut String, payload: &Value) -> bool {
 }
 
 fn absorb_item_preview(slot: &mut String, item: &Value) -> bool {
-    let Some(content) = item.get("content").and_then(Value::as_array) else {
-        return false;
-    };
-    match item.get("type").and_then(Value::as_str) {
-        Some("UserMessage") => {
-            let message = content.iter().filter_map(text_content).collect::<String>();
+    match completed_message(item) {
+        Some(CompletedMessage::User(message) | CompletedMessage::Agent(message)) => {
             assign_preview(slot, &message)
         }
-        Some("AgentMessage") => {
-            let mut assigned = false;
-            for message in content.iter().filter_map(text_content) {
-                assigned |= assign_preview(slot, message);
-            }
-            assigned
-        }
-        _ => false,
+        None => false,
     }
 }
 
@@ -140,13 +132,6 @@ fn delegated_user_message(payload: &Value) -> Option<bool> {
         }
         _ => None,
     }
-}
-
-fn text_content(content: &Value) -> Option<&str> {
-    if content.get("type").and_then(Value::as_str) != Some("text") {
-        return None;
-    }
-    content.get("text").and_then(Value::as_str)
 }
 
 fn assign_preview(slot: &mut String, message: &str) -> bool {
@@ -464,6 +449,8 @@ mod tests {
 
     #[test]
     fn paginated_agent_preview_survives_failed_completion() {
+        // These content tags belong to separate Codex protocol enums.
+        // Conflating them made every current agent turn vanish from previews.
         let mut file = fixture(&[
             r#"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-1","turn_id":"turn-1","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"begin","text_elements":[]}]},"started_at_ms":1,"completed_at_ms":1}}"#,
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
@@ -474,12 +461,12 @@ mod tests {
             "begin"
         );
         file.write_all(
-            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"thread_id\":\"thread-1\",\"turn_id\":\"turn-1\",\"item\":{\"type\":\"AgentMessage\",\"id\":\"agent-1\",\"content\":[{\"type\":\"text\",\"text\":\"progress\"},{\"type\":\"text\",\"text\":\"final fragment\"}]},\"started_at_ms\":2,\"completed_at_ms\":3}}\n",
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"thread_id\":\"thread-1\",\"turn_id\":\"turn-1\",\"item\":{\"type\":\"AgentMessage\",\"id\":\"agent-1\",\"content\":[{\"type\":\"Text\",\"text\":\"progress\"},{\"type\":\"Text\",\"text\":\"final fragment\"}]},\"started_at_ms\":2,\"completed_at_ms\":3}}\n",
         )
         .expect("append agent item");
         assert_eq!(
             rollouts.read(file.path()).expect("agent item").preview,
-            "final fragment"
+            "progress\nfinal fragment"
         );
         file.write_all(
             b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":null,\"error\":{\"message\":\"failed\"}}}\n",
@@ -489,13 +476,13 @@ mod tests {
         let incremental = rollouts.read(file.path()).expect("incremental completion");
         assert_eq!(incremental.state, TurnState::Error);
         assert!(!incremental.waiting_for_input);
-        assert_eq!(incremental.preview, "final fragment");
+        assert_eq!(incremental.preview, "progress\nfinal fragment");
         let cold = Rollouts::default()
             .read(file.path())
             .expect("cold completion");
         assert_eq!(cold.state, TurnState::Error);
         assert!(!cold.waiting_for_input);
-        assert_eq!(cold.preview, "final fragment");
+        assert_eq!(cold.preview, "progress\nfinal fragment");
     }
 
     #[test]
@@ -510,7 +497,7 @@ mod tests {
         );
         file.write_all(
             b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"UserMessage\",\"client_id\":\"wire-peer/post-1\",\"content\":[{\"type\":\"text\",\"text\":\"Wire advisory.\"}]}}}\n\
-              {\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"text\",\"text\":\"delegated progress\"}]}}}\n",
+              {\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"Text\",\"text\":\"delegated progress\"}]}}}\n",
         )
         .expect("append delegated turn");
         for summary in [

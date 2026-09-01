@@ -1,4 +1,5 @@
 mod app;
+mod codex_event;
 mod codex_rpc;
 mod commands;
 mod configuration;
