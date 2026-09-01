@@ -4,7 +4,7 @@ Live discovery detects capabilities, never version strings. This table is the su
 
 | Codex | Live thread claim | Rollout vocabulary | Acceptance fixture | Removal seam |
 | --- | --- | --- | --- | --- |
-| 0.151.0-wrangler | The packaged shared app server is mandatory; TUI bindings reconnect after a managed rollover and survive cwd changes | `task_*`, `turn_*`, and paginated `item_completed` | Local acceptance proves process-level discovery and transplantation; bridge protocol 2 projects remote app-server history, loaded-thread status, and the Site-owned Wrangler roster | `codex-wrangler-bridge`, `FleetWorker`, `CODEX_ALLOW_EMBEDDED_SERVER` |
+| 0.152.0-wrangler | The packaged shared app server is mandatory; TUI bindings reconnect after a managed rollover and survive cwd changes | `task_*`, `turn_*`, and paginated `item_completed` | Local acceptance proves process-level discovery and transplantation; bridge protocol 2 projects remote app-server history, loaded-thread status, and the Site-owned Wrangler roster | `codex-wrangler-bridge`, `FleetWorker`, `CODEX_ALLOW_EMBEDDED_SERVER` |
 
 All supported lines require `state_5.sqlite` and the UUID forms of `codex resume`
 and `codex fork`. They also provide app-server `thread/name/set` for unloaded,
