@@ -553,7 +553,7 @@ fn verify_session_lifecycle(
         "resurrected session did not return to its remembered workspace",
     )?;
     demand(
-        thread_archived(&fixture.index, DORMANT) == Some(true),
+        thread_archived(&fixture.index, DORMANT) == Some(false),
         "reopening a closed session mutated Codex archive state",
     )?;
 
@@ -622,12 +622,15 @@ fn verify_remembrance(fixture: &Fixture) -> Result<()> {
             detail: "known-session state omitted its session map".to_owned(),
         })?;
     demand(
-        sessions.contains_key(DORMANT) && !sessions.contains_key(UNSEEN),
+        sessions.contains_key(DORMANT)
+            && !sessions.contains_key(COLD)
+            && !sessions.contains_key(UNSEEN),
         "Wrangler did not preserve its remembered session boundary",
     )?;
     demand(
-        thread_archived(&fixture.index, DORMANT) == Some(true),
-        "fixture did not oppose Codex archive state to Wrangler closure",
+        thread_archived(&fixture.index, DORMANT) == Some(false)
+            && thread_archived(&fixture.index, COLD).is_none(),
+        "canonical deletion did not retire the remembered archive",
     )?;
     Ok(())
 }
@@ -1710,7 +1713,7 @@ fn verify_history(
         },
     )?;
     verify_history_rename(story, index)?;
-    verify_archived_history_rename(story, index)?;
+    verify_archived_history_rename(testbed, story, index)?;
     verify_history_sorting(story)?;
     let capture = testbed.private_path("captures/wrangler-history.png")?;
     story.capture()?.save_png(&capture)?;
@@ -1833,6 +1836,7 @@ fn verify_history_rename(story: &mut Story<'_, '_, Observation>, index: &Path) -
 }
 
 fn verify_archived_history_rename(
+    testbed: &Testbed,
     story: &mut Story<'_, '_, Observation>,
     index: &Path,
 ) -> Result<()> {
@@ -1900,35 +1904,47 @@ fn verify_archived_history_rename(
     let _unarchived = story.wait_stable(
         Duration::from_secs(10),
         Duration::from_millis(120),
-        "renamed session to retain its name through unarchive",
+        "upstream unarchive to restore a remembered session to Live",
         |frame| {
             (thread_archived(index, COLD) == Some(false)
                 && thread_name(index, COLD).as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
-                && frame.state.history.iter().any(|session| {
-                    session.thread == COLD
-                        && !session.archived
-                        && session.name.as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
-                }))
+                && frame
+                    .state
+                    .history
+                    .iter()
+                    .all(|session| session.thread != COLD)
+                && frame
+                    .state
+                    .cards
+                    .iter()
+                    .any(|card| card.thread == COLD && card.work == Work::Closed))
             .then_some(())
         },
     )?;
-    click_history(story, COLD, "archive")?;
-    vacate_history(story)?;
+    archive_out_of_band(testbed, COLD)?;
     let _rearchived = story.wait_stable(
         Duration::from_secs(10),
         Duration::from_millis(120),
-        "renamed session to retain its name through rearchive",
+        "out-of-band Codex archive to move a remembered session into History",
         |frame| {
             (thread_archived(index, COLD) == Some(true)
                 && thread_name(index, COLD).as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
                 && frame.state.history.iter().any(|session| {
                     session.thread == COLD
                         && session.archived
+                        && session.turns == Some(1)
                         && session.name.as_deref() == Some(RENAMED_ARCHIVED_HISTORY)
                 }))
             .then_some(())
         },
     )?;
+    Ok(())
+}
+
+fn archive_out_of_band(testbed: &Testbed, thread: &str) -> Result<()> {
+    let staging = testbed.write_private("archive-request.pending", format!("{thread}\n"))?;
+    let request = testbed.private_path("archive-request")?;
+    fs::rename(staging, request).map_err(io_verdict("publish out-of-band archive request"))?;
     Ok(())
 }
 
@@ -2022,7 +2038,7 @@ fn verify_history_archive_roundtrip(
     let _archived = story.wait_stable(
         Duration::from_secs(10),
         Duration::from_millis(150),
-        "historical session to archive and compress",
+        "historical session to enter Codex archive storage",
         |frame| {
             (thread_archived(index, UNSEEN) == Some(true)
                 && frame
@@ -2040,7 +2056,7 @@ fn verify_history_archive_roundtrip(
     let _unarchived = story.wait_stable(
         Duration::from_secs(10),
         Duration::from_millis(150),
-        "historical session to unarchive from compressed storage",
+        "historical session to leave Codex archive storage",
         |frame| {
             (thread_archived(index, UNSEEN) == Some(false)
                 && frame
@@ -2063,7 +2079,7 @@ fn verify_history_transcript(
     let _last = story.wait_stable(
         Duration::from_secs(10),
         Duration::from_millis(120),
-        "historical row to reveal its last turn from compressed storage",
+        "historical row to reveal its last turn from Codex archive storage",
         |frame| {
             frame
                 .state
@@ -2935,6 +2951,15 @@ fn forge_wrapper(testbed: &Testbed, binary: &Path, logs: [&Path; 11]) -> Result<
              *) exit 71 ;;\n\
            esac\n\
          done\n\
+         archive_request=/test/archive-request\n\
+         (\n\
+           while sleep 0.02; do\n\
+             [ -f $archive_request ] || continue\n\
+             thread=$(cat $archive_request)\n\
+             rm -f $archive_request\n\
+             codex archive $thread\n\
+           done\n\
+         ) &\n\
          exec {}\n",
         names[0],
         names[1],
@@ -3235,18 +3260,13 @@ fn seed_index(path: &Path) -> Result<()> {
     .map_err(verdict("seed superseded Codex version"))?;
     db.execute(
         "UPDATE threads
-         SET source = 'vscode', cli_version = '0.149.0',
+         SET source = 'vscode', thread_source = NULL, cli_version = '0.149.0',
              cwd = '/test/work/fresh-before-transplant',
              git_origin_url = 'fixture://transplanted'
          WHERE id = ?1",
         params![FRESH],
     )
     .map_err(verdict("seed contradictory 0.149 TUI provenance"))?;
-    db.execute(
-        "UPDATE threads SET archived = 1 WHERE id = ?1",
-        params![DORMANT],
-    )
-    .map_err(verdict("oppose Codex archive state to Wrangler closure"))?;
     db.execute(
         "UPDATE threads SET archived = 1 WHERE id = ?1",
         params![COLD],
@@ -3369,6 +3389,7 @@ fn seed_thread(db: &Connection, row: &ThreadSeed<'_>) -> Result<()> {
 }
 
 fn seed_historical(sessions: &Path, archive: &Path) -> Result<()> {
+    let cold = archive.join(format!("rollout-2026-08-03T00-00-00-cold-{COLD}.jsonl"));
     for (path, transcript) in [
         (
             rollout(sessions, UNSEEN, "unseen"),
@@ -3382,15 +3403,24 @@ fn seed_historical(sessions: &Path, archive: &Path) -> Result<()> {
             ),
         ),
         (
-            archive.join(format!("rollout-2026-08-03T00-00-00-cold-{COLD}.jsonl")),
+            cold.clone(),
             concat!(
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"First buried question.\"}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"First buried answer.\"}}\n",
             ),
         ),
     ] {
-        fs::write(path, transcript).map_err(io_verdict("write historical rollout"))?;
+        fs::write(&path, transcript).map_err(io_verdict("write historical rollout"))?;
     }
+    let status = Command::new("/usr/bin/zstd")
+        .args(["-q", "--long=31", "-f", "--rm"])
+        .arg(&cold)
+        .status()
+        .map_err(io_verdict("compress external archive fixture"))?;
+    demand(
+        status.success(),
+        "could not compress external archive fixture",
+    )?;
     Ok(())
 }
 
@@ -3411,6 +3441,13 @@ fn seed_roster(testbed: &Testbed) -> Result<PathBuf> {
                         "resets_at": OLD_RESET
                     }]
                 }
+            },
+            COLD: {
+                "name": "Filed engine",
+                "cwd": "/test/work/history",
+                "preview": "Filed.",
+                "updated_at_ms": 5,
+                "workspace": 4
             }
         }
     });

@@ -38,7 +38,8 @@ does not change harness state.
 
 **Roster**
 : The Site-owned set of sessions Wrangler has observed live and not forgotten.
-It is the sole authority for closed cards at that Site.
+It is the sole authority for closed cards at that Site, subordinate to the
+harness's canonical archive membership.
 
 **Fork**
 : A harness operation that creates a new thread from an existing Codex thread.

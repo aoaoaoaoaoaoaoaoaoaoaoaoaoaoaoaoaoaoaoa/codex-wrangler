@@ -42,8 +42,8 @@ use crate::{
     configuration::Configuration,
     fleet::{FleetSnapshot, FleetWorker},
     history::{
-        HistorySnapshot, HistoryWorker, Order as HistoryOrder, Session as HistorySession,
-        Turn as HistoryTurn, spawn as spawn_history,
+        ArtifactRevision, HistorySnapshot, HistoryWorker, Order as HistoryOrder,
+        Session as HistorySession, Turn as HistoryTurn, spawn as spawn_history,
     },
     instance::{Incumbent, NO_DESKTOP},
     model::{Card, LiveSnapshot},
@@ -321,7 +321,7 @@ struct Wrangler<const START_FLOATING: bool> {
     jolts: JoltLedger,
     search: Search,
     history_search: HistorySearch,
-    history_requested: HashSet<(SessionKey, i64)>,
+    history_requested: HashSet<(SessionKey, ArtifactRevision)>,
     history_pending: HashMap<SessionKey, HistoryLease>,
     history_error: Option<String>,
     history_rename: Option<HistoryRename>,
@@ -525,6 +525,18 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         if let Some(snapshot) = self.history_worker.take_snapshot() {
             self.history_pending
                 .retain(|key, lease| !lease.settled(key, &snapshot));
+            let revisions = snapshot
+                .sessions
+                .iter()
+                .filter_map(|session| {
+                    session
+                        .revision
+                        .clone()
+                        .map(|revision| (session.key(), revision))
+                })
+                .collect::<HashSet<_>>();
+            self.history_requested
+                .retain(|request| revisions.contains(request));
             self.local_history_snapshot = Some(snapshot);
             self.rebuild_snapshots();
             return true;
@@ -1213,18 +1225,24 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
     }
 
     fn request_history_tallies(&mut self, tally: Vec<SessionKey>) {
-        let stamps = self
+        let revisions = self
             .history_snapshot
             .iter()
             .flat_map(|history| &history.sessions)
-            .map(|session| (session.key(), session.updated_at_ms))
+            .filter_map(|session| {
+                session
+                    .revision
+                    .clone()
+                    .map(|revision| (session.key(), revision))
+            })
             .collect::<HashMap<_, _>>();
         let novel = tally
             .into_iter()
             .filter(|key| key.site.local())
             .filter(|key| {
-                stamps.get(key).is_some_and(|updated_at_ms| {
-                    self.history_requested.insert((key.clone(), *updated_at_ms))
+                revisions.get(key).is_some_and(|revision| {
+                    self.history_requested
+                        .insert((key.clone(), revision.clone()))
                 })
             })
             .collect::<Vec<_>>();
@@ -1234,8 +1252,8 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             .collect::<Vec<_>>();
         if !threads.is_empty() && self.history_worker.courier().tally(threads).is_err() {
             for key in novel {
-                if let Some(updated_at_ms) = stamps.get(&key) {
-                    let _removed = self.history_requested.remove(&(key, *updated_at_ms));
+                if let Some(revision) = revisions.get(&key) {
+                    let _removed = self.history_requested.remove(&(key, revision.clone()));
                 }
             }
         }

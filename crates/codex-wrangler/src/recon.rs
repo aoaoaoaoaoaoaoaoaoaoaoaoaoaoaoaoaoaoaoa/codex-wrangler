@@ -587,7 +587,7 @@ impl Recon {
             }
         }
         if let Some(codex) = &mut self.codex {
-            cards.extend(codex.closed_cards(codex_bodies.keys().map(String::as_str)));
+            cards.extend(codex.closed_cards(codex_bodies.keys().map(String::as_str))?);
             codex.commit()?;
         }
         for card in &mut cards {
@@ -1096,11 +1096,31 @@ impl Codex {
         )))
     }
 
-    fn closed_cards<'a>(&self, live: impl IntoIterator<Item = &'a str>) -> Vec<Card> {
+    fn closed_cards<'a>(&mut self, live: impl IntoIterator<Item = &'a str>) -> Result<Vec<Card>> {
         let live = live.into_iter().collect::<HashSet<_>>();
-        self.roster
+        let mut statement = self.db.prepare("SELECT id, archived FROM threads")?;
+        let indexed = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()
+            .context("query Codex index membership")?;
+        drop(statement);
+        let vanished = self
+            .roster
             .sessions()
-            .filter(|(thread, _)| !live.contains(*thread))
+            .filter(|&(thread, _)| !indexed.contains_key(thread))
+            .map(|(thread, _)| thread.to_owned())
+            .collect::<Vec<_>>();
+        for thread in vanished {
+            self.roster.forget(&thread);
+        }
+        Ok(self
+            .roster
+            .sessions()
+            .filter(|(thread, _)| {
+                !live.contains(*thread) && indexed.get(*thread).is_some_and(|archived| !archived)
+            })
             .map(|(thread, session)| Card {
                 site: Site::Local,
                 harness: Harness::Codex,
@@ -1114,7 +1134,7 @@ impl Codex {
                 updated_at_ms: session.updated_at_ms,
                 pinned: false,
             })
-            .collect()
+            .collect())
     }
 
     fn writer_lock_directory(&self) -> PathBuf {
@@ -1283,7 +1303,7 @@ impl Codex {
             .query_row(
                 "SELECT id, NULLIF(TRIM(name), ''), cwd, updated_at_ms, \
                  thread_source, agent_role, rollout_path, cli_version, \
-                 NULLIF(TRIM(git_origin_url), '') \
+                 NULLIF(TRIM(git_origin_url), ''), archived \
                  FROM threads WHERE id = ?1",
                 params![id],
                 |row| {
@@ -1297,6 +1317,7 @@ impl Codex {
                         PathBuf::from(row.get::<_, String>(6)?),
                         row.get::<_, String>(7)?,
                         row.get::<_, Option<String>>(8)?.map(GitOrigin),
+                        row.get::<_, bool>(9)?,
                     ))
                 },
             )
@@ -1312,11 +1333,12 @@ impl Codex {
             rollout,
             cli_version,
             git_origin,
+            archived,
         )) = thread
         else {
             return Ok(None);
         };
-        if !primary_codex_thread(thread_source.as_deref(), agent_role.as_deref()) {
+        if !primary_codex_thread(thread_source.as_deref(), agent_role.as_deref(), archived) {
             return Ok(None);
         }
         Ok(Some(Thread {
@@ -1331,8 +1353,12 @@ impl Codex {
     }
 }
 
-fn primary_codex_thread(thread_source: Option<&str>, agent_role: Option<&str>) -> bool {
-    thread_source == Some("user") && agent_role.is_none()
+fn primary_codex_thread(
+    thread_source: Option<&str>,
+    agent_role: Option<&str>,
+    archived: bool,
+) -> bool {
+    !archived && agent_role.is_none() && matches!(thread_source, Some("user") | None)
 }
 
 fn foreign_card(

@@ -52,6 +52,7 @@ pub struct Session {
     pub last_turn: String,
     pub updated_at_ms: i64,
     pub turns: Option<u64>,
+    pub(crate) revision: Option<ArtifactRevision>,
     pub tally_failed: bool,
     pub bytes: u64,
     pub archived: bool,
@@ -158,14 +159,30 @@ struct Artifact {
     updated_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ArtifactRevision {
+    thread: String,
+    path: PathBuf,
+    updated_at_ms: i64,
+}
+
+impl Artifact {
+    fn revision(&self, thread: &str) -> ArtifactRevision {
+        ArtifactRevision {
+            thread: thread.to_owned(),
+            path: self.path.clone(),
+            updated_at_ms: self.updated_at_ms,
+        }
+    }
+}
+
 struct CountJob {
     thread: String,
     artifact: Artifact,
 }
 
 struct CountResult {
-    thread: String,
-    updated_at_ms: i64,
+    revision: ArtifactRevision,
     tally: std::result::Result<u64, String>,
 }
 
@@ -569,8 +586,8 @@ struct Historian {
     names: NameIndex,
     sessions: Vec<Session>,
     artifacts: HashMap<String, Artifact>,
-    requested: HashSet<String>,
-    failed: HashSet<String>,
+    requested: HashSet<ArtifactRevision>,
+    failed: HashSet<ArtifactRevision>,
     ledger: TurnLedger,
     watchfire: Watchfire,
 }
@@ -612,8 +629,9 @@ impl Historian {
              COALESCE(strftime('%Y-%m-%d %H:%M', updated_at_ms / 1000, \
                                'unixepoch', 'localtime'), 'UNKNOWN') \
              FROM threads \
-             WHERE source = 'cli' AND agent_role IS NULL \
-               AND (thread_source = 'user' OR thread_source IS NULL)",
+             WHERE agent_role IS NULL \
+               AND (thread_source = 'user' \
+                    OR (thread_source IS NULL AND source IN ('cli', 'vscode')))",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -633,10 +651,12 @@ impl Historian {
                 continue;
             };
             let turns = self.ledger.get(&thread, updated_at_ms);
+            let revision = artifact.revision(&thread);
             sessions.push(Session {
                 site: Site::Local,
                 name: db_name.or_else(|| self.names.get(&thread).map(str::to_owned)),
-                tally_failed: turns.is_none() && self.failed.contains(&thread),
+                tally_failed: turns.is_none() && self.failed.contains(&revision),
+                revision: Some(revision),
                 bytes: fs::metadata(&artifact.path)?.len(),
                 thread: thread.clone(),
                 last_turn,
@@ -681,9 +701,10 @@ impl Historian {
             let Some(artifact) = self.artifacts.get(&thread).cloned() else {
                 continue;
             };
+            let revision = artifact.revision(&thread);
             if self.ledger.get(&thread, artifact.updated_at_ms).is_some()
-                || self.failed.contains(&thread)
-                || !self.requested.insert(thread.clone())
+                || self.failed.contains(&revision)
+                || !self.requested.insert(revision.clone())
             {
                 continue;
             }
@@ -694,7 +715,7 @@ impl Historian {
                 }))
                 .is_err()
             {
-                let _removed = self.requested.remove(&thread);
+                let _removed = self.requested.remove(&revision);
             }
         }
     }
@@ -735,14 +756,19 @@ impl Historian {
     }
 
     fn absorb(&mut self, result: CountResult) -> bool {
-        let _removed = self.requested.remove(&result.thread);
+        let _removed = self.requested.remove(&result.revision);
         match result.tally {
             Ok(turns) => {
-                let _removed = self.failed.remove(&result.thread);
-                self.ledger
-                    .record(result.thread.clone(), result.updated_at_ms, turns);
+                self.failed
+                    .retain(|revision| revision.thread != result.revision.thread);
+                self.ledger.record(
+                    result.revision.thread.clone(),
+                    result.revision.updated_at_ms,
+                    turns,
+                );
                 if let Some(session) = self.sessions.iter_mut().find(|session| {
-                    session.thread == result.thread && session.updated_at_ms == result.updated_at_ms
+                    session.thread == result.revision.thread
+                        && session.updated_at_ms == result.revision.updated_at_ms
                 }) {
                     session.turns = Some(turns);
                     session.tally_failed = false;
@@ -753,13 +779,22 @@ impl Historian {
             Err(error) => {
                 eprintln!(
                     "codex-wrangler could not count turns for {}: {error}",
-                    result.thread
+                    result.revision.thread
                 );
-                let _new = self.failed.insert(result.thread.clone());
+                let current = self
+                    .artifacts
+                    .get(&result.revision.thread)
+                    .is_some_and(|artifact| {
+                        artifact.revision(&result.revision.thread) == result.revision
+                    });
+                if !current {
+                    return false;
+                }
+                let _new = self.failed.insert(result.revision.clone());
                 if let Some(session) = self
                     .sessions
                     .iter_mut()
-                    .find(|session| session.thread == result.thread)
+                    .find(|session| session.thread == result.revision.thread)
                 {
                     session.tally_failed = true;
                     return true;
@@ -798,8 +833,9 @@ impl Historian {
         connection.busy_timeout(Duration::from_secs(2))?;
         let changed = connection.execute(
             "UPDATE threads SET name = ?2
-             WHERE id = ?1 AND archived = 1 AND source = 'cli' AND agent_role IS NULL
-               AND (thread_source = 'user' OR thread_source IS NULL)",
+             WHERE id = ?1 AND archived = 1 AND agent_role IS NULL
+               AND (thread_source = 'user'
+                    OR (thread_source IS NULL AND source IN ('cli', 'vscode')))",
             params![thread, name],
         )?;
         anyhow::ensure!(changed == 1, "archived session ceased to be renameable");
@@ -812,13 +848,13 @@ impl Historian {
             bail!("session `{thread}` is already archived");
         }
         run_codex(&self.home, &["archive", thread])?;
-        let (archived, nominal) = self
+        let (archived, _) = self
             .row(thread)?
             .context("Codex archive removed the session index row")?;
         if !archived {
             bail!("Codex did not mark session `{thread}` archived");
         }
-        compress(&nominal)
+        Ok(())
     }
 
     fn unarchive(&self, thread: &str) -> Result<()> {
@@ -901,19 +937,6 @@ fn temporary_path(path: &Path, purpose: &str) -> Result<PathBuf> {
         .and_then(|name| name.to_str())
         .context("session artifact has no UTF-8 filename")?;
     Ok(path.with_file_name(format!(".{name}.{purpose}.tmp")))
-}
-
-fn compress(nominal: &Path) -> Result<()> {
-    if !nominal.is_file() {
-        bail!("Codex archived payload `{}` is absent", nominal.display());
-    }
-    let destination = compressed_path(nominal);
-    let temporary = temporary_path(&destination, "compress")?;
-    run_zstd(&["-q", "-T1", "-f"], nominal, &temporary)?;
-    seal_artifact(&temporary, &destination)?;
-    fs::remove_file(nominal)
-        .with_context(|| format!("retire uncompressed payload `{}`", nominal.display()))?;
-    sync_parent(nominal)
 }
 
 fn materialize(nominal: &Path) -> Result<bool> {
@@ -1008,11 +1031,13 @@ fn read_history(
             continue;
         };
         let result = match job {
-            ReadJob::Count(job) => ReadResult::Count(CountResult {
-                thread: job.thread,
-                updated_at_ms: job.artifact.updated_at_ms,
-                tally: tally(&job.artifact, alive).map_err(|error| format!("{error:#}")),
-            }),
+            ReadJob::Count(job) => {
+                let revision = job.artifact.revision(&job.thread);
+                ReadResult::Count(CountResult {
+                    revision,
+                    tally: tally(&job.artifact, alive).map_err(|error| format!("{error:#}")),
+                })
+            }
             ReadJob::Transcript(job) => {
                 let (turns, error) = match read_transcript(&job.artifact, alive) {
                     Ok(turns) => (turns, None),

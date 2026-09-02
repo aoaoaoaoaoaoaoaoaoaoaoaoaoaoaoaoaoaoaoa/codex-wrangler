@@ -486,6 +486,7 @@ fn absorb(
                     last_turn: thread.last_turn,
                     updated_at_ms,
                     turns: None,
+                    revision: None,
                     tally_failed: true,
                     bytes: 0,
                     archived: thread.archived,

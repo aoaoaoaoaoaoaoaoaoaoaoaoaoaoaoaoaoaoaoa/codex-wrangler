@@ -16,11 +16,21 @@ updates their canonical `threads.name` field directly through the
 and named removal seam leave in the same change.
 
 Live admission trusts the foreground terminal process, an explicit resume
-identity or a conservatively reconciled app-server claim, `thread_source =
-'user'`, and the absence of an agent role. A closing terminal cannot donate its
+identity or a conservatively reconciled app-server claim, and the absence of an
+agent role. `thread_source = 'user'` is canonical; a missing value is admitted
+only at this stronger live boundary so durable sessions created before the
+field was populated remain usable. A closing terminal cannot donate its
 lingering lock to an unrelated TUI. Live admission does not consult
-`threads.source`; historical enumeration retains `source = 'cli'` because no
-live process exists to supply the stronger proof.
+`threads.source`. Historical enumeration uses canonical `thread_source` and a
+named legacy seam for null-source `cli` and `vscode` rows.
+
+Codex alone owns archive membership and its `sessions` / `archived_sessions`
+layout. Wrangler delegates archive transitions to the Codex CLI, suppresses
+upstream-archived roster entries from Live, and consequently exposes them in
+History. It does not compress newly archived threads. Historical reads and
+resume preparation retain `.zst` support for an out-of-band cold-storage
+pipeline; materialization is the only storage interposition. A roster entry
+absent from the canonical Codex index is forgotten rather than resurrected.
 
 Historical turn tallies count persisted `user_message` and paginated
 `item_completed/UserMessage` records. A running message whose `client_id` begins
