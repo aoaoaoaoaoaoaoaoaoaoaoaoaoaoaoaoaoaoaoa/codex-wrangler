@@ -22,8 +22,8 @@ codex-wrangler-contract = { path = "crates/codex-wrangler-contract", version = "
 brass_poolrooms = { version = "0.14.6", features = ["serde"] }
 directories = "6.0.0"
 egui = "=0.36.1"
-egui-tester = "0.9.7"
-egui-tester-witness = "0.9.7"
+egui-tester = "0.9.8"
+egui-tester-witness = "0.9.8"
 egui-wgpu = "=0.36.1"
 eternalist-apps = "0.9.4"
 inotify = { version = "0.11.4", default-features = false }
@@ -40,9 +40,11 @@ uuid = "1.18.1"
 x11rb = { version = "0.14.0", default-features = false, features = ["randr"] }
 
 [patch.crates-io]
-brass_foundry = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/brass_poolrooms", rev = "1bbe717feec396fef9838967ec27d6c2b3df85fe" }
-brass_poolrooms = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/brass_poolrooms", rev = "1bbe717feec396fef9838967ec27d6c2b3df85fe" }
-eternalist-apps = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/eternalist-apps", rev = "ec5cd21f93debe15613637f39a979330f021ebfe" }
+brass_foundry = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/brass_poolrooms", rev = "d970dc99d1e31e05cb22bddc6dc647701fd298d6" }
+brass_poolrooms = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/brass_poolrooms", rev = "d970dc99d1e31e05cb22bddc6dc647701fd298d6" }
+egui-tester = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/egui-tester", rev = "5ea31adc6814d658783251ba65e6181a258866e0" }
+egui-tester-witness = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/egui-tester", rev = "5ea31adc6814d658783251ba65e6181a258866e0" }
+eternalist-apps = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/eternalist-apps", rev = "4712c12a3788b2d19840554fc68a8577484b7413" }
 
 [workspace.lints.rust]
 warnings = "deny"
