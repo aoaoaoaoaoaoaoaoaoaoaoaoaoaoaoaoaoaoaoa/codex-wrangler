@@ -8,9 +8,9 @@ Use `eternalist-apps` as the native host and Brass Poolrooms as the visual and
 physical language. Keep Codex discovery, X11 activation, tray behavior, and the
 acceptance fixtures product-owned.
 
-`docs/codex-compatibility.md` is the support-policy source of truth. Runtime
-detects capabilities; each supported Codex line retains a named removal seam
-and an acceptance fixture.
+Wrangler supports only the Codex version vendored by the atomic package.
+Runtime detects capabilities; product-owned acceptance fixtures guard its
+integration boundaries.
 
 Run `scripts/check` after meaningful edits and `scripts/accept` after native UI
 changes. This workstation installs Wrangler only through the atomic

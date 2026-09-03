@@ -3,7 +3,7 @@
 An as-is tray switcher for manual Codex, Claude Code, and Prime Agent TUI
 sessions across one or more machines. Linux/X11/i3 only.
 
-[Wrangler names](docs/glossary.md) · [Codex compatibility](docs/codex-compatibility.md)
+[Wrangler names](docs/glossary.md)
 
 Wrangler settings live in the platform configuration directory as
 `codex-wrangler/config.toml`. Open the central sheet with F2; Control+Comma is
