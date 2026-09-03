@@ -53,7 +53,8 @@ reading remote files or process tables. The bridge compiles against the exact
 app-server protocol and emits protocol-versioned NDJSON over SSH. A protocol
 mismatch quarantines remote data. A Codex or bridge build mismatch remains
 visible with a `HARMONIZE SITE` fault so compatible state can still be inspected
-before the Site is upgraded.
+before the Site is upgraded. Ordinary unavailability is instead a dimmed Site
+in the remote legend; an offline workstation is not an application fault.
 
 Each Site alone writes its Wrangler roster. Protocol 2 streams only its thread
 identities; the receiver joins them against already-exported history, subtracts

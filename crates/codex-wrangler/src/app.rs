@@ -963,28 +963,6 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         });
     }
 
-    fn site_faults(&self, ui: &mut egui::Ui) {
-        let faults = self
-            .fleet_snapshot
-            .iter()
-            .flat_map(|fleet| &fleet.sites)
-            .filter_map(|status| {
-                status
-                    .fault
-                    .as_deref()
-                    .map(|fault| format!("{} · {fault}", status.site))
-            })
-            .collect::<Vec<_>>();
-        if !faults.is_empty() {
-            ui.add_space(7.0);
-            let _fault = ui.add(
-                egui::Label::new(TypeRole::Body.text(faults.join("\n")).color(RED))
-                    .wrap()
-                    .show_tooltip_when_elided(false),
-            );
-        }
-    }
-
     fn settings_sheet(&mut self, ctx: &egui::Context) {
         let path = self.configuration.path().to_owned();
         let fault = self
@@ -1079,7 +1057,6 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             )
             .show(ui, |ui| {
                 self.header(ui);
-                self.site_faults(ui);
                 if self.search_focus.editing() {
                     ui.add_space(7.0);
                     self.search_field(ui, search_id);
@@ -1146,7 +1123,6 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
             )
             .show(ui, |ui| {
                 self.header(ui);
-                self.site_faults(ui);
                 if self.search_focus.editing() {
                     ui.add_space(7.0);
                     self.search_field(ui, search_id);
@@ -3073,16 +3049,21 @@ fn legend(ui: &mut egui::Ui, label: &str, work: Work) {
 fn site_legend(ui: &mut egui::Ui, status: &crate::fleet::SiteStatus) {
     let legend = ui.horizontal(|ui| {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
-        let color = site_color(&status.site);
+        let offline = !status.online && status.incompatibility.is_none();
+        let color = if offline {
+            ASH.gamma_multiply(0.65)
+        } else {
+            site_color(&status.site)
+        };
         ui.painter().circle_filled(rect.center(), 3.5, color);
-        if status.fault.is_some() {
+        if status.incompatibility.is_some() {
             ui.painter()
                 .circle_stroke(rect.center(), 4.25, Stroke::new(1.0, RED));
         }
         let label = ui.label(
             TypeRole::Label
                 .text(status.site.endpoint())
-                .color(chrome::MUTED),
+                .color(if offline { color } else { chrome::MUTED }),
         );
         response.union(label)
     });
@@ -3090,10 +3071,16 @@ fn site_legend(ui: &mut egui::Ui, status: &crate::fleet::SiteStatus) {
     let codex = status.codex_version.as_deref().unwrap_or("unknown Codex");
     let platform = status.platform.as_deref().unwrap_or("unknown platform");
     let identity = format!("{bridge} · Codex {codex} · {platform}");
-    let hint = status
-        .fault
-        .as_ref()
-        .map_or(identity.clone(), |fault| format!("{fault}\n{identity}"));
+    let hint = status.incompatibility.as_ref().map_or_else(
+        || {
+            if status.online {
+                identity.clone()
+            } else {
+                "OFFLINE".to_owned()
+            }
+        },
+        |fault| format!("{fault}\n{identity}"),
+    );
     let _hint = legend.inner.on_hover_text(hint);
 }
 

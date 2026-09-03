@@ -39,10 +39,11 @@ pub struct FleetSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SiteStatus {
     pub site: RemoteSite,
+    pub online: bool,
     pub bridge_version: Option<String>,
     pub codex_version: Option<String>,
     pub platform: Option<String>,
-    pub fault: Option<String>,
+    pub incompatibility: Option<String>,
 }
 
 pub struct FleetWorker {
@@ -155,10 +156,11 @@ impl FleetWorker {
                     Mutex::new(SiteState {
                         status: SiteStatus {
                             site,
+                            online: false,
                             bridge_version: None,
                             codex_version: None,
                             platform: None,
-                            fault: Some("CONNECTING".to_owned()),
+                            incompatibility: None,
                         },
                         protocol_compatible: false,
                         live_cards: Vec::new(),
@@ -272,7 +274,7 @@ impl SiteWatcher {
                 Ok(mut child) => {
                     let stdout = child.stdout.take();
                     self.bridge.arm(child);
-                    if let Some(stdout) = stdout {
+                    let incompatibility = stdout.and_then(|stdout| {
                         read_bridge(
                             &self.site,
                             self.expected_codex.as_ref(),
@@ -281,23 +283,29 @@ impl SiteWatcher {
                             &self.states,
                             stdout,
                             &self.alive,
-                        );
-                    }
+                        )
+                    });
                     self.bridge.abort();
-                    let error = self.bridge.reap().map(|mut child| bridge_error(&mut child));
-                    if self.alive.load(Ordering::Acquire)
-                        && let Some(error) = error
-                    {
-                        fault(self.index, error, &self.repaint, &self.latest, &self.states);
+                    if let Some(mut child) = self.bridge.reap() {
+                        let _diagnostic = bridge_error(&mut child);
+                    }
+                    if self.alive.load(Ordering::Acquire) {
+                        if let Some(error) = incompatibility {
+                            quarantine(
+                                self.index,
+                                error,
+                                &self.repaint,
+                                &self.latest,
+                                &self.states,
+                            );
+                        } else {
+                            offline(self.index, &self.repaint, &self.latest, &self.states);
+                        }
                     }
                 }
-                Err(error) if self.alive.load(Ordering::Acquire) => fault(
-                    self.index,
-                    format!("COULD NOT RAISE SITE BRIDGE · {error}"),
-                    &self.repaint,
-                    &self.latest,
-                    &self.states,
-                ),
+                Err(_) if self.alive.load(Ordering::Acquire) => {
+                    offline(self.index, &self.repaint, &self.latest, &self.states);
+                }
                 Err(_) => return,
             }
             for _ in 0..RECONNECTION_DELAY.as_millis() / 100 {
@@ -372,7 +380,7 @@ fn read_bridge(
     states: &[Mutex<SiteState>],
     stdout: ChildStdout,
     alive: &AtomicBool,
-) {
+) -> Option<String> {
     let mut lines = BufReader::new(stdout).lines();
     while alive.load(Ordering::Acquire) {
         let Some(line) = lines.next() else {
@@ -380,31 +388,16 @@ fn read_bridge(
         };
         let frame = match line {
             Ok(line) => serde_json::from_str::<Frame>(&line),
-            Err(error) => {
-                fault(
-                    site_index(site, states),
-                    format!("SITE STREAM FAILED · {error}"),
-                    repaint,
-                    latest,
-                    states,
-                );
-                break;
-            }
+            Err(_) => break,
         };
         match frame {
             Ok(frame) => absorb(site, expected_codex, frame, repaint, latest, states),
             Err(error) => {
-                fault(
-                    site_index(site, states),
-                    format!("INCOMPATIBLE SITE FRAME · {error}"),
-                    repaint,
-                    latest,
-                    states,
-                );
-                break;
+                return Some(format!("INCOMPATIBLE SITE FRAME · {error}"));
             }
         }
     }
+    None
 }
 
 fn absorb(
@@ -426,12 +419,13 @@ fn absorb(
             codex_version,
             platform,
         } => {
+            state.status.online = true;
             state.protocol_compatible = protocol == BRIDGE_PROTOCOL;
             state.status.bridge_version = Some(bridge_version);
             state.status.codex_version = Some(codex_version);
             state.status.platform = Some(platform);
-            state.status.fault = if state.protocol_compatible {
-                distribution_fault(expected_codex, &state.status)
+            state.status.incompatibility = if state.protocol_compatible {
+                distribution_incompatibility(expected_codex, &state.status)
             } else {
                 state.live_cards.clear();
                 state.roster.clear();
@@ -515,7 +509,7 @@ fn site_index(site: &RemoteSite, states: &[Mutex<SiteState>]) -> usize {
         .expect("configured Site owns one state cell")
 }
 
-fn fault(
+fn quarantine(
     index: usize,
     error: String,
     repaint: &NativeWake,
@@ -525,7 +519,8 @@ fn fault(
     let mut state = states[index]
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.status.fault = Some(error);
+    state.status.incompatibility = Some(error);
+    state.status.online = false;
     state.protocol_compatible = false;
     state.live_cards.clear();
     state.roster.clear();
@@ -533,7 +528,33 @@ fn fault(
     publish(repaint, latest, states);
 }
 
-fn distribution_fault(expected: Option<&Version>, status: &SiteStatus) -> Option<String> {
+fn offline(
+    index: usize,
+    repaint: &NativeWake,
+    latest: &Mutex<Option<FleetSnapshot>>,
+    states: &[Mutex<SiteState>],
+) {
+    let mut state = states[index]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !state.status.online
+        && state.status.incompatibility.is_none()
+        && !state.protocol_compatible
+        && state.live_cards.is_empty()
+        && state.roster.is_empty()
+    {
+        return;
+    }
+    state.status.online = false;
+    state.status.incompatibility = None;
+    state.protocol_compatible = false;
+    state.live_cards.clear();
+    state.roster.clear();
+    drop(state);
+    publish(repaint, latest, states);
+}
+
+fn distribution_incompatibility(expected: Option<&Version>, status: &SiteStatus) -> Option<String> {
     let expected = expected?;
     let codex = status.codex_version.as_deref()?;
     let bridge = status.bridge_version.as_deref()?;
@@ -611,7 +632,7 @@ fn bridge_error(child: &mut Child) -> String {
             |status| format!("SITE BRIDGE ENDED · {status}"),
         )
     } else {
-        format!("SITE NEEDS HARMONIZATION · {detail}")
+        format!("SITE UNAVAILABLE · {detail}")
     }
 }
 
