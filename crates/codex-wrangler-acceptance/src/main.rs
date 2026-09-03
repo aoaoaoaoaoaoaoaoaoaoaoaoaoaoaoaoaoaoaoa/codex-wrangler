@@ -1177,6 +1177,7 @@ fn verify_gallery(
     verify_error_truth(story, &fixture.error_rollout)?;
     verify_hover_lock(story, &fixture.input_rollout)?;
 
+    let _seized = seize_card(story, TURN, "whole-tile hitbox proof")?;
     let turn = story.anchor(CardTarget(Harness::Codex, TURN))?;
     let [left, top, right, bottom] = turn.rect;
     let (center_x, center_y) = turn.center();
