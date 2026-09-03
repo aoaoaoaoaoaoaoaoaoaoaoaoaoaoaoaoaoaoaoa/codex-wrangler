@@ -22,10 +22,10 @@ codex-wrangler-contract = { path = "crates/codex-wrangler-contract", version = "
 brass_poolrooms = { version = "0.14.7", features = ["serde"] }
 directories = "6.0.0"
 egui = "=0.36.1"
-egui-tester = "0.9.8"
-egui-tester-witness = "0.9.8"
+egui-tester = "0.9.9"
+egui-tester-witness = "0.9.9"
 egui-wgpu = "=0.36.1"
-eternalist-apps = "0.9.4"
+eternalist-apps = "0.9.5"
 inotify = { version = "0.11.5", default-features = false }
 memchr = "2.8.3"
 nix = { version = "0.31.3", default-features = false, features = ["poll", "signal"] }
