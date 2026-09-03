@@ -1178,13 +1178,19 @@ fn verify_gallery(
     verify_hover_lock(story, &fixture.input_rollout)?;
 
     let turn = story.anchor(CardTarget(Harness::Codex, TURN))?;
+    let [left, top, right, bottom] = turn.rect;
     let (center_x, center_y) = turn.center();
+    let text_x = window_coordinate(left + 20.0)?;
     for (x, y, region) in [
-        (center_x - 149, center_y - 75, "anonymous name"),
-        (center_x - 149, center_y - 50, "working directory"),
-        (center_x - 149, center_y - 20, "preview"),
+        (text_x, window_coordinate(top + 17.0)?, "anonymous name"),
+        (text_x, window_coordinate(top + 42.0)?, "working directory"),
+        (text_x, window_coordinate(top + 72.0)?, "preview"),
         (center_x, center_y, "center"),
-        (center_x + 170, center_y + 75, "empty corner"),
+        (
+            window_coordinate(right - 20.0)?,
+            window_coordinate(bottom - 17.0)?,
+            "empty corner",
+        ),
     ] {
         let receipt = story.session().move_to(x, y)?;
         let thread = TURN.to_owned();
@@ -1212,6 +1218,20 @@ fn verify_gallery(
         fs::copy(&capture, destination).map_err(io_verdict("export acceptance capture"))?;
     }
     Ok(())
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "validated physical window coordinates are integral i16 inputs to X11"
+)]
+fn window_coordinate(coordinate: f32) -> Result<i16> {
+    demand(
+        coordinate.is_finite()
+            && coordinate >= f32::from(i16::MIN)
+            && coordinate <= f32::from(i16::MAX),
+        format!("anchor coordinate {coordinate} escaped the X11 input domain"),
+    )?;
+    Ok(coordinate.round() as i16)
 }
 
 fn verify_native_cursor_fields(story: &mut Story<'_, '_, Observation>) -> Result<()> {
