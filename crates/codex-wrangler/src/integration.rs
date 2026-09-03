@@ -88,6 +88,9 @@ fn install() -> Result<()> {
             fs::set_permissions(&local, fs::Permissions::from_mode(0o600))?;
         }
     }
+    if Path::new("/usr/lib/systemd/user/codex-wrangler.service").is_file() {
+        remove_if_exists(&unit_dir.join("codex-wrangler.service.d/90-local.conf"))?;
+    }
 
     let packaged_desktop = Path::new("/usr/share/applications/codex-wrangler.desktop");
     let local_desktop = application_dir.join("codex-wrangler.desktop");

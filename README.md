@@ -20,7 +20,9 @@ idempotent `install` command installs the desktop entry and user units, enables
 the shared Codex app server, and starts Wrangler as a concealed X11 service.
 `codex-wrangler uninstall` removes those integrations without deleting settings
 or session data. A system package may own the same assets globally; `install`
-then removes obsolete user shadows and enables the packaged units.
+then removes obsolete user units and drop-ins and enables the packaged units.
+Do not mix a system distribution with `scripts/install-local`; its Codex,
+Wrangler, and Site bridge revisions are one atomic installation.
 
 ## Sites
 
@@ -31,9 +33,9 @@ remotes = ["MAIN", "vivobook"]
 ```
 
 Each Site must run the Wrangler-managed Codex distribution and expose
-`codex-wrangler-bridge`. Federation prefers the Site's user-local installation
-and falls back to `/usr/bin`; Wrangler opens remote sessions in local Alacritty
-windows.
+`codex-wrangler-bridge`. Federation prefers `/usr/bin` and falls back to a
+standalone user-local installation; Wrangler opens remote sessions in local
+Alacritty windows.
 Colored diamonds identify Sites; their header legend reports connection,
 protocol, and distribution drift. Authentication and host policy remain owned
 by OpenSSH configuration. Wrangler-opened terminals are independent transient

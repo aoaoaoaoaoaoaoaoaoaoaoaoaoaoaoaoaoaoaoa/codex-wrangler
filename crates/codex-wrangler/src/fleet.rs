@@ -362,7 +362,7 @@ fn bridge(site: &RemoteSite) -> std::io::Result<Child> {
             "ServerAliveCountMax=2",
             "--",
             site.endpoint(),
-            r#"PATH="$HOME/.local/bin:/usr/bin""#,
+            r#"PATH="/usr/bin:$HOME/.local/bin""#,
             "codex-wrangler-bridge",
             "--watch",
         ])

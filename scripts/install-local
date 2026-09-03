@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+if [ -x /usr/bin/codex-wrangler ]; then
+  printf '%s\n' \
+    'install-local refused: /usr/bin/codex-wrangler owns this system; refresh its package instead' >&2
+  exit 69
+fi
+
 cargo build --release --bin codex-wrangler
 target_directory=$(cargo metadata --format-version 1 --no-deps \
   | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
@@ -8,14 +14,3 @@ test -n "$target_directory"
 install -Dm755 "$target_directory/release/codex-wrangler" \
   "$HOME/.local/bin/codex-wrangler"
 "$HOME/.local/bin/codex-wrangler" install
-
-# A system package may own the canonical unit. Development installs must still
-# exercise the binary they just built rather than leaving /usr/bin active.
-override_directory="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/codex-wrangler.service.d"
-mkdir -p "$override_directory"
-chmod 700 "$override_directory"
-printf '[Service]\nExecStart=\nExecStart=%s --resident\n' \
-  "$HOME/.local/bin/codex-wrangler" > "$override_directory/90-local.conf"
-chmod 600 "$override_directory/90-local.conf"
-systemctl --user daemon-reload
-systemctl --user restart codex-wrangler.service

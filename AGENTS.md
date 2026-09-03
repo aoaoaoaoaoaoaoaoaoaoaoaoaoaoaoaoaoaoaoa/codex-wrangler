@@ -13,4 +13,6 @@ detects capabilities; each supported Codex line retains a named removal seam
 and an acceptance fixture.
 
 Run `scripts/check` after meaningful edits and `scripts/accept` after native UI
-changes. Install with `scripts/install-local` only after both pass.
+changes. This workstation installs Wrangler only through the atomic
+`openai-codex` package; `scripts/install-local` is a standalone fallback and
+must not shadow a system installation.
