@@ -1180,9 +1180,9 @@ fn verify_gallery(
     let turn = story.anchor(CardTarget(Harness::Codex, TURN))?;
     let (center_x, center_y) = turn.center();
     for (x, y, region) in [
-        (center_x - 150, center_y - 75, "anonymous name"),
-        (center_x - 150, center_y - 50, "working directory"),
-        (center_x - 150, center_y - 20, "preview"),
+        (center_x - 149, center_y - 75, "anonymous name"),
+        (center_x - 149, center_y - 50, "working directory"),
+        (center_x - 149, center_y - 20, "preview"),
         (center_x, center_y, "center"),
         (center_x + 170, center_y + 75, "empty corner"),
     ] {
