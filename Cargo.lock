@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "codex-process-snapshot"
-version = "1.3.20"
+version = "1.3.21"
 dependencies = [
  "anyhow",
  "uuid",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler"
-version = "1.3.20"
+version = "1.3.21"
 dependencies = [
  "anyhow",
  "brass_poolrooms",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "codex-wrangler-acceptance"
-version = "1.3.20"
+version = "1.3.21"
 dependencies = [
  "brass_poolrooms",
  "codex-wrangler-contract",
