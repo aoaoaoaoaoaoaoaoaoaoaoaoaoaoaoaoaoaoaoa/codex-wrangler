@@ -6,6 +6,34 @@ die() {
     exit 1
 }
 
+is_published() {
+    package=$1
+    package_version=$2
+    (cd / && cargo info --registry crates-io "$package@$package_version" >/dev/null 2>&1)
+}
+
+wait_for_registry() {
+    package=$1
+    package_version=$2
+    attempts=0
+    until is_published "$package" "$package_version"; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 90 ] || die "$package@$package_version did not reach the registry"
+        sleep 2
+    done
+}
+
+publish_once() {
+    package=$1
+    package_version=$2
+    if is_published "$package" "$package_version"; then
+        printf '%s\n' "$package@$package_version is already published"
+        return
+    fi
+    cargo publish --locked --package "$package"
+    wait_for_registry "$package" "$package_version"
+}
+
 version=${1:-}
 mode=${2:-check}
 [ -n "$version" ] || die 'usage: scripts/release VERSION [check|publish]'
@@ -26,17 +54,25 @@ cd "$root"
     die 'HEAD is not the pushed origin/main commit'
 grep -Fqx "version = \"$version\"" Cargo.toml ||
     die "Cargo.toml does not declare workspace version $version"
+contract_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' crates/codex-wrangler-contract/Cargo.toml)
+[ -n "$contract_version" ] || die 'codex-wrangler-contract has no package version'
 git tag --points-at HEAD | grep -Fqx "v$version" ||
     die "v$version does not tag HEAD"
 git tag -v "v$version" >/dev/null 2>&1 || die "v$version is not a valid signed tag"
 
 scripts/check
 scripts/audit
+cargo package --locked --package codex-wrangler-contract
+if [ "$mode" = publish ]; then
+    publish_once codex-wrangler-contract "$contract_version"
+elif ! is_published codex-wrangler-contract "$contract_version"; then
+    die "codex-wrangler-contract@$contract_version must be published before the app package can be verified"
+fi
 scripts/package
 scripts/prove-runtime
 
 if [ "$mode" = publish ]; then
-    cargo publish --locked --package codex-wrangler
+    publish_once codex-wrangler "$version"
 else
     printf 'release candidate v%s passed; publication was not requested\n' "$version"
 fi

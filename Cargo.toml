@@ -18,7 +18,7 @@ version = "1.3.18"
 [workspace.dependencies]
 anyhow = "1.0.104"
 crossbeam-channel = "0.5.16"
-codex-wrangler-contract = { path = "crates/codex-wrangler-contract", version = "1.3.18" }
+codex-wrangler-contract = { path = "crates/codex-wrangler-contract", version = "0.1.0" }
 brass_poolrooms = { version = "0.14.7", features = ["serde"] }
 directories = "6.0.0"
 egui = "=0.36.1"
