@@ -2,7 +2,7 @@
 Type=Application
 Name=Codex Wrangler
 Comment=Survey and activate agent sessions across machines
-Exec=codex-wrangler
+Exec=@WRANGLER@
 Terminal=false
 Categories=Development;
 StartupNotify=false

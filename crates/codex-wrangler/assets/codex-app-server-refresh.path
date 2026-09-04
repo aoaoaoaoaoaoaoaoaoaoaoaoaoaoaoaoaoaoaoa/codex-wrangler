@@ -1,8 +1,8 @@
 [Unit]
-Description=Watch the system Codex release
+Description=Watch the selected Codex release
 
 [Path]
-PathChanged=/usr/bin/codex
+PathChanged=@CODEX@
 Unit=codex-app-server-refresh.service
 
 [Install]

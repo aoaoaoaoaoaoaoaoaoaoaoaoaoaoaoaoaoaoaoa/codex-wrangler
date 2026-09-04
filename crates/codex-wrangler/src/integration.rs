@@ -49,58 +49,28 @@ fn install() -> Result<()> {
         .with_context(|| format!("create `{}`", application_dir.display()))?;
     fs::set_permissions(&unit_dir, fs::Permissions::from_mode(0o700))?;
     let codex = executable("codex")?;
+    let wrangler = service_executable()?;
 
-    for (name, packaged, embedded) in [
-        (
-            "codex-app-server.service",
-            Path::new("/usr/lib/systemd/user/codex-app-server.service"),
-            APP_SERVER,
-        ),
-        (
-            "codex-app-server-refresh.service",
-            Path::new("/usr/lib/systemd/user/codex-app-server-refresh.service"),
-            APP_SERVER_REFRESH,
-        ),
-        (
-            "codex-app-server-refresh.path",
-            Path::new("/usr/lib/systemd/user/codex-app-server-refresh.path"),
-            APP_SERVER_WATCH,
-        ),
-        (
-            "codex-wrangler.service",
-            Path::new("/usr/lib/systemd/user/codex-wrangler.service"),
-            WRANGLER,
-        ),
+    for (name, embedded) in [
+        ("codex-app-server.service", APP_SERVER),
+        ("codex-app-server-refresh.service", APP_SERVER_REFRESH),
+        ("codex-app-server-refresh.path", APP_SERVER_WATCH),
+        ("codex-wrangler.service", WRANGLER),
     ] {
         let local = unit_dir.join(name);
-        if packaged.is_file() {
-            remove_if_exists(&local)?;
-        } else {
-            let contents = if name == "codex-wrangler.service" {
-                let executable = std::env::current_exe()?.canonicalize()?;
-                embedded.replace("/usr/bin/codex-wrangler", &executable.display().to_string())
-            } else if name == "codex-app-server.service" {
-                embedded.replace("/usr/bin/codex", &codex.display().to_string())
-            } else {
-                embedded.to_owned()
-            };
-            fs::write(&local, contents).with_context(|| format!("write `{}`", local.display()))?;
-            fs::set_permissions(&local, fs::Permissions::from_mode(0o600))?;
-        }
+        let contents = embedded
+            .replace("@CODEX@", &codex.display().to_string())
+            .replace("@WRANGLER@", &wrangler.display().to_string());
+        fs::write(&local, contents).with_context(|| format!("write `{}`", local.display()))?;
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o600))?;
     }
-    if Path::new("/usr/lib/systemd/user/codex-wrangler.service").is_file() {
-        remove_if_exists(&unit_dir.join("codex-wrangler.service.d/90-local.conf"))?;
-    }
+    remove_if_exists(&unit_dir.join("codex-wrangler.service.d/90-local.conf"))?;
 
-    let packaged_desktop = Path::new("/usr/share/applications/codex-wrangler.desktop");
     let local_desktop = application_dir.join("codex-wrangler.desktop");
-    if packaged_desktop.is_file() {
-        remove_if_exists(&local_desktop)?;
-    } else {
-        fs::write(&local_desktop, DESKTOP)
-            .with_context(|| format!("write `{}`", local_desktop.display()))?;
-        fs::set_permissions(&local_desktop, fs::Permissions::from_mode(0o644))?;
-    }
+    let desktop = DESKTOP.replace("@WRANGLER@", &wrangler.display().to_string());
+    fs::write(&local_desktop, desktop)
+        .with_context(|| format!("write `{}`", local_desktop.display()))?;
+    fs::set_permissions(&local_desktop, fs::Permissions::from_mode(0o644))?;
 
     systemctl(&["daemon-reload"])?;
     systemctl(&[
@@ -110,6 +80,8 @@ fn install() -> Result<()> {
         "codex-app-server-refresh.path",
         "codex-wrangler.service",
     ])?;
+    systemctl(&["start", "codex-app-server-refresh.service"])?;
+    systemctl(&["restart", "codex-wrangler.service"])?;
     println!("Codex Wrangler integration installed.");
     Ok(())
 }
@@ -168,12 +140,20 @@ fn executable(name: &str) -> Result<PathBuf> {
             continue;
         };
         if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            return candidate
-                .canonicalize()
-                .with_context(|| format!("canonicalize `{}`", candidate.display()));
+            return Ok(candidate);
         }
     }
     anyhow::bail!("`{name}` is absent from PATH")
+}
+
+fn service_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe()?.canonicalize()?;
+    if let Ok(candidate) = executable("codex-wrangler")
+        && candidate.canonicalize()? == current
+    {
+        return Ok(candidate);
+    }
+    Ok(current)
 }
 
 pub fn prepare_row(home: &Path, thread: &str) -> Result<(PathBuf, bool, PathBuf)> {
