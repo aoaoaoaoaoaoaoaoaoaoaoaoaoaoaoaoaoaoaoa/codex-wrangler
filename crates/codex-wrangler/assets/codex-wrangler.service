@@ -6,6 +6,7 @@ After=x11-apps.target
 
 [Service]
 Type=simple
+Environment="PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin"
 ExecStart=@WRANGLER@ --resident
 Restart=on-failure
 RestartSec=2s
