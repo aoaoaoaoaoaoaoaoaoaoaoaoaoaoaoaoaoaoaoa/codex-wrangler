@@ -9,6 +9,8 @@ ExecStart=@CODEX@ app-server --listen unix://
 OOMPolicy=continue
 Restart=always
 RestartSec=3s
+# Drain the daemon first; surviving tool children must not delay its replacement.
+KillMode=mixed
 TimeoutStopSec=1h
 UMask=0077
 Environment=PATH=%h/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin
