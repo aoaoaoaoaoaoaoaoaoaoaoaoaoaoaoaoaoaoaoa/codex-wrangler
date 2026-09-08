@@ -26,7 +26,6 @@ mod transcript;
 mod tray;
 mod watchfire;
 
-#[cfg(feature = "egui-test")]
 use anyhow::Result;
 use eternalist_apps::{ProductIdentity, TraceGuard};
 

@@ -1,6 +1,6 @@
 [package]
 name = "codex-wrangler-contract"
-version = "0.1.0"
+version = "0.1.1"
 description = "Tester-independent native UI contract for Codex Wrangler"
 edition.workspace = true
 license.workspace = true
