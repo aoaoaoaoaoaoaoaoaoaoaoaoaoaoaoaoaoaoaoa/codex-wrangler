@@ -1,5 +1,9 @@
 # codex-wrangler
 
+**Retired from the Poolrooms application line.** Development now belongs to
+the Codex 1337 fork at `~/programming/contrib/codex-1337`. The instructions
+below describe the historical standalone product, not the current installation.
+
 An as-is tray switcher for manual Codex, Claude Code, and Prime Agent TUI
 sessions across one or more machines. Linux/X11/i3 only.
 

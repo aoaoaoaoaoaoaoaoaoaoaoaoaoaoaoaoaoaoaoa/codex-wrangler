@@ -1,5 +1,10 @@
 # Codex Wrangler Agent Guidance
 
+This standalone checkout is retired from the Poolrooms application line.
+Development belongs in `/home/main/programming/contrib/codex-1337`.
+Do not release or reinstall this checkout. Its code remains historical while
+the fork replaces the installed GUI with the Codex agents dashboard.
+
 This is an as-is, machine-specialized X11 application. Its product coordinate
 is the owner's present Codex TUI + Alacritty + i3 system; portability and
 support beyond that coordinate are explicitly out of scope.
