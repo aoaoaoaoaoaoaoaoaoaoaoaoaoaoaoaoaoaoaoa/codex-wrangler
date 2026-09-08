@@ -27,10 +27,13 @@ mod tray;
 mod watchfire;
 
 #[cfg(feature = "egui-test")]
-use egui_tester_witness as _;
-
 use anyhow::Result;
-use eternalist_apps::TraceGuard;
+use eternalist_apps::{ProductIdentity, TraceGuard};
+
+pub const PRODUCT: ProductIdentity = ProductIdentity::declare(
+    codex_wrangler_contract::PRODUCT_IDENTIFIER,
+    codex_wrangler_contract::PRODUCT_NAME,
+);
 use instance::{Incumbent, Invocation};
 use posture::Ledger;
 

@@ -20,11 +20,8 @@ anyhow = "1.0.104"
 crossbeam-channel = "0.5.16"
 codex-wrangler-contract = { path = "crates/codex-wrangler-contract", version = "0.1.0" }
 brass_poolrooms = { version = "0.14.8", features = ["serde"] }
-directories = "6.0.0"
 egui = "=0.36.1"
 egui-tester = "0.9.9"
-egui-tester-witness = "0.9.9"
-egui-wgpu = "=0.36.1"
 eternalist-apps = "0.9.6"
 inotify = { version = "0.11.5", default-features = false }
 memchr = "2.8.3"
@@ -70,3 +67,8 @@ doc_command = ["cargo", "doc", "--workspace", "--all-features", "--no-deps"]
 max_lines = 3000
 include = ["*.rs", "**/*.rs"]
 exclude = []
+
+[patch.crates-io]
+brass_poolrooms = { path = "../../../brass_poolrooms/.worktrees/cell-walls" }
+eternalist-apps = { path = "../../../eternalist_apps/.worktrees/cell-walls" }
+egui-tester-witness = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/egui-tester", rev = "2411accb64b9c4012190d1bd0915d68113b8dcf1" }

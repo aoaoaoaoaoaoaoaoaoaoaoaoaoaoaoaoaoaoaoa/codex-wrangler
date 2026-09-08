@@ -1,21 +1,15 @@
 use std::{
-    env, fs,
+    fs,
     io::Write as _,
     os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, Result};
-
-const APPLICATION: &str = "codex-wrangler";
+use eternalist_apps::ApplicationPaths;
 
 pub fn path(file: &str) -> Result<PathBuf> {
-    path_from(
-        file,
-        env::var_os("XDG_STATE_HOME").as_deref(),
-        env::var_os("HOME").as_deref(),
-    )
-    .context("neither absolute XDG_STATE_HOME nor HOME is available")
+    Ok(ApplicationPaths::claim(crate::PRODUCT)?.state.join(file))
 }
 
 pub fn seal(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -46,47 +40,4 @@ pub fn seal(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .with_context(|| format!("seal `{}`", parent.display()))
-}
-
-pub(crate) fn path_from(
-    file: &str,
-    xdg: Option<&std::ffi::OsStr>,
-    home: Option<&std::ffi::OsStr>,
-) -> Option<PathBuf> {
-    xdg.map(Path::new)
-        .filter(|path| path.is_absolute())
-        .map(Path::to_path_buf)
-        .or_else(|| {
-            home.map(Path::new)
-                .filter(|path| path.is_absolute())
-                .map(|home| home.join(".local/state"))
-        })
-        .map(|root| root.join(APPLICATION).join(file))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn relative_xdg_state_is_banished_to_the_absolute_home_default() {
-        assert_eq!(
-            path_from(
-                "window-mode",
-                Some("relative".as_ref()),
-                Some("/home/keeper".as_ref())
-            ),
-            Some(PathBuf::from(
-                "/home/keeper/.local/state/codex-wrangler/window-mode"
-            ))
-        );
-        assert_eq!(
-            path_from(
-                "window-mode",
-                Some("/vault/state".as_ref()),
-                Some("/home/keeper".as_ref())
-            ),
-            Some(PathBuf::from("/vault/state/codex-wrangler/window-mode"))
-        );
-    }
 }

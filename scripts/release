@@ -50,6 +50,10 @@ cd "$root"
 
 [ "$(git branch --show-current)" = main ] || die 'release checkout is not main'
 [ -z "$(git status --porcelain)" ] || die 'worktree is dirty'
+grep -Eq '^\[patch\.' Cargo.toml && die 'Cargo.toml carries a [patch] section; release from registry dependencies only'
+grep -rEq --include=Cargo.toml --exclude-dir=target --exclude-dir=.git --exclude-dir=.worktrees --exclude-dir=vendor \
+    'path[[:space:]]*=[[:space:]]*"\.\./' . &&
+    die 'a manifest depends on a path outside the repository; release from registry dependencies only'
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] ||
     die 'HEAD is not the pushed origin/main commit'
 grep -Fqx "version = \"$version\"" Cargo.toml ||

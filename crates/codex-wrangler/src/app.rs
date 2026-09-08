@@ -28,7 +28,8 @@ use egui::{
     text::{LayoutJob, TextFormat},
 };
 use eternalist_apps::{
-    ApplicationHeader, CloseDisposition, LivingWait, NativeApp, NativeWake, WindowSpec,
+    ApplicationHeader, CloseDisposition, LivingWait, NativeApp, NativeWake, ProductIdentity,
+    WindowSpec,
     command_guide::CommandGuide,
     commands::{CommandDispatch, CommandStatus},
     settings::{SettingSpec, SettingsFile, SettingsSheet},
@@ -984,7 +985,7 @@ impl<const START_FLOATING: bool> Wrangler<START_FLOATING> {
         let mut confirm_changed = false;
         let response = self.settings.show(ctx, &mut self.water, file, |ui| {
             ui.group("APPEARANCE");
-            font_scale_changed = ui.font_scale(&mut font_scale);
+            font_scale_changed = ui.font_size(&mut font_scale);
             ui.group("BEHAVIOR");
             minimize_changed = ui.boolean(MINIMIZE_ON_CLOSE, &mut minimize);
             confirm_changed = ui.boolean(CONFIRM_DELETION, &mut confirm);
@@ -1749,10 +1750,12 @@ impl<const START_FLOATING: bool> Drop for Wrangler<START_FLOATING> {
 }
 
 impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
+    const PRODUCT: ProductIdentity = crate::PRODUCT;
+    const RELEASE: &'static str = env!("CARGO_PKG_VERSION");
     const WINDOW: WindowSpec = if START_FLOATING {
-        WindowSpec::new("Codex Wrangler", [1_260.0, 820.0]).floating()
+        WindowSpec::new(crate::PRODUCT.name(), [1_260.0, 820.0]).floating()
     } else {
-        WindowSpec::new("Codex Wrangler", [1_260.0, 820.0])
+        WindowSpec::new(crate::PRODUCT.name(), [1_260.0, 820.0])
     };
 
     fn draw(&mut self, ui: &mut egui::Ui) {
@@ -1946,13 +1949,6 @@ impl<const START_FLOATING: bool> NativeApp for Wrangler<START_FLOATING> {
             self.living_wait.compose(ctx, &mut self.water);
         }
         self.water.frame(ctx, pixels_per_point, tooltip_rects, None)
-    }
-
-    fn register_gpu(
-        _renderer: &mut egui_wgpu::Renderer,
-        _device: &egui_wgpu::wgpu::Device,
-        _format: egui_wgpu::wgpu::TextureFormat,
-    ) {
     }
 
     #[cfg(feature = "egui-test")]

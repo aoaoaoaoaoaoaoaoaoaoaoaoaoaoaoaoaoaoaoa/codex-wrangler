@@ -1,0 +1,32 @@
+#!/bin/sh
+# Product cell walls: host-owned window and GPU crates stay in the host, and
+# the product's identity is one record that foundry.toml repeats exactly.
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+fail() {
+    printf 'cell-wall violation: %s\n' "$1" >&2
+    exit 1
+}
+
+contract=crates/codex-wrangler-contract/src/lib.rs
+if cargo metadata --no-deps --format-version 1 |
+    jq -e '[.packages[].dependencies[].name | select(. == "winit" or . == "egui-winit" or . == "egui-wgpu" or . == "wgpu")] | length > 0' >/dev/null
+then
+    fail 'a workspace member depends directly on a host-owned window or GPU crate'
+fi
+identifier=$(sed -n 's/^pub const PRODUCT_IDENTIFIER: &str = "\([^"]*\)";$/\1/p' "$contract")
+[ -n "$identifier" ] || fail "$contract declares no PRODUCT_IDENTIFIER"
+name=$(sed -n 's/^pub const PRODUCT_NAME: &str = "\([^"]*\)";$/\1/p' "$contract")
+[ -n "$name" ] || fail "$contract declares no PRODUCT_NAME"
+if [ -f foundry.toml ]; then
+    declared=$(sed -n 's/^identifier = "\([^"]*\)"$/\1/p' foundry.toml)
+    [ -z "$declared" ] || [ "$declared" = "$identifier" ] ||
+        fail "foundry.toml identifier $declared != contract $identifier"
+    declared=$(sed -n '/^\[product\]/,/^\[/s/^name = "\([^"]*\)"$/\1/p' foundry.toml)
+    [ -z "$declared" ] || [ "$declared" = "$name" ] ||
+        fail "foundry.toml name $declared != contract $name"
+fi
+printf 'cell walls closed: %s (%s)\n' "$identifier" "$name"

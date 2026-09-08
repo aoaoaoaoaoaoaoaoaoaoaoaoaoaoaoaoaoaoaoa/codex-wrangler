@@ -5,6 +5,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Reverse-DNS product identifier; the sole source of Wrangler's platform identity.
+pub const PRODUCT_IDENTIFIER: &str = "moe.eternalist.codex-wrangler";
+/// Product display name.
+pub const PRODUCT_NAME: &str = "Codex Wrangler";
+
 #[cfg(feature = "egui-test")]
 pub const UI_FINGERPRINT: &str = "codex-wrangler.ui/30";
 

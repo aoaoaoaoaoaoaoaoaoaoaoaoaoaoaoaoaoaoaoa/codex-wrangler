@@ -6,9 +6,11 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use brass_poolrooms::chrome::FontScale;
-use directories::ProjectDirs;
-use eternalist_apps::configuration::{
-    Configuration as ConfigurationContract, ConfigurationFault, ConfigurationLedger,
+use eternalist_apps::{
+    ApplicationPaths,
+    configuration::{
+        Configuration as ConfigurationContract, ConfigurationFault, ConfigurationLedger,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,9 +65,9 @@ pub struct Configuration {
 
 impl Configuration {
     pub fn raise(ctx: &egui::Context) -> Result<Self> {
-        let project = ProjectDirs::from("moe", "Eternalist", "codex-wrangler")
-            .context("cannot resolve the platform configuration directory")?;
-        let path = project.config_dir().join("config.toml");
+        let path = ApplicationPaths::claim(crate::PRODUCT)?
+            .config
+            .join("config.toml");
         let fallback = match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 legacy().unwrap_or_else(|error| {

@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+scripts/cells
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets --all-features

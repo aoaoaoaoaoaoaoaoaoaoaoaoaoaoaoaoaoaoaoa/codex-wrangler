@@ -13,7 +13,6 @@ categories = ["gui"]
 [features]
 egui-test = [
   "codex-wrangler-contract/egui-test",
-  "dep:egui-tester-witness",
   "instrumentation",
   "eternalist-apps/egui-test",
 ]
@@ -24,10 +23,7 @@ anyhow.workspace = true
 crossbeam-channel.workspace = true
 codex-wrangler-contract.workspace = true
 brass_poolrooms.workspace = true
-directories.workspace = true
 egui.workspace = true
-egui-tester-witness = { workspace = true, optional = true, features = ["egui"] }
-egui-wgpu.workspace = true
 eternalist-apps.workspace = true
 inotify.workspace = true
 memchr.workspace = true
