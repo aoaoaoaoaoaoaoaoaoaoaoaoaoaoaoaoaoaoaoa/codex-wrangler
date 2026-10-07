@@ -1,25 +1,11 @@
-# Codex Wrangler Agent Guidance
+codex_wrangler: retired standalone checkout; development belongs in `../../codex-1337`
 
-This standalone checkout is retired from the Poolrooms application line.
-Development belongs in `/home/main/programming/contrib/codex-1337`.
-Do not release or reinstall this checkout. Its code remains historical while
-the fork replaces the installed GUI with the Codex agents dashboard.
+## gate
+- `scripts/check` after edits; `scripts/accept` after native UI changes
+- Workstation installs Wrangler via codex-1337 `scripts/install-local`; standalone `scripts/install-local` only for development and recovery
 
-This is an as-is, machine-specialized X11 application. Its product coordinate
-is the owner's present Codex TUI + Alacritty + i3 system; portability and
-support beyond that coordinate are explicitly out of scope.
-
-Use `eternalist-apps` as the native host and Brass Poolrooms as the visual and
-physical language. Keep Codex discovery, X11 activation, tray behavior, and the
-acceptance fixtures product-owned.
-
-Wrangler supports only the Codex version carried by the coordinated local
-distribution.
-Runtime detects capabilities; product-owned acceptance fixtures guard its
-integration boundaries.
-
-Run `scripts/check` after meaningful edits and `scripts/accept` after native UI
-changes. This workstation installs Codex, Code Mode, the Site bridge, and
-Wrangler from the downstream Codex checkout's `scripts/install-local`. The
-standalone `scripts/install-local` installs only Wrangler for development and
-recovery.
+## invariants
+- Never release or reinstall this checkout; code stays historical while the fork replaces installed GUI with Codex agents dashboard
+- Machine-specialized X11 app: product coordinate = owner's present Codex TUI + Alacritty + i3; portability out of scope
+- Native host `eternalist-apps`, visual language Brass Poolrooms; Codex discovery, X11 activation, tray, acceptance fixtures product-owned
+- Supports only Codex version of coordinated local distribution; runtime detects capabilities; product fixtures guard integration boundaries
